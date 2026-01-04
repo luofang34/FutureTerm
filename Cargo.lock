@@ -890,6 +890,8 @@ name = "transport-webserial"
 version = "0.1.0"
 dependencies = [
  "core-types",
+ "js-sys",
+ "thiserror 1.0.69",
  "wasm-bindgen",
  "wasm-bindgen-futures",
  "web-sys",
