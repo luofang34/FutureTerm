@@ -11,6 +11,7 @@ members = [
     # apps/web will be a separate npm project or part of workspace if using wasm-pack extensively
     # apps/native will be a cargo project
     "apps/native", 
+    "apps/web",
 ]
 resolver = "2"
 
