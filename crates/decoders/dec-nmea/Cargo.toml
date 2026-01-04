@@ -1,0 +1,9 @@
+[package]
+name = "dec-nmea"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+core-types = { path = "../../core-types" }
+decoders = { path = ".." }
+nmea = "0.6"

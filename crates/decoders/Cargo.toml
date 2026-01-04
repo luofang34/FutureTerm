@@ -1,0 +1,8 @@
+[package]
+name = "decoders"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+core-types = { path = "../core-types" }
+framing = { path = "../framing" }

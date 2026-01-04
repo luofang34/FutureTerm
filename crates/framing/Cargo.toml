@@ -1,0 +1,12 @@
+[package]
+name = "framing"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+core-types = { path = "../core-types" }
+bytes = "1.5"
+cobs = "0.2"
+slip-codec = "0.3"
+thiserror = "1.0"
+log = "0.4"
