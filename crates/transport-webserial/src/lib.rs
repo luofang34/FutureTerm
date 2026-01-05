@@ -1,8 +1,7 @@
 use wasm_bindgen::prelude::*;
 use wasm_bindgen_futures::JsFuture;
 use web_sys::{SerialPort, SerialOptions, ReadableStreamDefaultReader, WritableStreamDefaultWriter};
-use js_sys::{Uint8Array, Array};
-use core_types::Frame;
+use js_sys::Uint8Array;
 
 /// WebSerial Transport Implementation.
 /// 
@@ -34,7 +33,12 @@ impl WebSerialTransport {
         }
     }
 
+    pub fn is_open(&self) -> bool {
+        self.port.is_some()
+    }
+
     /// Open the port with specified baud rate.
+    // Note: Mutability is required here to set self.port, self.reader, self.writer
     pub async fn open(&mut self, port: SerialPort, baud_rate: u32) -> Result<(), TransportError> {
         let options = SerialOptions::new(baud_rate);
         
@@ -74,6 +78,14 @@ impl WebSerialTransport {
         Ok(())
     }
 
+    /// Attach to existing streams (Worker Mode)
+    pub fn attach(&mut self, reader: ReadableStreamDefaultReader, writer: WritableStreamDefaultWriter) {
+        self.reader = Some(reader);
+        self.writer = Some(writer);
+        // Port is None in worker mode, signals won't work locally but data will flow
+        self.port = None;
+    }
+
     pub async fn close(&mut self) -> Result<(), TransportError> {
         // Release locks
         if let Some(reader) = self.reader.take() {
@@ -86,12 +98,24 @@ impl WebSerialTransport {
         }
         
         if let Some(port) = self.port.take() {
-            let _ = JsFuture::from(port.close()).await;
+            // port.close() via Reflect if binding fails
+            let _ = match js_sys::Reflect::get(&port, &"close".into()) {
+                Ok(func_val) => {
+                     if let Ok(func) = func_val.dyn_into::<js_sys::Function>() {
+                         let promise = func.call0(&port);
+                         if let Ok(p) = promise {
+                             JsFuture::from(js_sys::Promise::from(p)).await.ok();
+                         }
+                     }
+                },
+                Err(_) => {}
+            };
         }
         Ok(())
     }
 
-    pub async fn read_chunk(&mut self) -> Result<(Vec<u8>, f64), TransportError> {
+    // CHANGED: &mut self -> &self to allow concurrent read/write via RefCell borrow()
+    pub async fn read_chunk(&self) -> Result<(Vec<u8>, f64), TransportError> {
         // use f64 for performance.now() timestamp
         let reader = self.reader.as_ref().ok_or(TransportError::NotOpen)?;
         
@@ -115,14 +139,23 @@ impl WebSerialTransport {
         let chunk = Uint8Array::new(&val);
         let bytes = chunk.to_vec();
         
-        // Get timestamp (browser perf time)
-        let window = web_sys::window().expect("Window");
-        let ts = window.performance().expect("Performance").now();
+        // Get timestamp (worker compatible)
+        let global = js_sys::global();
+        let perf_val = js_sys::Reflect::get(&global, &"performance".into())
+             .unwrap_or(JsValue::UNDEFINED);
+        
+        let ts = if !perf_val.is_undefined() {
+             let perf: web_sys::Performance = perf_val.unchecked_into();
+             perf.now()
+        } else {
+             js_sys::Date::now()
+        };
 
         Ok((bytes, ts))
     }
 
-    pub async fn write(&mut self, data: &[u8]) -> Result<(), TransportError> {
+    // CHANGED: &mut self -> &self
+    pub async fn write(&self, data: &[u8]) -> Result<(), TransportError> {
         let writer = self.writer.as_ref().ok_or(TransportError::NotOpen)?;
         let arr = Uint8Array::from(data);
         
@@ -132,12 +165,24 @@ impl WebSerialTransport {
         Ok(())
     }
     
-    pub async fn set_signals(&mut self, dtr: bool, rts: bool) -> Result<(), TransportError> {
+    // CHANGED: &mut self -> &self
+    pub async fn set_signals(&self, dtr: bool, rts: bool) -> Result<(), TransportError> {
          let port = self.port.as_ref().ok_or(TransportError::NotOpen)?;
-         // PortSignal 
-         let signals = web_sys::SerialOutputSignals::new();
-         signals.set_data_terminal_ready(dtr);
-         signals.set_request_to_send(rts);
+         
+         #[derive(serde::Serialize)]
+         #[serde(rename_all = "camelCase")]
+         struct Signals {
+             data_terminal_ready: bool,
+             request_to_send: bool,
+         }
+         
+         let signals = Signals {
+             data_terminal_ready: dtr,
+             request_to_send: rts,
+         };
+         
+         let signals_val = serde_wasm_bindgen::to_value(&signals)
+             .map_err(|e| TransportError::Io(format!("Failed to serialize signals: {:?}", e)))?;
          
          // Use Reflect to get "setSignals" method and call it
          let func_val = js_sys::Reflect::get(port, &"setSignals".into())
@@ -146,7 +191,7 @@ impl WebSerialTransport {
          let func: js_sys::Function = func_val.dyn_into()
              .map_err(|_| TransportError::Io("setSignals is not a function".into()))?;
              
-         let promise_val = func.call1(port, &signals)
+         let promise_val = func.call1(port, &signals_val)
              .map_err(|e| TransportError::Io(format!("setSignals call failed: {:?}", e)))?;
              
          JsFuture::from(js_sys::Promise::from(promise_val)).await

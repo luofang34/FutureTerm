@@ -3,19 +3,32 @@ name = "app-web"
 version = "0.1.0"
 edition = "2021"
 
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[[bin]]
+name = "worker"
+path = "src/worker_entry.rs"
+
 [dependencies]
 leptos = { version = "0.6", features = ["csr"] }
 wasm-bindgen = "0.2"
-web-sys = { version = "0.3", features = ["HtmlDivElement", "Window", "Document", "Element"] }
+wasm-bindgen-futures = "0.4"
+web-sys = { version = "0.3", features = [
+    "HtmlDivElement", "Window", "Document", "Element", "Worker", "WorkerGlobalScope",
+    "DedicatedWorkerGlobalScope", "MessageEvent", "Serial", "SerialPort", "SerialOptions",
+    "Navigator", "SerialPortRequestOptions", "WorkerOptions", "WorkerType"
+] }
 console_error_panic_hook = "0.1"
 log = "0.4"
 console_log = "1.0"
 core-types = { path = "../../crates/core-types" }
-# Note: transport-webserial creates a circular dependency if used directly in UI thread logic usually?
-# No, UI thread initiates connection? Wait, SPEC-0001 said "Serial Worker".
-# So UI thread does NOT depend on transport-webserial directly.
-# UI thread depends on Worker messaging. 
-# The Worker (which will be a separate binary target or just a separate entry point) depends on transport.
+serde = { version = "1.0", features = ["derive"] }
+serde-wasm-bindgen = "0.6"
+transport-webserial = { path = "../../crates/transport-webserial" }
+framing = { path = "../../crates/framing" }
+decoders = { path = "../../crates/decoders" }
+js-sys = "0.3"
 
 [profile.release]
 codegen-units = 1

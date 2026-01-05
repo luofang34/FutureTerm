@@ -1,17 +1,24 @@
 <!DOCTYPE html>
 <html>
-  <head>
-    <meta charset="utf-8"/>
-    <title>WASM Serial Tool</title>
-    <!-- xterm.js CSS -->
-    <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/xterm@5.3.0/css/xterm.css" />
-    <!-- xterm.js JS (loaded via CDN for simplicity in V1 specific binding approach, 
-         or we can use npm install but Trunk handles Rust best. 
-         Let's assume we load xterm.js globally so we can bind to window.Terminal) -->
-    <script src="https://cdn.jsdelivr.net/npm/xterm@5.3.0/lib/xterm.js"></script>
-    <script src="https://cdn.jsdelivr.net/npm/xterm-addon-fit@0.8.0/lib/xterm-addon-fit.js"></script>
-  </head>
-  <body>
-    <!-- Leptos will mount here -->
-  </body>
+
+<head>
+  <meta charset="utf-8" />
+  <title>WASM Serial Tool</title>
+  <!-- xterm.js CSS -->
+  <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/xterm@5.3.0/css/xterm.css" />
+  <!-- xterm.js JS -->
+  <script src="https://cdn.jsdelivr.net/npm/xterm@5.3.0/lib/xterm.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/xterm-addon-fit@0.8.0/lib/xterm-addon-fit.js"></script>
+
+  <!-- Trunk Worker configuration -->
+  <link data-trunk rel="rust" data-bin="worker" data-type="worker" />
+  <link data-trunk rel="copy-file" href="worker_bootstrap.js" />
+  <!-- Main App configuration -->
+  <link data-trunk rel="rust" data-target-name="app-web" href="Cargo.toml" />
+</head>
+
+<body>
+  <!-- Leptos will mount here -->
+</body>
+
 </html>

@@ -1,5 +1,4 @@
-use decoders::Decoder;
-use core_types::{Frame, DecodedEvent};
+use core_types::{Frame, DecodedEvent, Decoder};
 use nmea::Nmea;
 
 pub struct NmeaDecoder {

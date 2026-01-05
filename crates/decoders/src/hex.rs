@@ -1,5 +1,4 @@
-use crate::Decoder;
-use core_types::{Frame, DecodedEvent};
+use core_types::{Frame, DecodedEvent, Decoder};
 
 /// A universal decoder that converts ANY frame into a Hex Dump event.
 /// Useful for "Hex View" mode or debugging unknown protocols.
