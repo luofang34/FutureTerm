@@ -17,7 +17,8 @@ wasm-bindgen-futures = "0.4"
 web-sys = { version = "0.3", features = [
     "HtmlDivElement", "Window", "Document", "Element", "Worker", "WorkerGlobalScope",
     "DedicatedWorkerGlobalScope", "MessageEvent", "Serial", "SerialPort", "SerialOptions",
-    "Navigator", "SerialPortRequestOptions", "WorkerOptions", "WorkerType"
+    "Navigator", "SerialPortRequestOptions", "WorkerOptions", "WorkerType",
+    "TextDecoder", "TextDecodeOptions"
 ] }
 console_error_panic_hook = "0.1"
 log = "0.4"

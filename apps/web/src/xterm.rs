@@ -5,6 +5,7 @@ use web_sys::HtmlDivElement;
 
 #[wasm_bindgen]
 extern "C" {
+    #[derive(Clone)]
     type Terminal;
     type FitAddon;
 
@@ -36,6 +37,10 @@ pub struct TerminalHandle(Terminal);
 impl TerminalHandle {
     pub fn write_u8(&self, data: &[u8]) {
         self.0.write_u8(data);
+    }
+    
+    pub fn write(&self, data: &str) {
+        self.0.write(data);
     }
 }
 

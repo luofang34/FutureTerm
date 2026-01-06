@@ -29,17 +29,31 @@ pub fn App() -> impl IntoView {
         // We'll try "worker.js" (standard trunk default for single worker or based on bin name).
         // If data-bin="worker", it should be "worker.js".
         if let Ok(w) = Worker::new("worker_bootstrap.js") {
+            // Create a stateful TextDecoder
+            let decoder = web_sys::TextDecoder::new().unwrap();
+            let decode_opts = js_sys::Object::new();
+            let _ = js_sys::Reflect::set(&decode_opts, &"stream".into(), &JsValue::from(true));
+            let opts: web_sys::TextDecodeOptions = decode_opts.unchecked_into();
+            
             // Setup listener
             let cb = Closure::wrap(Box::new(move |e: MessageEvent| {
                  if let Ok(msg) = serde_wasm_bindgen::from_value::<WorkerToUi>(e.data()) {
                      match msg {
                          WorkerToUi::Status(s) => set_status.set(s),
                          WorkerToUi::DataBatch { frames, events: _ } => {
-                             // Handle data - flatten frames and direct write
+                             // Handle data - decode via TextDecoder to handle split UTF-8 statefully
                              if let Some(term) = term_handle.get_untracked() {
+                                 // Clean up: Removed stale comments about thread-local storage
                                  for f in frames {
                                      if !f.bytes.is_empty() {
-                                         term.write_u8(&f.bytes);
+                                        // Stateful decode: split chars are buffered by decoder
+                                        if let Ok(text) = decoder.decode_with_u8_array_and_options(&f.bytes, &opts) {
+                                            let text: String = text;
+                                            let text: String = text;
+                                            if !text.is_empty() {
+                                                term.write(&text);
+                                            }
+                                        }
                                      }
                                  }
                              }
@@ -86,9 +100,10 @@ pub fn App() -> impl IntoView {
                       // 1. Open locally
                       let options = web_sys::SerialOptions::new(current_baud);
                       options.set_data_bits(8);
-                      options.set_parity(web_sys::SerialParityType::None);
                       options.set_stop_bits(1);
-                      options.set_flow_control(web_sys::SerialFlowControlType::None);
+                      // Enums not available in web-sys 0.3.83, setting via Reflect
+                      let _ = js_sys::Reflect::set(&options, &"parity".into(), &"none".into());
+                      let _ = js_sys::Reflect::set(&options, &"flowControl".into(), &"none".into());
                       
                       let open_promise = port.open(&options);
                       
@@ -184,12 +199,33 @@ pub fn App() -> impl IntoView {
 
     let on_data = move |data: String| {
         if let Some(w) = worker.get_untracked() {
-             // Debug 
-             set_status.set(format!("TX: {} bytes", data.len()));
+             let len = data.len();
+             set_status.set(format!("TX: {} bytes", len));
              
-             let msg = UiToWorker::Send { data: data.into_bytes() };
-             if let Ok(val) = serde_wasm_bindgen::to_value(&msg) {
-                 let _ = w.post_message(&val);
+             if len <= 64 {
+                 // Fast path: send immediately
+                 let msg = UiToWorker::Send { data: data.into_bytes() };
+                 if let Ok(val) = serde_wasm_bindgen::to_value(&msg) {
+                     let _ = w.post_message(&val);
+                 }
+             } else {
+                 // Throttled path for Paste (prevent buffer overflow)
+                 let data_bytes = data.into_bytes();
+                 let w_clone = w.clone();
+                 spawn_local(async move {
+                     for chunk in data_bytes.chunks(64) {
+                         let msg = UiToWorker::Send { data: chunk.to_vec() };
+                         if let Ok(val) = serde_wasm_bindgen::to_value(&msg) {
+                             let _ = w_clone.post_message(&val);
+                         }
+                         // 5ms delay between chunks (approx 200 chunks/sec => ~12KB/s minimum, enough for 115200+)
+                         // For 1.5M, we can go faster, but safety first.
+                         let promise = js_sys::Promise::new(&mut |resolve, _| {
+                             let _ = web_sys::window().unwrap().set_timeout_with_callback_and_timeout_and_arguments_0(&resolve, 5);
+                         });
+                         let _ = wasm_bindgen_futures::JsFuture::from(promise).await;
+                     }
+                 });
              }
         }
     };
