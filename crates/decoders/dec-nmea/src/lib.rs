@@ -15,45 +15,62 @@ impl NmeaDecoder {
 
 impl Decoder for NmeaDecoder {
     fn ingest(&mut self, frame: &Frame) -> Option<DecodedEvent> {
+        let mut event = DecodedEvent::new(0, "", "");
+        if self.ingest_into(frame, &mut event) {
+            Some(event)
+        } else {
+            None
+        }
+    }
+
+    fn ingest_into(&mut self, frame: &Frame, output: &mut DecodedEvent) -> bool {
         // 1. Convert frame bytes to string (NMEA is ASCII)
-        let s = std::str::from_utf8(&frame.bytes).ok()?;
+        let Ok(s) = std::str::from_utf8(&frame.bytes) else {
+            return false;
+        };
         
         // 2. Parse
-        // Note: `nmea` crate's `parse` method typically expects the full sentence including $ and checksum.
-        // It updates internal state.
         match self.parser.parse(s) {
             Ok(sentence_type) => {
                 // Success!
-                // We construct an event based on the parsed data.
-                // For now, simpler summary: just the sentence type and key info.
+                // Clear the output buffer first to ensure clean state
+                output.clear();
                 
-                // Note: The `nmea` parser maintains state (fix, etc.).
-                // We might want to snapshot that state into the event.
+                output.timestamp_us = frame.timestamp_us;
+                output.protocol = std::borrow::Cow::Borrowed("NMEA");
+
+                let type_str = match sentence_type {
+                    nmea::SentenceType::GGA => "GGA",
+                    nmea::SentenceType::RMC => "RMC",
+                    nmea::SentenceType::GSA => "GSA",
+                    nmea::SentenceType::GSV => "GSV",
+                    nmea::SentenceType::VTG => "VTG",
+                    nmea::SentenceType::GLL => "GLL",
+                    nmea::SentenceType::TXT => "TXT",
+                    _ => "OTHER", // Fallback if we don't want to format!
+                };
                 
-                let summary = format!("NMEA {:?}", sentence_type);
-                let mut event = DecodedEvent::new(frame.timestamp_us, "NMEA", &summary)
-                    .with_field("type", format!("{:?}", sentence_type));
+                output.summary = std::borrow::Cow::Borrowed(type_str);
+                output.fields.push((std::borrow::Cow::Borrowed("type"), type_str.into()));
                     
-                // Add specific fields if GPGGA (Global Positioning System Fix Data)
-                // Just as an example of structured data extraction
+                // Add specific fields if GPGGA
                 if let nmea::SentenceType::GGA = sentence_type {
                     if let Some(lat) = self.parser.latitude {
-                        event = event.with_field("latitude", lat);
+                        output.fields.push((std::borrow::Cow::Borrowed("latitude"), lat.into()));
                     }
                     if let Some(lon) = self.parser.longitude {
-                        event = event.with_field("longitude", lon);
+                        output.fields.push((std::borrow::Cow::Borrowed("longitude"), lon.into()));
                     }
                     if let Some(alt) = self.parser.altitude {
-                        event = event.with_field("altitude", alt);
+                        output.fields.push((std::borrow::Cow::Borrowed("altitude"), alt.into()));
                     }
                 }
-
-                Some(event)
+                
+                output.confidence = 1.0;
+                true
             },
             Err(_e) => {
-                // Parse failed (CRC error, invalid format, etc.)
-                // Return None -> This frame is not valid NMEA (or at least this decoder thinks so)
-                None
+                false
             }
         }
     }
@@ -82,8 +99,8 @@ mod tests {
         
         assert_eq!(event.protocol, "NMEA");
         // Check dynamic fields (simplified check, real usage would check lat/lon values)
-        assert!(event.fields.contains_key("latitude"));
-        assert!(event.fields.contains_key("longitude"));
+        assert!(event.fields.iter().any(|(k, _)| k == "latitude"));
+        assert!(event.fields.iter().any(|(k, _)| k == "longitude"));
     }
 
     #[test]

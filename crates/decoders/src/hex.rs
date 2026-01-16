@@ -35,7 +35,7 @@ impl Decoder for HexDecoder {
             hex_str.clone()
         };
 
-        Some(DecodedEvent::new(frame.timestamp_us, "Hex", &summary)
+        Some(DecodedEvent::new(frame.timestamp_us, "Hex", summary)
             .with_field("hex", hex_str)
             .with_field("ascii", ascii_str)
             .with_field("len", frame.bytes.len()))
@@ -53,6 +53,7 @@ impl Decoder for HexDecoder {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use core_types::Value;
 
     #[test]
     fn test_hex_decoder() {
@@ -62,8 +63,20 @@ mod tests {
         let event = decoder.ingest(&frame).expect("Hex decoder always succeeds");
         
         assert_eq!(event.protocol, "Hex");
-        assert_eq!(event.fields.get("hex").unwrap().as_str().unwrap(), "41 42 00 FF");
-        assert_eq!(event.fields.get("ascii").unwrap().as_str().unwrap(), "AB..");
-        assert_eq!(event.fields.get("len").unwrap().as_u64().unwrap(), 4);
+        
+        match event.get_field("hex") {
+            Some(Value::String(s)) => assert_eq!(s, "41 42 00 FF"),
+            _ => panic!("Expected hex string field"),
+        }
+        
+        match event.get_field("ascii") {
+            Some(Value::String(s)) => assert_eq!(s, "AB.."),
+            _ => panic!("Expected ascii string field"),
+        }
+
+        match event.get_field("len") {
+            Some(Value::I64(v)) => assert_eq!(*v, 4),
+            _ => panic!("Expected len integer field"),
+        }
     }
 }

@@ -1,5 +1,8 @@
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+
+
+pub mod transport;
+pub use transport::{Transport, TransportError};
 
 /// Represents the direction of data flow.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -37,38 +40,72 @@ impl Frame {
     }
 }
 
+use std::borrow::Cow;
+
+/// Lightweight value wrapper to avoid serde_json allocations for common types.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum Value {
+    Null,
+    Bool(bool),
+    I64(i64),
+    F64(f64),
+    String(String),
+}
+
+impl From<bool> for Value { fn from(v: bool) -> Self { Value::Bool(v) } }
+impl From<i64> for Value { fn from(v: i64) -> Self { Value::I64(v) } }
+impl From<i32> for Value { fn from(v: i32) -> Self { Value::I64(v as i64) } }
+impl From<f64> for Value { fn from(v: f64) -> Self { Value::F64(v) } }
+impl From<f32> for Value { fn from(v: f32) -> Self { Value::F64(v as f64) } }
+impl From<String> for Value { fn from(v: String) -> Self { Value::String(v) } }
+impl From<&str> for Value { fn from(v: &str) -> Self { Value::String(v.to_string()) } }
+impl From<usize> for Value { fn from(v: usize) -> Self { Value::I64(v as i64) } }
+
 /// A semantic interpretation of a Frame.
+/// Optimized for low allocation frequency.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct DecodedEvent {
     /// Timestamp inherited from the Frame.
     pub timestamp_us: u64,
     /// Protocol name (e.g., "NMEA", "MAVLink", "Hex").
-    pub protocol: String,
+    pub protocol: Cow<'static, str>,
     /// Short human-readable summary (e.g., "GPGGA: 3D Fix").
-    pub summary: String,
+    pub summary: Cow<'static, str>,
     /// Structured key-value pairs for deep inspection.
-    pub fields: HashMap<String, serde_json::Value>,
+    /// Using Vec instead of HashMap to avoid allocation for small number of fields.
+    pub fields: Vec<(Cow<'static, str>, Value)>,
     /// How confident the decoder is (0.0 - 1.0).
-    /// Useful for heuristic detection.
     pub confidence: f32,
 }
 
 impl DecodedEvent {
-    pub fn new(timestamp_us: u64, protocol: &str, summary: &str) -> Self {
+    pub fn new(timestamp_us: u64, protocol: &'static str, summary: impl Into<Cow<'static, str>>) -> Self {
         Self {
             timestamp_us,
-            protocol: protocol.to_string(),
-            summary: summary.to_string(),
-            fields: HashMap::new(),
+            protocol: Cow::Borrowed(protocol),
+            summary: summary.into(),
+            fields: Vec::with_capacity(8), // Pre-allocate small capacity
             confidence: 1.0,
         }
     }
 
-    pub fn with_field<V: Serialize>(mut self, key: &str, value: V) -> Self {
-        if let Ok(json_val) = serde_json::to_value(value) {
-            self.fields.insert(key.to_string(), json_val);
-        }
+    pub fn with_field<V: Into<Value>>(mut self, key: &'static str, value: V) -> Self {
+        self.fields.push((Cow::Borrowed(key), value.into()));
         self
+    }
+    
+    // Helper to get a field for tests
+    pub fn get_field(&self, key: &str) -> Option<&Value> {
+        self.fields.iter().find(|(k, _)| k == key).map(|(_, v)| v)
+    }
+
+    /// Resets the event data without deallocating the fields vector.
+    pub fn clear(&mut self) {
+        self.protocol = Cow::Borrowed("");
+        self.summary = Cow::Borrowed("");
+        self.fields.clear();
+        self.confidence = 0.0;
     }
 }
 
@@ -81,6 +118,20 @@ pub trait Decoder: Send {
     /// # Arguments
     /// * `frame` - The input frame (contains bytes, timestamp, channel).
     fn ingest(&mut self, frame: &Frame) -> Option<DecodedEvent>;
+
+    /// Attempt to parse a frame into an existing DecodedEvent buffer.
+    /// Returns true if successful, false otherwise.
+    /// 
+    /// Detailed Instructions:
+    /// Implementations should call `output.clear()` before populating.
+    fn ingest_into(&mut self, frame: &Frame, output: &mut DecodedEvent) -> bool {
+        if let Some(event) = self.ingest(frame) {
+            *output = event;
+            true
+        } else {
+            false
+        }
+    }
 
     /// Get the unique name of this decoder (e.g., "NMEA", "Hex").
     fn id(&self) -> &'static str;
@@ -108,7 +159,7 @@ mod tests {
             .with_field("valid", true);
         
         assert_eq!(event.protocol, "TEST");
-        assert_eq!(event.fields.get("temperature").unwrap().as_f64(), Some(25.5));
-        assert_eq!(event.fields.get("valid").unwrap().as_bool(), Some(true));
+        assert_eq!(event.fields.iter().find(|(k, _)| k == "temperature").unwrap().1, Value::F64(25.5));
+        assert_eq!(event.fields.iter().find(|(k, _)| k == "valid").unwrap().1, Value::Bool(true));
     }
 }

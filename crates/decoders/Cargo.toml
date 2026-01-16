@@ -5,5 +5,5 @@ edition = "2021"
 
 [dependencies]
 core-types = { path = "../core-types" }
-framing = { path = "../framing" }
+
 dec-nmea = { path = "dec-nmea" }
