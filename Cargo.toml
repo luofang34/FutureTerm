@@ -4,9 +4,7 @@ members = [
     "crates/framing",
     "crates/decoders",
     "crates/decoders/dec-nmea",
-    "crates/decoders/dec-mavlink",
     "crates/transport-webserial",
-    "crates/transport-native",
     # apps/web will be a separate npm project or part of workspace if using wasm-pack extensively
     # apps/native will be a cargo project
     "apps/native", 
