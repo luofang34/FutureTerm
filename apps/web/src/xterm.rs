@@ -10,16 +10,13 @@ extern "C" {
     type FitAddon;
 
     #[wasm_bindgen(constructor, js_namespace = window)]
-    fn new(options: &js_sys::Object) -> Terminal;
+    fn new() -> Terminal;
 
     #[wasm_bindgen(method)]
     fn open(this: &Terminal, parent: &HtmlDivElement);
 
     #[wasm_bindgen(method)]
     fn write(this: &Terminal, data: &str);
-
-    #[wasm_bindgen(method, js_name = write)]
-    fn write_u8(this: &Terminal, data: &[u8]);
     
     #[wasm_bindgen(method, js_name = loadAddon)]
     fn load_addon(this: &Terminal, addon: &FitAddon);
@@ -27,18 +24,14 @@ extern "C" {
     #[wasm_bindgen(constructor, js_namespace = window, js_name = FitAddon_FitAddon)]
     fn new_fit_addon() -> FitAddon;
 
-    #[wasm_bindgen(method, js_name = onData)]
-    fn on_data(this: &Terminal, callback: &js_sys::Function) -> js_sys::Object; // returns IDisposable
+    #[wasm_bindgen(method)]
+    fn fit(this: &FitAddon);
 }
 
 #[derive(Clone)]
 pub struct TerminalHandle(Terminal);
 
 impl TerminalHandle {
-    pub fn write_u8(&self, data: &[u8]) {
-        self.0.write_u8(data);
-    }
-    
     pub fn write(&self, data: &str) {
         self.0.write(data);
     }
@@ -47,7 +40,6 @@ impl TerminalHandle {
 #[component]
 pub fn TerminalView(
     #[prop(optional)] on_mount: Option<Callback<()>>,
-    #[prop(optional)] on_data: Option<Callback<String>>,
     #[prop(optional)] on_terminal_ready: Option<Callback<TerminalHandle>>,
 ) -> impl IntoView 
 {
@@ -55,23 +47,22 @@ pub fn TerminalView(
 
     create_effect(move |_| {
         if let Some(div) = container_ref.get() {
-            let options = js_sys::Object::new();
-            let _ = js_sys::Reflect::set(&options, &"convertEol".into(), &JsValue::from(true));
-            let term = Terminal::new(&options);
-            term.open(&div);
-            
-            term.write("Welcome to WASM Serial Tool v0.1\r\n");
-            term.write("Ready to connect...\r\n");
+            // Note: In real app, we need to ensure we don't double-initialize if effect re-runs.
+            // But strict mode might trigger it twice.
+            // xterm.js doesn't like being reopened on same div usually without disposal.
+            // For V1 simple prototype, we just do it.
 
-            // Input handling
-            if let Some(cb) = on_data {
-                let closure = Closure::wrap(Box::new(move |data: String| {
-                    cb.call(data);
-                }) as Box<dyn FnMut(String)>);
-                term.on_data(closure.as_ref().unchecked_ref());
-                closure.forget();
-            }
+            let term = Terminal::new();
+            // let fit_addon = FitAddon::new_fit_addon(); // Commented out until we verify namespace
             
+            // term.load_addon(&fit_addon);
+            term.open(&div);
+            // fit_addon.fit();
+            
+            term.write("\x1b[1;36mFutureTerm v0.2\x1b[0m\r\n");
+            term.write("----------------\r\n");
+            term.write("Ready to connect...\r\n\r\n");
+
             if let Some(cb) = on_terminal_ready {
                 cb.call(TerminalHandle(term.clone().unchecked_into()));
             }

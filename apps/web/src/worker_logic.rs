@@ -4,7 +4,7 @@ use web_sys::{MessageEvent, DedicatedWorkerGlobalScope, SerialPort};
 use wasm_bindgen_futures::JsFuture;
 use crate::protocol::{UiToWorker, WorkerToUi};
 use transport_webserial::{WebSerialTransport, TransportError};
-use framing::{Framer, lines::LineFramer, raw::RawFramer};
+use framing::{Framer, lines::LineFramer};
 use decoders::{Decoder, hex::HexDecoder};
 use std::rc::Rc;
 use std::cell::RefCell;
@@ -33,72 +33,59 @@ async fn handle_message(
 ) {
     let data = event.data();
     // Notify UI we got something (Debugging)
-    // post_to_ui(&WorkerToUi::Status("Worker: Message Received".into()));
+    post_to_ui(&WorkerToUi::Status("Worker: Message Received".into()));
     
-    // Check for "Connect" manually to allow extra fields (streams) which confuse serde
-    let connect_val = js_sys::Reflect::get(&data, &"Connect".into());
+    // Extract envelope: { cmd: ..., port: ... }
+    let cmd_val = js_sys::Reflect::get(&data, &"cmd".into()).unwrap_or(data.clone()); 
     
-    if let Ok(c_val) = connect_val {
-        if !c_val.is_undefined() {
-             // It is a Connect message
-             // Extract baud_rate from the inner object: { "baud_rate": 123 }
-             // But wait, lib.rs sends { "Connect": { "baud_rate": 123 } }
-             let baud_obj: js_sys::Object = c_val.unchecked_into();
-             let br_val = js_sys::Reflect::get(&baud_obj, &"baud_rate".into()).unwrap_or(JsValue::from(115200));
-             // let baud_rate = br_val.as_f64().unwrap_or(115200.0) as u32; // Not needed if we don't use it or open locally?
-             // Actually, we perform attach now, baud rate is irrelevant to worker in this mode.
-             
-             post_to_ui(&WorkerToUi::Status("Worker: Connect Cmd Detected".into()));
-             
-             let reader_val = js_sys::Reflect::get(&data, &"readable".into()).ok();
-             let writer_val = js_sys::Reflect::get(&data, &"writable".into()).ok();
-            
-             if let (Some(r), Some(w)) = (reader_val, writer_val) {
-                 if !r.is_undefined() && !w.is_undefined() {
-                     post_to_ui(&WorkerToUi::Status("Worker: Streams extracted".into()));
-                     
-                     use web_sys::{ReadableStream, WritableStream, ReadableStreamDefaultReader, WritableStreamDefaultWriter};
-                     use wasm_bindgen::JsCast;
-
-                     let r_stream: ReadableStream = r.unchecked_into();
-                     let w_stream: WritableStream = w.unchecked_into();
-                     
-                     // Get Reader/Writer from streams
-                     let reader_val = r_stream.get_reader();
-                     let reader: ReadableStreamDefaultReader = reader_val.unchecked_into();
-                     
-                     let writer_val = w_stream.get_writer().unwrap(); 
-                     let writer: WritableStreamDefaultWriter = writer_val.unchecked_into();
-                     
-                     let mut t = transport.borrow_mut();
-                     t.attach(reader, writer);
-                     post_to_ui(&WorkerToUi::Status("Connected".into()));
-                     return;
-                 } else {
-                     post_to_ui(&WorkerToUi::Status("Worker: Streams are undefined".into()));
-                 }
-            } else {
-                 post_to_ui(&WorkerToUi::Status("Worker: Failed to reflect stream properties".into()));
-            }
-            return;
-        }
-    }
-
-    match from_value::<UiToWorker>(data.clone()) {
+    match from_value::<UiToWorker>(cmd_val) {
         Ok(cmd) => {
-            // log!("Worker parsed cmd: {:?}", cmd);
+            web_sys::console::log_1(&format!("Worker parsed cmd: {:?}", cmd).into());
             match cmd {
-                UiToWorker::Connect { .. } => {
-                    // Should be handled above manually
-                    post_to_ui(&WorkerToUi::Status("Worker: Fallback Connect (Unexpected)".into()));
+                UiToWorker::Connect { baud_rate } => {
+                    web_sys::console::log_1(&"Worker: Handling Connect...".into());
+                    // Port is on the envelope (data), not inside cmd
+                    let port_val = js_sys::Reflect::get(&data, &"port".into()).ok();
+                    if let Some(val) = port_val {
+                        if !val.is_undefined() && !val.is_null() {
+                             web_sys::console::log_1(&"Worker: Port found in message.".into());
+                             let port: SerialPort = val.unchecked_into();
+                             // Must be mutable because open() takes &mut self
+                             let mut t = transport.borrow_mut();
+                             web_sys::console::log_1(&"Worker: Calling transport.open...".into());
+                             match t.open(port, baud_rate).await {
+                                 Ok(_) => {
+                                     web_sys::console::log_1(&"Worker: Transport opened.".into());
+                                     post_to_ui(&WorkerToUi::Status("Connected".into()));
+                                 },
+                                 Err(e) => {
+                                     web_sys::console::log_1(&format!("Worker: Transport open failed: {:?}", e).into());
+                                     post_to_ui(&WorkerToUi::Status(format!("Error: {:?}", e)));
+                                 }
+                             }
+                             return;
+                        }
+                    }
+                    web_sys::console::log_1(&"Worker: Port NOT found in message.".into());
+                    post_to_ui(&WorkerToUi::Status("Error: Connect received without port".into()));
                 },
                 UiToWorker::Disconnect => {
+                     // close() takes &mut self
                      let mut t = transport.borrow_mut();
                      let _ = t.close().await;
                      post_to_ui(&WorkerToUi::Status("Disconnected".into()));
                 },
                 UiToWorker::Send { data } => {
-                     // Changed to borrow() to allow concurrent Write while Read is pending
+                     // write() takes &self, so no mut needed for the transport struct itself?
+                     // Wait, RefCell::borrow_mut() returns a RefMut, which derefs to &mut T.
+                     // If write() takes &self, we can use borrow() instead of borrow_mut()!
+                     // BUT, we used SharedTransport = Rc<RefCell<WebSerialTransport>>.
+                     // If we want to allow concurrent reads, we should use borrow().
+                     // But WebSerialTransport logic might require internal mutability if it wasn't using RefCell? 
+                     // No, WebSerialTransport struct fields are Option<...>. Setting them requires &mut.
+                     // Writing to them: writer.write_with_chunk takes &self (JS API).
+                     
+                     // So we can use borrow() here if write() is &self.
                      let t = transport.borrow();
                      let _ = t.write(&data).await;
                 },
@@ -110,6 +97,48 @@ async fn handle_message(
                          _ => log!("Unknown decoder: {}", id),
                      }
                      post_to_ui(&WorkerToUi::Status(format!("Decoder set to {}", id)));
+                },
+                UiToWorker::Simulate { duration_ms } => {
+                     post_to_ui(&WorkerToUi::Status(format!("Starting Simulation ({}ms)...", duration_ms)));
+                     let f_metrics = framer.clone();
+                     let d_metrics = decoder.clone();
+                     
+                     wasm_bindgen_futures::spawn_local(async move {
+                         let start = js_sys::Date::now();
+                         // GPGGA sample
+                         let base_sentence = "$GPGGA,123519,4807.038,N,01131.000,E,1,08,0.9,545.4,M,46.9,M,,*47\r\n";
+                         
+                         while js_sys::Date::now() - start < duration_ms as f64 {
+                             // Inject
+                             let bytes = base_sentence.as_bytes();
+                             let mut f = f_metrics.borrow_mut();
+                             // Mock timestamp
+                             let ts = (js_sys::Date::now() * 1000.0) as u64; 
+                             let frames = f.push(bytes, ts);
+                             drop(f); // Release borrow
+                             
+                             let mut events = Vec::new();
+                             let mut d = d_metrics.borrow_mut();
+                             for frame in &frames {
+                                 if let Some(event) = d.ingest(frame) {
+                                     events.push(event);
+                                 }
+                             }
+                             drop(d); // Release borrow
+                             
+                             if !frames.is_empty() {
+                                 post_to_ui(&WorkerToUi::DataBatch { frames, events });
+                             }
+                             
+                             // Sleep 500ms
+                             let _ = JsFuture::from(
+                                 js_sys::Promise::new(&mut |resolve, _| {
+                                     let _ = worker_scope().set_timeout_with_callback_and_timeout_and_arguments_0(&resolve, 500);
+                                 })
+                             ).await;
+                         }
+                         post_to_ui(&WorkerToUi::Status("Simulation Complete".into()));
+                     });
                 },
                 _ => log!("Unhandled command"),
             }
@@ -130,27 +159,20 @@ async fn read_loop(
         // But `read_chunk` is async, so it yields.
         
         // Check if connected
-        // let _is_open = transport.borrow().is_open(); 
+        // borrow() is enough for is_open()
+        let _is_open = transport.borrow().is_open(); 
         
-        // Changed to borrow() to allow concurrent interaction
-        // Note: This holds an immutable borrow across the await point.
+        // read_chunk uses &self in WebSerialTransport, so borrow() is fine
         let result = transport.borrow().read_chunk().await;
         
         match result {
             Ok((bytes, ts)) => {
                  if !bytes.is_empty() {
-                     // Debug: Echo raw bytes to UI status for diagnosis
-                     // post_to_ui(&WorkerToUi::Status(format!("RX: {} bytes", bytes.len())));
-                     
                      // 1. Frame
                      let mut f = framer.borrow_mut();
                      // timestamp from read is f64 (ms), Framer wants u64 (us).
                      let ts_us = (ts * 1000.0) as u64;
                      let frames = f.push(&bytes, ts_us);
-                     
-                     if !frames.is_empty() {
-                         post_to_ui(&WorkerToUi::Status(format!("RX Framed: {} frames", frames.len())));
-                     }
                      
                      // 2. Decode & Batch
                      let mut events = Vec::new();
@@ -190,8 +212,7 @@ async fn read_loop(
 
 pub async fn start_worker() {
     let transport = Rc::new(RefCell::new(WebSerialTransport::new()));
-    // Use RawFramer for interactive terminal to avoid buffering
-    let framer: Rc<RefCell<Box<dyn Framer>>> = Rc::new(RefCell::new(Box::new(RawFramer::new())));
+    let framer: Rc<RefCell<Box<dyn Framer>>> = Rc::new(RefCell::new(Box::new(LineFramer::new())));
     let decoder: Rc<RefCell<Box<dyn Decoder>>> = Rc::new(RefCell::new(Box::new(HexDecoder::new())));
     
     // Setup message handler

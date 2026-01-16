@@ -10,6 +10,8 @@ pub enum UiToWorker {
     // Configs
     SetFramer { id: String },
     SetDecoder { id: String },
+    // Simulation
+    Simulate { duration_ms: u32 },
 }
 
 #[derive(Debug, Serialize, Deserialize)]
