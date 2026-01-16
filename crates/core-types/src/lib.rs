@@ -2,7 +2,7 @@ use serde::{Deserialize, Serialize};
 
 
 pub mod transport;
-pub use transport::{Transport, TransportError};
+pub use transport::{Transport, TransportError, SignalState};
 
 /// Represents the direction of data flow.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]

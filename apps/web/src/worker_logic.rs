@@ -3,7 +3,8 @@ use serde_wasm_bindgen::{to_value, from_value};
 use web_sys::{MessageEvent, DedicatedWorkerGlobalScope, SerialPort};
 use wasm_bindgen_futures::JsFuture;
 use crate::protocol::{UiToWorker, WorkerToUi};
-use transport_webserial::{WebSerialTransport, TransportError};
+use transport_webserial::WebSerialTransport;
+use core_types::{Transport, TransportError};
 use framing::{Framer, lines::LineFramer};
 use decoders::{Decoder, hex::HexDecoder};
 use std::rc::Rc;
@@ -171,7 +172,7 @@ async fn read_loop(
                      // 1. Frame
                      let mut f = framer.borrow_mut();
                      // timestamp from read is f64 (ms), Framer wants u64 (us).
-                     let ts_us = (ts * 1000.0) as u64;
+                     let ts_us = ts;
                      let frames = f.push(&bytes, ts_us);
                      
                      // 2. Decode & Batch

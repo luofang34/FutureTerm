@@ -12,22 +12,38 @@ pub enum TransportError {
     Other(String),
 }
 
+
+use serde::{Deserialize, Serialize};
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct SignalState {
+    pub dtr: bool,
+    pub rts: bool,
+    pub dcd: bool, // Data Carrier Detect
+    pub dsr: bool, // Data Set Ready
+    pub ri: bool,  // Ring Indicator
+    pub cts: bool, // Clear To Send
+}
+
 /// A generic async transport layer (Serial, WebSocket, TCP, etc.)
-/// 
-/// Note: We use `async_trait` compatible signatures directly if on Rust 1.75+,
-/// or use the `async_trait` macro if we need to support older rust or dynamic dispatch easily.
-/// Given user prompt syntax, standard async fn in trait is likely meant.
-/// However, for object safety (Box<dyn Transport>), native async fn in traits have caveats (Send bounds etc).
-/// For now, we define it as standard async fn.
 #[allow(async_fn_in_trait)]
 pub trait Transport: Send + Sync {
+    /// Check if the transport is currently open.
+    fn is_open(&self) -> bool;
+
     /// Read a chunk of bytes.
-    /// Returns (data, timestamp).
-    async fn read_chunk(&self) -> Result<(Vec<u8>, f64), TransportError>;
+    /// Returns (data, timestamp_in_microseconds).
+    async fn read_chunk(&self) -> Result<(Vec<u8>, u64), TransportError>;
     
     /// Write bytes to the transport.
     async fn write(&self, data: &[u8]) -> Result<(), TransportError>;
     
+    /// Control DTR and RTS signals.
+    async fn set_signals(&self, dtr: bool, rts: bool) -> Result<(), TransportError>;
+
+    /// Read signal state (CTS, DSR, DCD, RI).
+    async fn get_signals(&self) -> Result<SignalState, TransportError>;
+
     /// Close the connection.
     async fn close(&mut self) -> Result<(), TransportError>;
 }
