@@ -5,7 +5,7 @@ use wasm_bindgen_futures::JsFuture;
 use crate::protocol::{UiToWorker, WorkerToUi};
 use transport_webserial::WebSerialTransport;
 use core_types::{Transport, TransportError};
-use framing::{Framer, lines::LineFramer};
+use framing::{Framer, lines::LineFramer, raw::RawFramer, cobs_impl::CobsFramer, slip_impl::SlipFramer};
 use decoders::{Decoder, hex::HexDecoder};
 use std::rc::Rc;
 use std::cell::RefCell;
@@ -13,6 +13,8 @@ use leptos::logging::log;
 
 // Types
 type SharedTransport = Rc<RefCell<WebSerialTransport>>;
+type SharedFramer = Rc<RefCell<Box<dyn Framer>>>;
+type SharedDecoder = Rc<RefCell<Box<dyn Decoder>>>;
 
 fn worker_scope() -> DedicatedWorkerGlobalScope {
     js_sys::global().unchecked_into()
@@ -29,8 +31,8 @@ fn post_to_ui(msg: &WorkerToUi) {
 async fn handle_message(
     event: MessageEvent, 
     transport: SharedTransport,
-    framer: Rc<RefCell<Box<dyn Framer>>>,
-    decoder: Rc<RefCell<Box<dyn Decoder>>>
+    framer: SharedFramer,
+    decoder: SharedDecoder
 ) {
     let data = event.data();
     // Notify UI we got something (Debugging)
@@ -41,33 +43,26 @@ async fn handle_message(
     
     match from_value::<UiToWorker>(cmd_val) {
         Ok(cmd) => {
-            web_sys::console::log_1(&format!("Worker parsed cmd: {:?}", cmd).into());
             match cmd {
                 UiToWorker::Connect { baud_rate } => {
-                    web_sys::console::log_1(&"Worker: Handling Connect...".into());
                     // Port is on the envelope (data), not inside cmd
                     let port_val = js_sys::Reflect::get(&data, &"port".into()).ok();
                     if let Some(val) = port_val {
                         if !val.is_undefined() && !val.is_null() {
-                             web_sys::console::log_1(&"Worker: Port found in message.".into());
                              let port: SerialPort = val.unchecked_into();
                              // Must be mutable because open() takes &mut self
                              let mut t = transport.borrow_mut();
-                             web_sys::console::log_1(&"Worker: Calling transport.open...".into());
                              match t.open(port, baud_rate).await {
                                  Ok(_) => {
-                                     web_sys::console::log_1(&"Worker: Transport opened.".into());
                                      post_to_ui(&WorkerToUi::Status("Connected".into()));
                                  },
                                  Err(e) => {
-                                     web_sys::console::log_1(&format!("Worker: Transport open failed: {:?}", e).into());
                                      post_to_ui(&WorkerToUi::Status(format!("Error: {:?}", e)));
                                  }
                              }
                              return;
                         }
                     }
-                    web_sys::console::log_1(&"Worker: Port NOT found in message.".into());
                     post_to_ui(&WorkerToUi::Status("Error: Connect received without port".into()));
                 },
                 UiToWorker::Disconnect => {
@@ -141,7 +136,27 @@ async fn handle_message(
                          post_to_ui(&WorkerToUi::Status("Simulation Complete".into()));
                      });
                 },
-                _ => log!("Unhandled command"),
+                UiToWorker::SetFramer { id } => {
+                     let mut f = framer.borrow_mut();
+                     match id.as_str() {
+                         "raw" => *f = Box::new(RawFramer::new()),
+                         "lines" => *f = Box::new(LineFramer::new()),
+                         "cobs" => *f = Box::new(CobsFramer::new()),
+                         "slip" => *f = Box::new(SlipFramer::new()),
+                         _ => log!("Unknown framer: {}", id),
+                     }
+                     post_to_ui(&WorkerToUi::Status(format!("Framer set to {}", id)));
+                },
+                UiToWorker::SetSignals { dtr, rts } => {
+                     let t = transport.clone();
+                     wasm_bindgen_futures::spawn_local(async move {
+                         let t = t.borrow();
+                         if let Err(e) = t.set_signals(dtr, rts).await {
+                             post_to_ui(&WorkerToUi::Status(format!("SetSignals error: {:?}", e)));
+                         }
+                     });
+                },
+
             }
         },
         Err(e) => post_to_ui(&WorkerToUi::Status(format!("Worker Parse Error: {:?}", e))),
@@ -151,8 +166,8 @@ async fn handle_message(
 // The loop that reads from transport and feeds framer
 async fn read_loop(
     transport: SharedTransport,
-    framer: Rc<RefCell<Box<dyn Framer>>>,
-    decoder: Rc<RefCell<Box<dyn Decoder>>>
+    framer: SharedFramer,
+    decoder: SharedDecoder
 ) {
     loop {
         // Yield to allow message handling? 
@@ -161,7 +176,6 @@ async fn read_loop(
         
         // Check if connected
         // borrow() is enough for is_open()
-        let _is_open = transport.borrow().is_open(); 
         
         // read_chunk uses &self in WebSerialTransport, so borrow() is fine
         let result = transport.borrow().read_chunk().await;
@@ -213,8 +227,8 @@ async fn read_loop(
 
 pub async fn start_worker() {
     let transport = Rc::new(RefCell::new(WebSerialTransport::new()));
-    let framer: Rc<RefCell<Box<dyn Framer>>> = Rc::new(RefCell::new(Box::new(LineFramer::new())));
-    let decoder: Rc<RefCell<Box<dyn Decoder>>> = Rc::new(RefCell::new(Box::new(HexDecoder::new())));
+    let framer: SharedFramer = Rc::new(RefCell::new(Box::new(LineFramer::new())));
+    let decoder: SharedDecoder = Rc::new(RefCell::new(Box::new(HexDecoder::new())));
     
     // Setup message handler
     let t_clone = transport.clone();

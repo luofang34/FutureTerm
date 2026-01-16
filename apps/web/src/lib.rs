@@ -10,7 +10,7 @@ pub mod worker_logic;
 
 #[component]
 pub fn App() -> impl IntoView {
-    let (terminal_ready, set_terminal_ready) = create_signal(false);
+    let (_terminal_ready, set_terminal_ready) = create_signal(false);
     let (status, set_status) = create_signal("Idle".to_string());
     let (worker, set_worker) = create_signal::<Option<Worker>>(None);
     let (baud_rate, set_baud_rate) = create_signal(115200);

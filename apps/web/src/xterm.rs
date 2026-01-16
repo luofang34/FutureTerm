@@ -7,7 +7,6 @@ use web_sys::HtmlDivElement;
 extern "C" {
     #[derive(Clone)]
     type Terminal;
-    type FitAddon;
 
     #[wasm_bindgen(constructor, js_namespace = window)]
     fn new() -> Terminal;
@@ -17,15 +16,6 @@ extern "C" {
 
     #[wasm_bindgen(method)]
     fn write(this: &Terminal, data: &str);
-    
-    #[wasm_bindgen(method, js_name = loadAddon)]
-    fn load_addon(this: &Terminal, addon: &FitAddon);
-
-    #[wasm_bindgen(constructor, js_namespace = window, js_name = FitAddon_FitAddon)]
-    fn new_fit_addon() -> FitAddon;
-
-    #[wasm_bindgen(method)]
-    fn fit(this: &FitAddon);
 }
 
 #[derive(Clone)]
@@ -53,11 +43,8 @@ pub fn TerminalView(
             // For V1 simple prototype, we just do it.
 
             let term = Terminal::new();
-            // let fit_addon = FitAddon::new_fit_addon(); // Commented out until we verify namespace
             
-            // term.load_addon(&fit_addon);
             term.open(&div);
-            // fit_addon.fit();
             
             term.write("\x1b[1;36mFutureTerm v0.2\x1b[0m\r\n");
             term.write("----------------\r\n");

@@ -26,7 +26,4 @@ framing = { path = "../../crates/framing" }
 decoders = { path = "../../crates/decoders" }
 js-sys = "0.3"
 
-[profile.release]
-codegen-units = 1
-lto = true
-opt-level = 'z'
+

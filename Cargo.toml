@@ -16,3 +16,6 @@ resolver = "2"
 lto = true
 opt-level = 3
 codegen-units = 1
+
+[profile.release.package.app-web]
+opt-level = "z"
