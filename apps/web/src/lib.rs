@@ -300,9 +300,22 @@ pub fn App() -> impl IntoView {
                                                                  };
                                                                  // Manager Connect (Handles open, loop, worker)
                                                                  // Auto-reconnect not needed here, handled by manager internal state or explicit loop
+                                                                 web_sys::console::log_1(&"DEBUG: Auto-Connect Triggered. Calling disconnect/connect sequence.".into());
+
                                                                  spawn_local(async move {
+                                                                    // FORCE RESET: Close any stale handles (even if we think we are disconnected, the browser might hold the lock)
+                                                                    manager_conn.disconnect().await;
+                                                                    
+                                                                    // Wait for OS/Browser to release resource fully (Crucial for auto-reconnect)
+                                                                    let _ = wasm_bindgen_futures::JsFuture::from(
+                                                                        js_sys::Promise::new(&mut |r, _| {
+                                                                            let _ = web_sys::window().unwrap().set_timeout_with_callback_and_timeout_and_arguments_0(&r, 500);
+                                                                        })
+                                                                    ).await;
+
                                                                     // Manager updates status signals automatically
-                                                                    if let Err(_e) = manager_conn.connect(p, if current_baud == 0 { 115200 } else { current_baud }, &final_framing_str).await {
+                                                                    // We pass `current_baud` directly. If it is 0 (Auto), logic in manager.connect() will trigger detection.
+                                                                    if let Err(_e) = manager_conn.connect(p, current_baud, &final_framing_str).await {
                                                                         // Connect failed
                                                                     } else {
                                                                         // Manual status update for "Restored" vs just "Connected"

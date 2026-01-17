@@ -200,6 +200,7 @@ impl ConnectionManager {
         let worker_signal = self.worker;
 
         spawn_local(async move {
+            web_sys::console::log_1(&"DEBUG: Read Loop STARTED".into());
             loop {
                  let mut chunk = Vec::new();
                  let mut ts = 0;
@@ -210,15 +211,25 @@ impl ConnectionManager {
                      if let Ok(borrow) = t_strong.try_borrow() {
                          if let Some(t) = borrow.as_ref() {
                              if !t.is_open() {
+                                 web_sys::console::log_1(&"DEBUG: Read Loop - Transport Closed".into());
                                  should_break = true;
                              } else {
                                  match t.read_chunk().await {
                                      Ok((d, t_val)) => { chunk = d; ts = t_val; },
-                                      Err(_) => { should_break = true; }
+                                      Err(e) => { 
+                                          web_sys::console::log_1(&format!("DEBUG: Read Loop - Read Error: {:?}", e).into());
+                                          should_break = true; 
+                                      }
                                  }
                              }
-                         } else { should_break = true; }
-                     } else { should_break = true; }
+                         } else { 
+                             web_sys::console::log_1(&"DEBUG: Read Loop - Transport None".into());
+                             should_break = true; 
+                         }
+                     } else { 
+                         web_sys::console::log_1(&"DEBUG: Read Loop - Transport Locked".into());
+                         should_break = true; 
+                     }
                  }
                  
                  if should_break { break; }
@@ -239,6 +250,8 @@ impl ConnectionManager {
                        ).await;
                  }
             }
+            
+            web_sys::console::log_1(&"DEBUG: Read Loop EXITED".into());
             
             // Loop exited
             if connected_signal.get_untracked() && !is_reconf.get_untracked() {
