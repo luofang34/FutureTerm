@@ -16,6 +16,9 @@ extern "C" {
 
     #[wasm_bindgen(method)]
     fn write(this: &Terminal, data: &str);
+
+    #[wasm_bindgen(method)]
+    fn onData(this: &Terminal, callback: &js_sys::Function) -> JsValue;
 }
 
 #[derive(Clone)]
@@ -24,6 +27,10 @@ pub struct TerminalHandle(Terminal);
 impl TerminalHandle {
     pub fn write(&self, data: &str) {
         self.0.write(data);
+    }
+    
+    pub fn on_data(&self, callback: js_sys::Function) {
+        self.0.onData(&callback);
     }
 }
 

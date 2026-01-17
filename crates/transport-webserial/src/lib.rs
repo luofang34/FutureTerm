@@ -11,6 +11,7 @@ pub struct WebSerialTransport {
     port: Option<SerialPort>,
     reader: Option<ReadableStreamDefaultReader>,
     writer: Option<WritableStreamDefaultWriter>,
+    pending_read: std::cell::RefCell<Option<js_sys::Promise>>,
 }
 
 // Safety: WebSerialTransport holds JsValues which are !Send / !Sync.
@@ -28,17 +29,21 @@ impl WebSerialTransport {
             port: None,
             reader: None,
             writer: None,
+            pending_read: std::cell::RefCell::new(None),
         }
     }
 
     /// Open the port with specified baud rate.
     // Note: Mutability is required here to set self.port, self.reader, self.writer
     pub async fn open(&mut self, port: SerialPort, baud_rate: u32) -> Result<(), TransportError> {
+        web_sys::console::log_1(&format!("WebSerialTransport: open() called. Baud: {}", baud_rate).into());
         let options = SerialOptions::new(baud_rate);
         
+        web_sys::console::log_1(&"WebSerialTransport: Invoking port.open()...".into());
         let promise = port.open(&options);
         JsFuture::from(promise).await
             .map_err(|e| TransportError::ConnectionFailed(format!("{:?}", e)))?;
+        web_sys::console::log_1(&"WebSerialTransport: port.open() resolved.".into());
 
         // Setup streams
         use wasm_bindgen::JsCast;
@@ -68,6 +73,8 @@ impl WebSerialTransport {
         self.port = Some(port);
         self.reader = Some(reader);
         self.writer = Some(writer);
+        self.pending_read = std::cell::RefCell::new(None);
+        web_sys::console::log_1(&"WebSerialTransport: Stream readers/writers setup complete.".into());
 
         Ok(())
     }
@@ -76,6 +83,8 @@ impl WebSerialTransport {
     pub fn attach(&mut self, reader: ReadableStreamDefaultReader, writer: WritableStreamDefaultWriter) {
         self.reader = Some(reader);
         self.writer = Some(writer);
+        // Reset pending read
+        *self.pending_read.borrow_mut() = None;
         // Port is None in worker mode, signals won't work locally but data will flow
         self.port = None;
     }
@@ -89,6 +98,7 @@ impl Transport for WebSerialTransport {
 
     async fn close(&mut self) -> Result<(), TransportError> {
         // Release locks
+        *self.pending_read.borrow_mut() = None; // Drop the promise ref
         if let Some(reader) = self.reader.take() {
             let _ = JsFuture::from(reader.cancel()).await;
             reader.release_lock();
@@ -119,9 +129,57 @@ impl Transport for WebSerialTransport {
         // use f64 for performance.now() timestamp
         let reader = self.reader.as_ref().ok_or(TransportError::NotConnected)?;
         
-        // Read is { value: Uint8Array, done: bool }
-        let result_val = JsFuture::from(reader.read()).await
+        // 1. Get or create read promise
+        let read_promise = {
+            let mut pending = self.pending_read.borrow_mut();
+            if let Some(ref p) = *pending {
+                p.clone()
+            } else {
+                let p = reader.read(); // This returns a promise
+                let p_obj: js_sys::Promise = p.unchecked_into();
+                *pending = Some(p_obj.clone());
+                p_obj
+            }
+        };
+
+        // 2. Create timeout promise (resolve with "TIMEOUT" string)
+        let timeout_string = JsValue::from_str("TIMEOUT");
+        let ts_clone = timeout_string.clone();
+        
+        let timeout_promise = js_sys::Promise::new(&mut |resolve, _| {
+             // Access setTimeout via global scope
+             let global = js_sys::global();
+             if let Ok(set_timeout) = js_sys::Reflect::get(&global, &"setTimeout".into()) {
+                 if let Ok(func) = set_timeout.dyn_into::<js_sys::Function>() {
+                     // Need to clone for the inner closure because outer is FnMut
+                     let ts_inner = ts_clone.clone(); 
+                     
+                     // Helper:
+                     let callback = wasm_bindgen::closure::Closure::once_into_js(move || {
+                         let _ = resolve.call1(&JsValue::NULL, &ts_inner);
+                     });
+                     
+                     // 100ms timeout
+                     let _ = func.call2(&JsValue::NULL, &callback, &JsValue::from_f64(100.0));
+                 }
+             }
+        });
+        
+        // 3. Race
+        let race_promise = js_sys::Promise::race(&js_sys::Array::of2(&read_promise, &timeout_promise));
+        
+        // 4. Await result
+        let result_val = JsFuture::from(race_promise).await
             .map_err(|e| TransportError::Io(format!("{:?}", e)))?;
+            
+        // 5. Check if timeout
+        if result_val == timeout_string {
+             // Timeout won. Return empty.
+             return Ok((Vec::new(), 0)); // Timestamp ignored for empty
+        }
+        
+        // 6. Read won. Clear pending read.
+        *self.pending_read.borrow_mut() = None;
         
         let result: js_sys::Object = result_val.unchecked_into();
         
@@ -151,7 +209,6 @@ impl Transport for WebSerialTransport {
              js_sys::Date::now()
         };
 
-        // Convert ms to micros (u64)
         Ok((bytes, (ts_ms * 1000.0) as u64))
     }
 

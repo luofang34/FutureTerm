@@ -3,6 +3,11 @@ use wasm_bindgen::prelude::*;
 use wasm_bindgen::JsCast;
 use web_sys::{Worker, MessageEvent};
 use crate::protocol::{UiToWorker, WorkerToUi};
+use transport_webserial::WebSerialTransport;
+use core_types::Transport;
+use std::rc::Rc;
+use std::cell::RefCell;
+use wasm_bindgen_futures::spawn_local;
 
 mod xterm;
 pub mod protocol;
@@ -13,16 +18,32 @@ pub fn App() -> impl IntoView {
     let (_terminal_ready, set_terminal_ready) = create_signal(false);
     let (status, set_status) = create_signal("Idle".to_string());
     let (worker, set_worker) = create_signal::<Option<Worker>>(None);
-    let (baud_rate, set_baud_rate) = create_signal(115200);
+    let (baud_rate, set_baud_rate) = create_signal(1500000);
     // Track connection state for toggle button
     let (connected, set_connected) = create_signal(false);
+    
+    // Transport - Main Thread Logic
+    // Store in Rc<RefCell<Option<T>>> to share with closures
+    let transport = Rc::new(RefCell::new(None::<WebSerialTransport>));
     
     // Direct Terminal Handle
     let (term_handle, set_term_handle) = create_signal::<Option<xterm::TerminalHandle>>(None);
 
+    // Track parsed events
+    let (events_list, set_events_list) = create_signal::<Vec<String>>(Vec::new());
+
     create_effect(move |_| {
         if let Ok(w) = Worker::new("worker_bootstrap.js") {
-            // Restore TextDecoder for RX
+            // Restore TextDecoder for RX to Main Thread (if we ever want to decode locally? No, worker does that)
+            // But wait, worker sends BACK a 'DataBatch' with frames. 
+            // We need to print raw text to terminal.
+            // The worker parses frames. Does it decode text? 
+            // Looking at worker_logic.rs:
+            // It receives IngestData -> Frames -> Decoder.
+            // It sends back DataBatch { frames, events }.
+            // Frames contain raw bytes.
+            // So Main Thread needs to decode bytes to string for Xterm.
+            
             let decoder = web_sys::TextDecoder::new().unwrap();
             let decode_opts = js_sys::Object::new();
             let _ = js_sys::Reflect::set(&decode_opts, &"stream".into(), &JsValue::from(true));
@@ -32,14 +53,12 @@ pub fn App() -> impl IntoView {
                  if let Ok(msg) = serde_wasm_bindgen::from_value::<WorkerToUi>(e.data()) {
                      match msg {
                          WorkerToUi::Status(s) => {
-                             set_status.set(s.clone());
-                             if s.contains("Connected") {
-                                 set_connected.set(true);
-                             } else if s.contains("Disconnected") {
-                                 set_connected.set(false);
+                             // Ignore "Connected" from worker if it's just config confirmation
+                             if !s.contains("Worker Ready") {
+                                 set_status.set(s.clone());
                              }
                          },
-                         WorkerToUi::DataBatch { frames, events: _ } => {
+                         WorkerToUi::DataBatch { frames, events } => {
                              if let Some(term) = term_handle.get_untracked() {
                                  for f in frames {
                                      if !f.bytes.is_empty() {
@@ -51,6 +70,23 @@ pub fn App() -> impl IntoView {
                                         }
                                      }
                                  }
+                             }
+                             
+                             // Update events
+                             if !events.is_empty() {
+                                 set_events_list.update(|list| {
+                                     for evt in events {
+                                         // Keep last 50 events
+                                         if list.len() >= 50 {
+                                             list.remove(0);
+                                         }
+                                         // Format event
+                                         let s = format!("{}: {}", evt.protocol, evt.summary);
+                                         if !s.is_empty() {
+                                            list.push(s);
+                                         }
+                                     }
+                                 });
                              }
                          }
                      }
@@ -65,75 +101,170 @@ pub fn App() -> impl IntoView {
         }
     });
 
+    let transport_clone = transport.clone();
+    let transport_term = transport.clone();
     let on_connect = move |_| {
          // Toggle Logic
          if connected.get() {
-             // Disconnect
-             if let Some(w) = worker.get_untracked() {
-                 let msg = UiToWorker::Disconnect;
-                 if let Ok(cmd_val) = serde_wasm_bindgen::to_value(&msg) {
-                     let envelope = js_sys::Object::new();
-                     let _ = js_sys::Reflect::set(&envelope, &"cmd".into(), &cmd_val);
-                     let _ = w.post_message(&envelope);
+             // Disconnect Logic
+             let t_c = transport_clone.clone();
+             spawn_local(async move {
+                 // Retry loop to acquire lock (in case reading is active)
+                 let mut closed = false;
+                 for _ in 0..10 { // Try for 500ms
+                     if let Ok(mut borrow) = t_c.try_borrow_mut() {
+                         if let Some(mut t) = borrow.take() {
+                             let _ = t.close().await;
+                             set_status.set("Disconnected".into());
+                             set_connected.set(false);
+                             closed = true;
+                             
+                             // Notify worker to reset
+                             if let Some(w) = worker.get_untracked() {
+                                 let msg = UiToWorker::Disconnect;
+                                 if let Ok(cmd_val) = serde_wasm_bindgen::to_value(&msg) {
+                                     let envelope = js_sys::Object::new();
+                                     let _ = js_sys::Reflect::set(&envelope, &"cmd".into(), &cmd_val);
+                                     let _ = w.post_message(&envelope);
+                                 }
+                             }
+                         }
+                         break;
+                     }
+                     // Wait 50ms
+                     let _ = wasm_bindgen_futures::JsFuture::from(
+                          js_sys::Promise::new(&mut |r, _| {
+                              let _ = web_sys::window().unwrap().set_timeout_with_callback_and_timeout_and_arguments_0(&r, 50);
+                          })
+                     ).await;
                  }
-             }
+                 
+                 if !closed {
+                     set_status.set("Error: Could not close transport (Busy)".into());
+                 }
+             });
              return;
          }
 
          // Connect Logic
          let current_baud = baud_rate.get_untracked();
+         let t_c = transport_clone.clone();
+         
          spawn_local(async move {
              let nav = web_sys::window().unwrap().navigator();
-             let serial = nav.serial(); 
+             let serial = nav.serial();
              
+             if serial.is_undefined() {
+                 set_status.set("Error: WebSerial not supported.".into());
+                 return;
+             }
+
+             // Request Port
              let options = js_sys::Object::new();
              let promise = match js_sys::Reflect::get(&serial, &"requestPort".into()) {
                  Ok(func_val) => {
                      let func: js_sys::Function = func_val.unchecked_into();
-                     func.call1(&serial, &options)
+                     func.call1(&serial, &options).map_err(Into::into)
                  },
-                 Err(_) => Err(js_sys::Error::new("requestPort not found").into()),
-             }.map_err(|e| format!("{:?}", e));
-             
-             let promise_val = match promise {
-                 Ok(p) => p,
-                 Err(e) => { set_status.set(format!("Error: {:?}", e)); return; }
+                 Err(e) => Err(e),
              };
-             let promise: js_sys::Promise = promise_val.unchecked_into();
-             match wasm_bindgen_futures::JsFuture::from(promise).await {
-                 Ok(val) => {
-                     let port: web_sys::SerialPort = val.unchecked_into();
-                     set_status.set("Port selected. Connecting...".into());
-                     
-                     if let Some(w) = worker.get_untracked() {
-                         let msg = UiToWorker::Connect { baud_rate: current_baud };
-                         if let Ok(cmd_val) = serde_wasm_bindgen::to_value(&msg) {
-                             let envelope = js_sys::Object::new();
-                             let _ = js_sys::Reflect::set(&envelope, &"cmd".into(), &cmd_val);
-                             let _ = js_sys::Reflect::set(&envelope, &"port".into(), &port);
+             
+             match promise {
+                 Ok(p) => {
+                     match wasm_bindgen_futures::JsFuture::from(js_sys::Promise::from(p)).await {
+                         Ok(val) => {
+                             let port: web_sys::SerialPort = val.unchecked_into();
+                             set_status.set("Port selected. Connecting...".into());
                              
-                             let transfer = js_sys::Array::new();
-                             transfer.push(&port);
-                             
-                             let _ = w.post_message_with_transfer(&envelope, &transfer);
-                         }
+                             // Open Transport Locally
+                             let mut t = WebSerialTransport::new();
+                             match t.open(port, current_baud).await {
+                                 Ok(_) => {
+                                     set_status.set("Connected".into());
+                                     set_connected.set(true);
+                                     
+                                     // Store transport
+                                     if let Ok(mut borrow) = t_c.try_borrow_mut() {
+                                         *borrow = Some(t);
+                                     } else {
+                                         set_status.set("Error: Could not store transport".into());
+                                         return;
+                                     }
+                                     
+                                     // Start Read Loop
+                                     let t_loop = t_c.clone();
+                                     spawn_local(async move {
+                                         loop {
+                                             let mut chunk = Vec::new();
+                                             let mut ts = 0;
+                                             let mut should_break = false;
+                                             
+                                             // 1. Borrow Shared to Read
+                                             if let Ok(borrow) = t_loop.try_borrow() {
+                                                 if let Some(t) = borrow.as_ref() {
+                                                     if !t.is_open() { 
+                                                         should_break = true; 
+                                                     } else {
+                                                         // This await holds the borrow!
+                                                         match t.read_chunk().await {
+                                                             Ok((d, t_val)) => { chunk = d; ts = t_val; },
+                                                             Err(_) => { should_break = true; }
+                                                         }
+                                                     }
+                                                 } else { should_break = true; }
+                                             } else {
+                                                  // Failed to borrow (Disconnect is mutating?)
+                                                  should_break = true; 
+                                             }
+
+                                             if should_break { break; }
+                                             
+                                             // 2. Send to Worker
+                                             if !chunk.is_empty() {
+                                                 if let Some(w) = worker.get_untracked() {
+                                                     let msg = UiToWorker::IngestData { data: chunk, timestamp_us: ts };
+                                                     if let Ok(cmd_val) = serde_wasm_bindgen::to_value(&msg) {
+                                                         let envelope = js_sys::Object::new();
+                                                         let _ = js_sys::Reflect::set(&envelope, &"cmd".into(), &cmd_val);
+                                                         let _ = w.post_message(&envelope);
+                                                     }
+                                                 }
+                                             } else {
+                                                 // Yield if no data (timeout occurred) to allow Disconnect to grab the lock
+                                                 // read_chunk holds lock for ~100ms. We sleep 20ms to give a 20% window.
+                                                 let _ = wasm_bindgen_futures::JsFuture::from(
+                                                      js_sys::Promise::new(&mut |r, _| {
+                                                          let _ = web_sys::window().unwrap().set_timeout_with_callback_and_timeout_and_arguments_0(&r, 20);
+                                                      })
+                                                 ).await;
+                                             }
+                                             
+                                             // Loop continues. `read_chunk` yields internally via Promise.race
+                                         }
+                                         // Loop End
+                                         set_connected.set(false);
+                                     });
+                                     
+                                     // Send initial config to worker
+                                     if let Some(w) = worker.get_untracked() {
+                                         let msg = UiToWorker::Connect { baud_rate: current_baud };
+                                         if let Ok(cmd_val) = serde_wasm_bindgen::to_value(&msg) {
+                                             let envelope = js_sys::Object::new();
+                                             let _ = js_sys::Reflect::set(&envelope, &"cmd".into(), &cmd_val);
+                                             let _ = w.post_message(&envelope);
+                                         }
+                                     }
+                                     
+                                 },
+                                 Err(e) => set_status.set(format!("Open Error: {:?}", e)),
+                             }
+                         },
+                         Err(e) => set_status.set(format!("Connect Error: {:?}", e)),
                      }
                  },
-                 Err(e) => set_status.set(format!("Error: {:?}", e)),
+                 Err(e) => set_status.set(format!("RequestPort Error: {:?}", e)),
              }
          });
-    };
-
-    let on_simulate = move |_| {
-        if let Some(w) = worker.get_untracked() {
-             set_status.set("Simulation requested...".into());
-             let msg = UiToWorker::Simulate { duration_ms: 10000 };
-             if let Ok(cmd_val) = serde_wasm_bindgen::to_value(&msg) {
-                 let envelope = js_sys::Object::new();
-                 let _ = js_sys::Reflect::set(&envelope, &"cmd".into(), &cmd_val);
-                 let _ = w.post_message(&envelope);
-             }
-        }
     };
 
     view! {
@@ -149,9 +280,26 @@ pub fn App() -> impl IntoView {
                     }
                 }>
                     <option value="9600">9600</option>
-                    <option value="115200" selected>115200</option>
+                    <option value="115200">115200</option>
                     <option value="921600">921600</option>
-                    <option value="1500000">1500000</option>
+                    <option value="1500000" selected>1500000</option>
+                </select>
+
+                <select on:change=move |ev| {
+                    let val = event_target_value(&ev);
+                     if let Some(w) = worker.get_untracked() {
+                          let msg = UiToWorker::SetFramer { id: val };
+                          if let Ok(cmd_val) = serde_wasm_bindgen::to_value(&msg) {
+                             let envelope = js_sys::Object::new();
+                             let _ = js_sys::Reflect::set(&envelope, &"cmd".into(), &cmd_val);
+                             let _ = w.post_message(&envelope);
+                          }
+                     }
+                }>
+                    <option value="lines" selected>Lines</option>
+                    <option value="raw">Raw</option>
+                    <option value="cobs">COBS</option>
+                    <option value="slip">SLIP</option>
                 </select>
 
                 <select on:change=move |ev| {
@@ -165,24 +313,61 @@ pub fn App() -> impl IntoView {
                          }
                     }
                 }>
-                    <option value="hex">Hex View</option>
                     <option value="nmea">NMEA</option>
+                    <option value="hex">Hex List</option>
                 </select>
 
                 <span>{move || status.get()}</span>
                 <button on:click=on_connect>
                     {move || if connected.get() { "Disconnect" } else { "Connect" }}
                 </button>
-                <button on:click=on_simulate style="margin-left: 10px; background: #666;">
-                    "Simulate (10s)"
-                </button>
             </header>
             <main style="flex: 1; display: flex;">
                 <div id="terminal-container" style="flex: 1; background: #000; overflow: hidden;">
                     <xterm::TerminalView 
                         on_mount=Callback::new(move |_| set_terminal_ready.set(true)) 
-                        on_terminal_ready=Callback::from(move |t| set_term_handle.set(Some(t)))
+                        on_terminal_ready=Callback::from(move |t: xterm::TerminalHandle| {
+                            set_term_handle.set(Some(t.clone()));
+                            
+                            // Bind TX
+                            let t_tx = transport_term.clone(); 
+                            let on_data_cb = Closure::wrap(Box::new(move |data: JsValue| {
+                                if let Some(text) = data.as_string() {
+                                    let bytes = text.into_bytes();
+                                    
+                                    // Direct TX on Main Thread
+                                    let t = t_tx.clone();
+                                    spawn_local(async move {
+                                        // Attempt to borrow transport
+                                        // read_loop holds a shared borrow, so we can also take a shared borrow!
+                                        if let Ok(borrow) = t.try_borrow() {
+                                            if let Some(transport) = borrow.as_ref() {
+                                                if transport.is_open() {
+                                                     if let Err(e) = transport.write(&bytes).await {
+                                                         web_sys::console::log_1(&format!("TX Error: {:?}", e).into());
+                                                     }
+                                                }
+                                            }
+                                        } else {
+                                            web_sys::console::log_1(&"TX Dropped: Transport busy/locked".into());
+                                        }
+                                    });
+                                }
+                            }) as Box<dyn FnMut(JsValue)>);
+
+                            t.on_data(on_data_cb.into_js_value().unchecked_into());
+                        })
                     />
+                </div>
+                <div style="width: 250px; background: #222; border-left: 1px solid #444; color: #eee; overflow-y: auto; font-family: monospace; font-size: 0.8rem; padding: 5px;">
+                     <div style="font-weight: bold; border-bottom: 1px solid #555; margin-bottom: 5px;">Decoded Events</div>
+                     <ul>
+                         <For
+                             each=move || events_list.get()
+                             key=|evt| evt.clone()
+                             children=|evt| view! { <li>{evt}</li> }
+                         />
+                     </ul>
                 </div>
             </main>
         </div>

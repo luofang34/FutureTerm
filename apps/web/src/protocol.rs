@@ -6,6 +6,7 @@ pub enum UiToWorker {
     Connect { baud_rate: u32 },
     Disconnect,
     Send { data: Vec<u8> },
+    IngestData { data: Vec<u8>, timestamp_us: u64 },
     SetSignals { dtr: bool, rts: bool },
     // Configs
     SetFramer { id: String },
