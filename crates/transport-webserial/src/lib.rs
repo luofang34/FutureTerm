@@ -2,7 +2,7 @@ use wasm_bindgen::prelude::*;
 use wasm_bindgen_futures::JsFuture;
 use web_sys::{SerialPort, SerialOptions, ReadableStreamDefaultReader, WritableStreamDefaultWriter};
 use js_sys::Uint8Array;
-use core_types::{Transport, TransportError, SignalState};
+use core_types::{Transport, TransportError, SignalState, SerialConfig};
 
 /// WebSerial Transport Implementation.
 /// 
@@ -33,14 +33,23 @@ impl WebSerialTransport {
         }
     }
 
-    /// Open the port with specified baud rate.
+    /// Open the port with specified configuration.
     // Note: Mutability is required here to set self.port, self.reader, self.writer
-    pub async fn open(&mut self, port: SerialPort, baud_rate: u32) -> Result<(), TransportError> {
-        web_sys::console::log_1(&format!("WebSerialTransport: open() called. Baud: {}", baud_rate).into());
-        let options = SerialOptions::new(baud_rate);
+    pub async fn open(&mut self, port: SerialPort, config: SerialConfig) -> Result<(), TransportError> {
+        web_sys::console::log_1(&format!("WebSerialTransport: open() called. Baud: {}", config.baud_rate).into());
+        
+        let options = js_sys::Object::new();
+        let _ = js_sys::Reflect::set(&options, &"baudRate".into(), &JsValue::from(config.baud_rate));
+        let _ = js_sys::Reflect::set(&options, &"dataBits".into(), &JsValue::from(config.data_bits));
+        let _ = js_sys::Reflect::set(&options, &"stopBits".into(), &JsValue::from(config.stop_bits));
+        let _ = js_sys::Reflect::set(&options, &"parity".into(), &JsValue::from(config.parity.as_str()));
+        let _ = js_sys::Reflect::set(&options, &"flowControl".into(), &JsValue::from(config.flow_control.as_str()));
+
+        // Convert to SerialOptions
+        let serial_options: SerialOptions = options.unchecked_into();
         
         web_sys::console::log_1(&"WebSerialTransport: Invoking port.open()...".into());
-        let promise = port.open(&options);
+        let promise = port.open(&serial_options);
         JsFuture::from(promise).await
             .map_err(|e| TransportError::ConnectionFailed(format!("{:?}", e)))?;
         web_sys::console::log_1(&"WebSerialTransport: port.open() resolved.".into());

@@ -13,6 +13,8 @@ pub enum UiToWorker {
     SetDecoder { id: String },
     // Simulation
     Simulate { duration_ms: u32 },
+    // Phase 3: Auto-Baud
+    AnalyzeRequest { baud_rate: u32, data: Vec<u8> },
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -22,4 +24,5 @@ pub enum WorkerToUi {
         frames: Vec<Frame>,
         events: Vec<DecodedEvent>,
     },
+    AnalyzeResult { baud_rate: u32, score: f32 },
 }

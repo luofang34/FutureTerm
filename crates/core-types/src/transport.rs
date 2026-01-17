@@ -25,7 +25,26 @@ pub struct SignalState {
     pub cts: bool, // Clear To Send
 }
 
-/// A generic async transport layer (Serial, WebSocket, TCP, etc.)
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SerialConfig {
+    pub baud_rate: u32,
+    pub data_bits: u8, // 7 or 8
+    pub flow_control: String, // "none" or "hardware"
+    pub parity: String, // "none", "even", "odd"
+    pub stop_bits: u8, // 1 or 2
+}
+
+impl Default for SerialConfig {
+    fn default() -> Self {
+        Self {
+            baud_rate: 115200,
+            data_bits: 8,
+            flow_control: "none".into(),
+            parity: "none".into(),
+            stop_bits: 1,
+        }
+    }
+}
 #[allow(async_fn_in_trait)]
 pub trait Transport: Send + Sync {
     /// Check if the transport is currently open.
