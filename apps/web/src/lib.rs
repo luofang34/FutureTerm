@@ -103,7 +103,9 @@ pub fn App() -> impl IntoView {
 
     let transport_clone = transport.clone();
     let transport_term = transport.clone();
-    let on_connect = move |_| {
+    
+    let on_connect = move |ev: web_sys::MouseEvent| {
+         let shift_held = ev.shift_key();
          // Toggle Logic
          if connected.get() {
              // Disconnect Logic
@@ -164,6 +166,35 @@ pub fn App() -> impl IntoView {
 
              // Request Port
              let options = js_sys::Object::new();
+             
+             // Smart Filter: Shift-Click bypasses filter
+             if !shift_held {
+                 // Common USB-Serial VIDs (Filtered by default for clean UX)
+                 let vids = vec![
+                     0x0403, // FTDI
+                     0x10C4, // Silicon Labs (CP210x)
+                     0x1A86, // QinHeng (CH340)
+                     0x067B, // Prolific
+                     0x303A, // Espressif
+                     0x2341, // Arduino
+                     0x239A, // Adafruit
+                     0x0483, // STMicroelectronics (STLink/CDC)
+                     0x1366, // Segger (JLink)
+                     0x2E8A, // Raspberry Pi (RP2040)
+                     0x03EB, // Atmel/Microchip
+                     0x1FC9, // NXP
+                     0x0D28, // micro:bit (ARM mbed)
+                 ];
+                 
+                 let filters = js_sys::Array::new();
+                 for vid in vids {
+                     let f = js_sys::Object::new();
+                     let _ = js_sys::Reflect::set(&f, &"usbVendorId".into(), &JsValue::from(vid));
+                     filters.push(&f);
+                 }
+                 let _ = js_sys::Reflect::set(&options, &"filters".into(), &filters);
+             }
+
              let promise = match js_sys::Reflect::get(&serial, &"requestPort".into()) {
                  Ok(func_val) => {
                      let func: js_sys::Function = func_val.unchecked_into();
@@ -407,7 +438,15 @@ pub fn App() -> impl IntoView {
                                  Err(e) => set_status.set(format!("Open Error: {:?}", e)),
                              }
                          },
-                         Err(e) => set_status.set(format!("Connect Error: {:?}", e)),
+                         Err(e) => {
+                             let e_str = format!("{:?}", e);
+                             if e_str.contains("No port selected") || e_str.contains("NotFoundError") {
+                                 // User cancelled picker, just reset or keep idle
+                                 set_status.set("Idle".into());
+                             } else {
+                                 set_status.set(format!("Connect Error: {:?}", e));
+                             }
+                         },
                      }
                  },
                  Err(e) => set_status.set(format!("RequestPort Error: {:?}", e)),
@@ -467,6 +506,7 @@ pub fn App() -> impl IntoView {
                 <span style="font-size: 0.9rem; color: #aaa;">{move || status.get()}</span>
                 <button 
                     style="padding: 5px 15px; background: #007acc; color: white; border: none; border-radius: 4px; cursor: pointer;"
+                    title="Normal Click: Smart Filter (Recommended)\nShift+Click: Show All Ports"
                     on:click=on_connect>
                     {move || if connected.get() { "Disconnect" } else { "Connect" }}
                 </button>
