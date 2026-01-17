@@ -22,6 +22,8 @@ build/target/
 # IDEs
 .idea/
 .vscode/
+.claude/
+.cargo/
 *.swp
 *.swo
 
