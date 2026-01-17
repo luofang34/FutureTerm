@@ -134,48 +134,16 @@ async fn handle_message(
                       });
                 },
                 UiToWorker::AnalyzeRequest { baud_rate, data } => {
-                    // Heuristic Logic:
-                    // 1. Valid UTF-8 ratio
-                    // 2. Control char ratio (avoid binary noise)
-                    
-                    if data.is_empty() {
-                         post_to_ui(&WorkerToUi::AnalyzeResult { baud_rate, score: 0.0 });
-                         return;
-                    }
+                     // Heuristic Logic (Using Shared Analysis Crate):
+                     // 1. Valid UTF-8 / ASCII ratio
+                     
+                     if data.is_empty() {
+                          post_to_ui(&WorkerToUi::AnalyzeResult { baud_rate, score: 0.0 });
+                          return;
+                     }
 
-                    // Try standard UTF-8 conversion
-                    if let Ok(text) = std::str::from_utf8(&data) {
-                        // It is valid UTF-8. Evaluate content.
-                        let mut printable = 0;
-                        let mut control = 0;
-                        for c in text.chars() {
-                            if c.is_ascii_graphic() || c == ' ' {
-                                printable += 1;
-                            } else if c.is_ascii_control() && c != '\r' && c != '\n' && c != '\t' {
-                                control += 1; // Weird control chars (e.g. 0x01, 0x05) => Bad
-                            }
-                        }
-                        
-                        let total = text.chars().count();
-                        let printable_ratio = printable as f32 / total as f32;
-                        let control_ratio = control as f32 / total as f32;
-                        
-                        // Scoring function: High printable is good. High Control is bad.
-                        let mut score = printable_ratio; 
-                        
-                        // Penalty for random control chars
-                        score -= control_ratio * 2.0;
-                        
-                        // Penalty for too many replacement chars if we strictly check utf8, but str::from_utf8 ensures validity.
-                        
-                        // Clamp
-                        if score < 0.0 { score = 0.0; }
-                        
-                        post_to_ui(&WorkerToUi::AnalyzeResult { baud_rate, score });
-                    } else {
-                        // Invalid UTF-8 => Usually means wrong baud rate (framing errors)
-                         post_to_ui(&WorkerToUi::AnalyzeResult { baud_rate, score: 0.0 });
-                    }
+                     let score = analysis::calculate_score_8n1(&data);
+                     post_to_ui(&WorkerToUi::AnalyzeResult { baud_rate, score });
                 },
                 _ => {} 
 

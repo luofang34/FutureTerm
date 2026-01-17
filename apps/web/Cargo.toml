@@ -24,6 +24,7 @@ serde-wasm-bindgen = "0.6"
 transport-webserial = { path = "../../crates/transport-webserial" }
 framing = { path = "../../crates/framing" }
 decoders = { path = "../../crates/decoders" }
+analysis = { path = "../../crates/analysis" }
 js-sys = "0.3"
 
 

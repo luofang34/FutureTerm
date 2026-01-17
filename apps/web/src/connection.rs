@@ -273,6 +273,85 @@ impl ConnectionManager {
          }
          Err("TX Dropped: Transport busy/locked or closed".to_string())
     }
+    pub async fn auto_select_port(&self, last_vid: Option<u16>, last_pid: Option<u16>) -> Option<web_sys::SerialPort> {
+        let nav = web_sys::window().unwrap().navigator();
+        let serial = nav.serial();
+        
+        if serial.is_undefined() {
+            self.set_status.set("Error: WebSerial not supported.".into());
+            return None;
+        }
+
+        if let Ok(ports_val) = wasm_bindgen_futures::JsFuture::from(serial.get_ports()).await {
+            let ports: js_sys::Array = ports_val.unchecked_into();
+            if ports.length() > 0 {
+                // Priority: Match Last VID/PID
+                let mut matched_port = None;
+                if let (Some(l_vid), Some(l_pid)) = (last_vid, last_pid) {
+                    for i in 0..ports.length() {
+                        let p: web_sys::SerialPort = ports.get(i).unchecked_into();
+                        let info = p.get_info();
+                        let vid = js_sys::Reflect::get(&info, &"usbVendorId".into()).ok().and_then(|v| v.as_f64()).map(|v| v as u16);
+                        let pid = js_sys::Reflect::get(&info, &"usbProductId".into()).ok().and_then(|v| v.as_f64()).map(|v| v as u16);
+                        if vid == Some(l_vid) && pid == Some(l_pid) {
+                            matched_port = Some(p);
+                            self.set_status.set("Auto-selected known port...".into());
+                            break;
+                        }
+                    }
+                }
+                
+                // Fallback: If no match but only 1 port exists, use it
+                if matched_port.is_none() && ports.length() == 1 {
+                     matched_port = Some(ports.get(0).unchecked_into());
+                     self.set_status.set("Auto-selected single available port...".into());
+                }
+                return matched_port;
+            }
+        }
+        None
+    }
+
+    pub async fn request_port(&self) -> Option<web_sys::SerialPort> {
+        use wasm_bindgen::JsValue; // Added this line to make JsValue available
+
+        let nav = web_sys::window().unwrap().navigator();
+        let serial = nav.serial();
+        
+        if serial.is_undefined() {
+             self.set_status.set("Error: WebSerial not supported.".into());
+             return None;
+        }
+
+        let options = js_sys::Object::new();
+        // Common USB-Serial VIDs (Filtered)
+        let vids = vec![
+             0x0403, 0x10C4, 0x1A86, 0x067B, 0x303A, 0x2341, 0x239A, 0x0483, 0x1366, 0x2E8A, 0x03EB, 0x1FC9, 0x0D28 
+        ];
+        let filters = js_sys::Array::new();
+        for vid in vids {
+             let f = js_sys::Object::new();
+             let _ = js_sys::Reflect::set(&f, &"usbVendorId".into(), &JsValue::from(vid));
+             filters.push(&f);
+        }
+        let _ = js_sys::Reflect::set(&options, &"filters".into(), &filters);
+
+        match js_sys::Reflect::get(&serial, &"requestPort".into()) {
+             Ok(func_val) => {
+                 let func: js_sys::Function = func_val.unchecked_into();
+                 match func.call1(&serial, &options) {
+                     Ok(p) => {
+                         match wasm_bindgen_futures::JsFuture::from(js_sys::Promise::from(p)).await {
+                             Ok(val) => Some(val.unchecked_into()),
+                             Err(_) => { self.set_status.set("Cancelled".into()); None }
+                         }
+                     },
+                     Err(_) => { self.set_status.set("Error: requestPort call failed".into()); None }
+                 }
+             },
+             Err(_) => { self.set_status.set("Error: requestPort not found".into()); None }
+        }
+    }
     // Helper: Parse Framing String
     fn parse_framing(&self, s: &str) -> (u8, String, u8) {
         let chars: Vec<char> = s.chars().collect();
@@ -295,34 +374,7 @@ impl ConnectionManager {
         let mut best_buffer = Vec::new();
 
         // Helpers
-        let calculate_score = |buf: &[u8]| -> f32 {
-             let mut p_count = 0;
-             let mut total = 0;
-             for &b in buf {
-                 total += 1;
-                 let c = b as char;
-                 if c.is_ascii_graphic() || c == ' ' || c == '\r' || c == '\n' { p_count += 1; }
-             }
-             if total == 0 { 0.0 } else { p_count as f32 / total as f32 }
-        };
-
-        let check_7e1 = |buf: &[u8]| -> f32 {
-             let mut p_count = 0;
-             let mut total = 0;
-             for &b in buf {
-                 total += 1;
-                 let data = b & 0x7F;
-                 let received_parity = (b & 0x80) >> 7;
-                 let ones = data.count_ones();
-                 let expected_parity = if ones % 2 == 0 { 0 } else { 1 };
-                 
-                 if received_parity == expected_parity {
-                     let c = data as char;
-                     if c.is_ascii_graphic() || c == ' ' || c == '\r' || c == '\n' { p_count += 1; }
-                 }
-             }
-             if total == 0 { 0.0 } else { p_count as f32 / total as f32 }
-        };
+        // Local scoring logic removed in favor of `analysis` crate.
 
         'outer: for rate in baud_candidates {
             self.set_status.set(format!("Scanning {}...", rate));
@@ -362,8 +414,8 @@ impl ConnectionManager {
             if buffer.is_empty() { continue; }
 
             // 2. Analyze
-            let score_8n1 = calculate_score(&buffer);
-            let score_7e1 = check_7e1(&buffer);
+            let score_8n1 = analysis::calculate_score_8n1(&buffer);
+            let score_7e1 = analysis::calculate_score_7e1(&buffer);
             
             web_sys::console::log_1(&format!("AUTO: Rate {} => 8N1 Score: {:.4} (Size: {}), 7E1 Score: {:.4}", rate, score_8n1, buffer.len(), score_7e1).into());
 
@@ -411,8 +463,8 @@ impl ConnectionManager {
                             ).await;
                          }
                          let _ = t2.close().await;
-                         
-                         let score = calculate_score(&buf2);
+                          
+                         let score = analysis::calculate_score_8n1(&buf2);
                          if score > best_score {
                              best_score = score;
                              best_rate = rate;

@@ -185,65 +185,12 @@ pub fn App() -> impl IntoView {
 
              // 1. Smart Check
              if !shift_held {
-                 if let Ok(ports_val) = wasm_bindgen_futures::JsFuture::from(serial.get_ports()).await {
-                    let ports: js_sys::Array = ports_val.unchecked_into();
-                    if ports.length() > 0 {
-                        // Priority: Match Last VID/PID
-                        let mut matched = false;
-                        if let (Some(l_vid), Some(l_pid)) = (last_vid.get_untracked(), last_pid.get_untracked()) {
-                            for i in 0..ports.length() {
-                                let p: web_sys::SerialPort = ports.get(i).unchecked_into();
-                                let info = p.get_info();
-                                let vid = js_sys::Reflect::get(&info, &"usbVendorId".into()).ok().and_then(|v| v.as_f64()).map(|v| v as u16);
-                                let pid = js_sys::Reflect::get(&info, &"usbProductId".into()).ok().and_then(|v| v.as_f64()).map(|v| v as u16);
-                                if vid == Some(l_vid) && pid == Some(l_pid) {
-                                    final_port = Some(p);
-                                    matched = true;
-                                    manager.set_status.set("Auto-selected known port...".into());
-                                    break;
-                                }
-                            }
-                        }
-                        
-                        // Fallback: If no match but only 1 port exists, use it
-                        if !matched && ports.length() == 1 {
-                             final_port = Some(ports.get(0).unchecked_into());
-                             manager.set_status.set("Auto-selected single available port...".into());
-                        }
-                    }
-                 }
+                 final_port = manager.auto_select_port(last_vid.get_untracked(), last_pid.get_untracked()).await;
              }
 
              // 2. Manual Request
              if final_port.is_none() {
-                 let options = js_sys::Object::new();
-                 // Common USB-Serial VIDs (Filtered)
-                 let vids = vec![
-                     0x0403, 0x10C4, 0x1A86, 0x067B, 0x303A, 0x2341, 0x239A, 0x0483, 0x1366, 0x2E8A, 0x03EB, 0x1FC9, 0x0D28 
-                 ];
-                 let filters = js_sys::Array::new();
-                 for vid in vids {
-                     let f = js_sys::Object::new();
-                     let _ = js_sys::Reflect::set(&f, &"usbVendorId".into(), &JsValue::from(vid));
-                     filters.push(&f);
-                 }
-                 let _ = js_sys::Reflect::set(&options, &"filters".into(), &filters);
-
-                 match js_sys::Reflect::get(&serial, &"requestPort".into()) {
-                     Ok(func_val) => {
-                         let func: js_sys::Function = func_val.unchecked_into();
-                         match func.call1(&serial, &options) {
-                             Ok(p) => {
-                                 match wasm_bindgen_futures::JsFuture::from(js_sys::Promise::from(p)).await {
-                                     Ok(val) => { final_port = Some(val.unchecked_into()); },
-                                     Err(_) => { manager.set_status.set("Cancelled".into()); return; }
-                                 }
-                             },
-                             Err(_) => { manager.set_status.set("Error: requestPort call failed".into()); return; }
-                         }
-                     },
-                     Err(_) => { manager.set_status.set("Error: requestPort not found".into()); return; }
-                 }
+                 final_port = manager.request_port().await;
              }
              
              if let Some(port) = final_port {
@@ -574,16 +521,5 @@ pub fn App() -> impl IntoView {
     }
 }
 
-pub fn parse_framing(s: &str) -> (u8, String, u8) {
-    let chars: Vec<char> = s.chars().collect();
-    let d = chars[0].to_digit(10).unwrap_or(8) as u8;
-    let p = match chars[1] {
-        'N' => "none",
-        'E' => "even",
-        'O' => "odd",
-        _ => "none",
-    }.to_string();
-    let s_bits = chars[2].to_digit(10).unwrap_or(1) as u8;
-    (d, p, s_bits)
-}
+
 
