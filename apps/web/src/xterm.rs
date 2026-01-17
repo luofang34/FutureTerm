@@ -122,6 +122,8 @@ pub fn TerminalView(
     });
 
     view! {
-        <div _ref=container_ref style="width: 100%; height: 100%; padding: 8px 8px 24px 8px; box-sizing: border-box; background: #191919; overflow: hidden;" />
+        <div style="width: 100%; height: 100%; padding: 8px; box-sizing: border-box; background: #191919; overflow: hidden;">
+            <div _ref=container_ref style="width: 100%; height: 100%;" />
+        </div>
     }
 }
