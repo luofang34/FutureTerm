@@ -268,12 +268,14 @@ pub fn App() -> impl IntoView {
     };
 
     view! {
-        <div style="display: flex; flex-direction: column; height: 100vh;">
-            <header style="padding: 10px; background: #333; color: white; display: flex; align-items: center; gap: 20px;">
-                <h1 style="margin: 0; font-size: 1.2rem;">WASM Serial Tool</h1>
+        <div style="display: flex; flex-direction: column; height: 100vh; background: rgb(25, 25, 25); color: #eee;">
+            <header style="padding: 10px; background: #1a1a1a; display: flex; align-items: center; gap: 20px; border-bottom: 1px solid #333;">
+                <h1 style="margin: 0; font-size: 1.2rem; font-weight: 600;">FutureTerm</h1>
                 <div style="flex: 1;"></div>
                 
-                <select on:change=move |ev| {
+                <select 
+                    style="background: #333; color: white; border: 1px solid #555; padding: 4px; border-radius: 4px;"
+                    on:change=move |ev| {
                     let val = event_target_value(&ev);
                     if let Ok(b) = val.parse::<u32>() {
                         set_baud_rate.set(b);
@@ -281,49 +283,48 @@ pub fn App() -> impl IntoView {
                 }>
                     <option value="9600">9600</option>
                     <option value="115200">115200</option>
-                    <option value="921600">921600</option>
+                    <option value="1000000">1000000</option>
                     <option value="1500000" selected>1500000</option>
                 </select>
 
-                <select on:change=move |ev| {
+                <select 
+                    style="background: #333; color: white; border: 1px solid #555; padding: 4px; border-radius: 4px;"
+                    on:change=move |ev| {
                     let val = event_target_value(&ev);
                      if let Some(w) = worker.get_untracked() {
                           let msg = UiToWorker::SetFramer { id: val };
-                          if let Ok(cmd_val) = serde_wasm_bindgen::to_value(&msg) {
-                             let envelope = js_sys::Object::new();
-                             let _ = js_sys::Reflect::set(&envelope, &"cmd".into(), &cmd_val);
-                             let _ = w.post_message(&envelope);
-                          }
+                          let _ = w.post_message(&serde_wasm_bindgen::to_value(&msg).unwrap());
                      }
                 }>
-                    <option value="lines" selected>Lines</option>
-                    <option value="raw">Raw</option>
+                    <option value="lines">Lines</option>
+                    <option value="raw" selected>Raw</option>
                     <option value="cobs">COBS</option>
                     <option value="slip">SLIP</option>
                 </select>
 
-                <select on:change=move |ev| {
+                <select 
+                    style="background: #333; color: white; border: 1px solid #555; padding: 4px; border-radius: 4px;"
+                    on:change=move |ev| {
                     let val = event_target_value(&ev);
                     if let Some(w) = worker.get_untracked() {
                          let msg = UiToWorker::SetDecoder { id: val };
-                         if let Ok(cmd_val) = serde_wasm_bindgen::to_value(&msg) {
-                            let envelope = js_sys::Object::new();
-                            let _ = js_sys::Reflect::set(&envelope, &"cmd".into(), &cmd_val);
-                            let _ = w.post_message(&envelope);
-                         }
+                         let _ = w.post_message(&serde_wasm_bindgen::to_value(&msg).unwrap());
                     }
                 }>
-                    <option value="nmea">NMEA</option>
+                    <option value="utf8">UTF-8</option>
+                    <option value="nmea" selected>NMEA</option>
                     <option value="hex">Hex List</option>
                 </select>
 
-                <span>{move || status.get()}</span>
-                <button on:click=on_connect>
+                <span style="font-size: 0.9rem; color: #aaa;">{move || status.get()}</span>
+                <button 
+                    style="padding: 5px 15px; background: #007acc; color: white; border: none; border-radius: 4px; cursor: pointer;"
+                    on:click=on_connect>
                     {move || if connected.get() { "Disconnect" } else { "Connect" }}
                 </button>
             </header>
-            <main style="flex: 1; display: flex;">
-                <div id="terminal-container" style="flex: 1; background: #000; overflow: hidden;">
+            <main style="flex: 1; display: flex; overflow: hidden; height: 100%;">
+                <div id="terminal-container" style="flex: 1; background: #191919; overflow: hidden; display: flex; flex-direction: column; min-width: 0;">
                     <xterm::TerminalView 
                         on_mount=Callback::new(move |_| set_terminal_ready.set(true)) 
                         on_terminal_ready=Callback::from(move |t: xterm::TerminalHandle| {

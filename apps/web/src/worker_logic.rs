@@ -148,7 +148,7 @@ async fn handle_message(
 pub async fn start_worker() {
     log!("Worker: start_worker() BEGIN (Main Thread IO Mode)");
     
-    let framer: SharedFramer = Rc::new(RefCell::new(Box::new(LineFramer::new())));
+    let framer: SharedFramer = Rc::new(RefCell::new(Box::new(RawFramer::new())));
     let decoder: SharedDecoder = Rc::new(RefCell::new(Box::new(HexDecoder::new())));
     
     // Setup message handler
