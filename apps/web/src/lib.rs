@@ -2,17 +2,24 @@ use leptos::*;
 use wasm_bindgen::prelude::*;
 use wasm_bindgen::JsCast;
 use web_sys::{Worker, MessageEvent};
-use crate::protocol::{UiToWorker, WorkerToUi}; // Cleanup Trigger
+use crate::protocol::WorkerToUi; // Cleanup Trigger
 use wasm_bindgen_futures::spawn_local;
-use core_types::SerialConfig;
+use core_types::{SerialConfig, DecodedEvent};
 // Imports Cleaned
 
 mod connection;
 use connection::ConnectionManager;
 
 mod xterm;
+mod hex_view;
 pub mod protocol;
 pub mod worker_logic;
+
+#[derive(Clone, Copy, PartialEq)]
+enum ViewMode {
+    Terminal,
+    Hex,
+}
 
 #[component]
 pub fn App() -> impl IntoView {
@@ -20,6 +27,7 @@ pub fn App() -> impl IntoView {
     
     // Worker Signal (Used by ConnectionManager)
     let (worker, set_worker) = create_signal::<Option<Worker>>(None);
+    let (view_mode, set_view_mode) = create_signal(ViewMode::Terminal);
     
     // Connection Manager encapsulates Status, Connected, Transport, Port
     let manager = ConnectionManager::new(worker.into());
@@ -43,7 +51,7 @@ pub fn App() -> impl IntoView {
     let (term_handle, set_term_handle) = create_signal::<Option<xterm::TerminalHandle>>(None);
 
     // Track parsed events
-    let (events_list, set_events_list) = create_signal::<Vec<String>>(Vec::new());
+    let (events_list, set_events_list) = create_signal::<Vec<DecodedEvent>>(Vec::new());
 
     // Legacy signals removed/replaced by manager:
     // status, connected, transport, active_port, is_reconfiguring
@@ -89,18 +97,14 @@ pub fn App() -> impl IntoView {
                              }
                              
                              // Update events
+                             // Update events
                              if !events.is_empty() {
                                  set_events_list.update(|list| {
-                                     for evt in events {
-                                         // Keep last 50 events
-                                         if list.len() >= 50 {
-                                             list.remove(0);
-                                         }
-                                         // Format event
-                                         let s = format!("{}: {}", evt.protocol, evt.summary);
-                                         if !s.is_empty() {
-                                            list.push(s);
-                                         }
+                                     list.extend(events);
+                                     // Cap at 2000 events to keep memory sane
+                                     if list.len() > 2000 {
+                                         let split = list.len() - 2000;
+                                         list.drain(0..split);
                                      }
                                  });
                              }
@@ -370,12 +374,36 @@ pub fn App() -> impl IntoView {
     });
 
     let on_connect_arrow = on_connect.clone();
-    let manager_tx = manager.clone();
+    let manager_tx_cb = manager.clone();
 
+    // -- Extract Callbacks for TerminalView --
+    let on_terminal_mount = Callback::new(move |_| set_terminal_ready.set(true));
+    
+    let on_term_ready = Callback::from(move |t: xterm::TerminalHandle| {
+        set_term_handle.set(Some(t.clone()));
+        
+        // Bind TX
+        let manager_tx = manager_tx_cb.clone();
+        let on_data_cb = Closure::wrap(Box::new(move |data: JsValue| {
+            if let Some(text) = data.as_string() {
+                let bytes = text.into_bytes();
+                
+                // Direct TX on Main Thread
+                let active_manager = manager_tx.clone();
+                spawn_local(async move {
+                    if let Err(e) = active_manager.write(&bytes).await {
+                        web_sys::console::log_1(&format!("TX Error: {:?}", e).into());
+                    }
+                });
+            }
+        }) as Box<dyn FnMut(JsValue)>);
+
+        t.on_data(on_data_cb.into_js_value().unchecked_into());
+    });
     
     view! {
         <div style="display: flex; flex-direction: column; height: 100vh; background: rgb(25, 25, 25); color: #eee;">
-            <header style="padding: 10px; background: #1a1a1a; display: flex; align-items: center; gap: 20px; border-bottom: 1px solid #333;">
+            <header style="padding: 10px; background: rgb(25, 25, 25); display: flex; align-items: center; gap: 20px; border-bottom: 1px solid rgb(45, 45, 45);">
                 <h1 style="margin: 0; font-size: 1.2rem; font-weight: 600;">FutureTerm</h1>
                 <div style="flex: 1;"></div>
                 
@@ -422,32 +450,22 @@ pub fn App() -> impl IntoView {
 
                 <select 
                     style="background: #333; color: white; border: 1px solid #555; padding: 4px; border-radius: 4px;"
-                    on:change=move |ev| {
-                    let val = event_target_value(&ev);
-                     if let Some(w) = worker.get_untracked() {
-                          let msg = UiToWorker::SetFramer { id: val };
-                          let _ = w.post_message(&serde_wasm_bindgen::to_value(&msg).unwrap());
-                     }
-                }>
+                    on:change={
+                        let manager_framer = manager.clone();
+                        move |ev| {
+                            let val = event_target_value(&ev);
+                            manager_framer.set_framer(val);
+                        }
+                    }
+                >
                     <option value="lines">Lines</option>
                     <option value="raw" selected>Raw</option>
                     <option value="cobs">COBS</option>
                     <option value="slip">SLIP</option>
                 </select>
 
-                <select 
-                    style="background: #333; color: white; border: 1px solid #555; padding: 4px; border-radius: 4px;"
-                    on:change=move |ev| {
-                    let val = event_target_value(&ev);
-                    if let Some(w) = worker.get_untracked() {
-                         let msg = UiToWorker::SetDecoder { id: val };
-                         let _ = w.post_message(&serde_wasm_bindgen::to_value(&msg).unwrap());
-                    }
-                }>
-                    <option value="utf8">UTF-8</option>
-                    <option value="nmea" selected>NMEA</option>
-                    <option value="hex">Hex List</option>
-                </select>
+                // Encoder / Auto-Decoder Dropdown Removed (Implicit now)
+
 
                 <span style="font-size: 0.9rem; color: #aaa;">{move || status.get()}</span>
                 
@@ -477,44 +495,64 @@ pub fn App() -> impl IntoView {
                     </button>
                 </div>
             </header>
-            <main style="flex: 1; display: flex; overflow: hidden; height: 100%;">
-                <div id="terminal-container" style="flex: 1; background: #191919; overflow: hidden; display: flex; flex-direction: column; min-width: 0;">
-                    <xterm::TerminalView 
-                        on_mount=Callback::new(move |_| set_terminal_ready.set(true)) 
-                        on_terminal_ready=Callback::from(move |t: xterm::TerminalHandle| {
-                            set_term_handle.set(Some(t.clone()));
-                            
-                            // Bind TX
-                            let manager_tx = manager_tx.clone();
-                            let on_data_cb = Closure::wrap(Box::new(move |data: JsValue| {
-                                if let Some(text) = data.as_string() {
-                                    let bytes = text.into_bytes();
-                                    
-                                    // Direct TX on Main Thread
-                                    let active_manager = manager_tx.clone();
-                                    spawn_local(async move {
-                                        if let Err(e) = active_manager.write(&bytes).await {
-                                            web_sys::console::log_1(&format!("TX Error: {:?}", e).into());
-                                        }
-                                    });
-                                }
-                            }) as Box<dyn FnMut(JsValue)>);
-
-                            t.on_data(on_data_cb.into_js_value().unchecked_into());
-                        })
-                    />
-                </div>
-                <div style="width: 250px; background: #222; border-left: 1px solid #444; color: #eee; overflow-y: auto; font-family: monospace; font-size: 0.8rem; padding: 5px;">
-                     <div style="font-weight: bold; border-bottom: 1px solid #555; margin-bottom: 5px;">Decoded Events</div>
-                     <ul>
-                         <For
-                             each=move || events_list.get()
-                             key=|evt| evt.clone()
-                             children=|evt| view! { <li>{evt}</li> }
+            <div style="flex: 1; display: flex; overflow: hidden; height: 100%; flex-direction: row;">
+                 // Sidebar
+                <div style="flex: 1; position: relative; overflow: hidden; display: flex;">
+                    // Terminal Container
+                    <div style=move || format!("flex: 1; height: 100%; display: {};", if view_mode.get() == ViewMode::Terminal { "block" } else { "none" })>
+                         <xterm::TerminalView 
+                             on_mount=on_terminal_mount
+                             on_terminal_ready=on_term_ready
                          />
-                     </ul>
+                    </div>
+                    
+                    // Hex View Container
+                    <Show when=move || view_mode.get() == ViewMode::Hex fallback=|| ()>
+                        <hex_view::HexView events=events_list />
+                    </Show>
                 </div>
-            </main>
+
+                 // Sidebar (Moved to Right)
+                 <div style="width: 50px; background: rgb(25, 25, 25); display: flex; flex-direction: column; align-items: center; padding-top: 10px; border-left: 1px solid rgb(45, 45, 45);">
+                    // Terminal Button
+                    <button
+                        title="Terminal View (UTF-8)"
+                        style=move || format!(
+                            "width: 40px; height: 40px; background: {}; color: white; border: none; cursor: pointer; border-radius: 4px; margin-bottom: 8px; display: flex; align-items: center; justify-content: center;",
+                            if view_mode.get() == ViewMode::Terminal { "rgb(45, 45, 45)" } else { "transparent" }
+                        )
+                        on:click={
+                            let m = manager.clone();
+                            move |_| {
+                                set_view_mode.set(ViewMode::Terminal);
+                                set_events_list.set(Vec::new()); // Clear history on switch
+                                m.set_decoder("utf8".to_string());
+                            }
+                        }
+                    >
+                        {xterm::icon()}
+                    </button>
+                    
+                    // Hex Inspector Button
+                    <button
+                        title="Hex Inspector (Hex List)"
+                        style=move || format!(
+                            "width: 40px; height: 40px; background: {}; color: white; border: none; cursor: pointer; border-radius: 4px; margin-bottom: 8px; display: flex; align-items: center; justify-content: center;",
+                            if view_mode.get() == ViewMode::Hex { "rgb(45, 45, 45)" } else { "transparent" }
+                        )
+                        on:click={
+                            let m = manager.clone();
+                            move |_| {
+                                set_view_mode.set(ViewMode::Hex);
+                                set_events_list.set(Vec::new()); // Clear history on switch
+                                m.set_decoder("hex".to_string());
+                            }
+                        }
+                    >
+                         {hex_view::icon()}
+                    </button>
+                 </div>
+            </div>
         </div>
     }
 }

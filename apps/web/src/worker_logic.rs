@@ -4,7 +4,7 @@ use web_sys::{MessageEvent, DedicatedWorkerGlobalScope};
 use wasm_bindgen_futures::JsFuture;
 use crate::protocol::{UiToWorker, WorkerToUi};
 use framing::{Framer, lines::LineFramer, raw::RawFramer, cobs_impl::CobsFramer, slip_impl::SlipFramer};
-use decoders::{Decoder, hex::HexDecoder};
+use decoders::{Decoder, utf8::Utf8Decoder};
 use std::rc::Rc;
 use std::cell::RefCell;
 use leptos::logging::log;
@@ -32,10 +32,8 @@ async fn handle_message(
 ) {
     let data = event.data();
     
-    // Deserialize envelope
-    let cmd_val = js_sys::Reflect::get(&data, &"cmd".into()).unwrap_or(data.clone()); 
-    
-    match from_value::<UiToWorker>(cmd_val) {
+    // Direct deserialization (Legacy envelope logic removed)
+    match from_value::<UiToWorker>(data) {
         Ok(cmd) => {
             match cmd {
                 UiToWorker::IngestData { data, timestamp_us } => {
@@ -79,6 +77,7 @@ async fn handle_message(
                      match id.as_str() {
                          "hex" => *d = Box::new(decoders::hex::HexDecoder::new()),
                          "nmea" => *d = Box::new(decoders::nmea::NmeaDecoder::new()),
+                         "utf8" => *d = Box::new(decoders::utf8::Utf8Decoder::new()),
                          _ => log!("Unknown decoder: {}", id),
                      }
                      post_to_ui(&WorkerToUi::Status(format!("Decoder set to {}", id)));
@@ -158,7 +157,8 @@ pub async fn start_worker() {
     log!("Worker: start_worker() BEGIN (Main Thread IO Mode)");
     
     let framer: SharedFramer = Rc::new(RefCell::new(Box::new(RawFramer::new())));
-    let decoder: SharedDecoder = Rc::new(RefCell::new(Box::new(HexDecoder::new())));
+    // Default to Utf8 for ANSI colors
+    let decoder: SharedDecoder = Rc::new(RefCell::new(Box::new(Utf8Decoder::new())));
     
     // Setup message handler
     let f_clone = framer.clone();

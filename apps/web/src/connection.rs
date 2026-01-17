@@ -227,9 +227,7 @@ impl ConnectionManager {
                       if let Some(w) = worker_signal.get_untracked() {
                            let msg = UiToWorker::IngestData { data: chunk, timestamp_us: ts };
                            if let Ok(cmd_val) = serde_wasm_bindgen::to_value(&msg) {
-                               let envelope = js_sys::Object::new();
-                               let _ = js_sys::Reflect::set(&envelope, &"cmd".into(), &cmd_val);
-                               let _ = w.post_message(&envelope);
+                               let _ = w.post_message(&cmd_val);
                            }
                       }
                  } else {
@@ -254,9 +252,7 @@ impl ConnectionManager {
         if let Some(w) = self.worker.get_untracked() {
              let msg = UiToWorker::Connect { baud_rate: baud };
              if let Ok(cmd_val) = serde_wasm_bindgen::to_value(&msg) {
-                 let envelope = js_sys::Object::new();
-                 let _ = js_sys::Reflect::set(&envelope, &"cmd".into(), &cmd_val);
-                 let _ = w.post_message(&envelope);
+                 let _ = w.post_message(&cmd_val);
              }
         }
     }
@@ -560,9 +556,7 @@ impl ConnectionManager {
                          if let Some(w) = self.worker.get_untracked() {
                               let msg = UiToWorker::IngestData { data: buf, timestamp_us: (js_sys::Date::now() * 1000.0) as u64 };
                               if let Ok(cmd_val) = serde_wasm_bindgen::to_value(&msg) {
-                                  let envelope = js_sys::Object::new();
-                                  let _ = js_sys::Reflect::set(&envelope, &"cmd".into(), &cmd_val);
-                                  let _ = w.post_message(&envelope);
+                                  let _ = w.post_message(&cmd_val);
                               }
                          }
                     }
@@ -574,6 +568,24 @@ impl ConnectionManager {
                 self.set_status.set(format!("Connection Failed: {:?}", e));
                 Err(format!("{:?}", e))
             }
+        }
+    }
+    
+    pub fn set_decoder(&self, id: String) {
+        if let Some(w) = self.worker.get_untracked() {
+             let msg = UiToWorker::SetDecoder { id };
+             if let Ok(cmd_val) = serde_wasm_bindgen::to_value(&msg) {
+                 let _ = w.post_message(&cmd_val);
+             }
+        }
+    }
+    
+    pub fn set_framer(&self, id: String) {
+        if let Some(w) = self.worker.get_untracked() {
+             let msg = UiToWorker::SetFramer { id };
+             if let Ok(cmd_val) = serde_wasm_bindgen::to_value(&msg) {
+                 let _ = w.post_message(&cmd_val);
+             }
         }
     }
 }
