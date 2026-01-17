@@ -2,12 +2,10 @@ use leptos::*;
 use wasm_bindgen::prelude::*;
 use wasm_bindgen::JsCast;
 use web_sys::{Worker, MessageEvent};
-use crate::protocol::{UiToWorker, WorkerToUi};
-use transport_webserial::WebSerialTransport;
-use core_types::{Transport, SerialConfig};
-use std::rc::Rc;
-use std::cell::RefCell;
+use crate::protocol::{UiToWorker, WorkerToUi}; // Cleanup Trigger
 use wasm_bindgen_futures::spawn_local;
+use core_types::SerialConfig;
+// Imports Cleaned
 
 mod connection;
 use connection::ConnectionManager;
@@ -222,13 +220,13 @@ pub fn App() -> impl IntoView {
                              set_last_vid.set(vid);
                              set_last_pid.set(pid);
 
-                             
-
                              let current_framing = framing.get_untracked();
 
                              let mut final_baud = current_baud;
-                             let mut final_framing_str = if current_framing == "Auto" { "8N1".to_string() } else { current_framing.clone() };
-
+                             // Removed unused final_framing_str variable
+                             
+                             // Resolve Auto to something concrete if needed, but Manager handles it now.
+                             // if current_baud == 0 { final_baud = 115200; } // REMOVED (Regression Fix)
                              if final_baud == 0 || current_framing == "Auto" {
                                  manager.set_status.set("Auto-Detecting Config...".into());
                                  
@@ -297,7 +295,7 @@ pub fn App() -> impl IntoView {
                                                                      flow_control: "none".into(),
                                                                  };
                                                                  // Manager Connect (Handles open, loop, worker)
-                                                                 let manager_conn = manager_conn.clone();
+                                                                 // Auto-reconnect not needed here, handled by manager internal state or explicit loop
                                                                  spawn_local(async move {
                                                                     // Manager updates status signals automatically
                                                                     if let Err(_e) = manager_conn.connect(p, if current_baud == 0 { 115200 } else { current_baud }, &final_framing_str).await {

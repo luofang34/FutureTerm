@@ -3,13 +3,13 @@ use std::rc::Rc;
 use std::cell::RefCell;
 use wasm_bindgen::prelude::*;
 use wasm_bindgen::JsCast;
-use web_sys::{Worker, MessageEvent};
+use web_sys::Worker;
 use transport_webserial::WebSerialTransport;
 use core_types::{Transport, SerialConfig};
 use wasm_bindgen_futures::spawn_local;
 
 // We need to move the protocol module usage here or make it public
-use crate::protocol::{UiToWorker, WorkerToUi};
+use crate::protocol::UiToWorker;
 
 
 #[derive(Clone)]
@@ -367,7 +367,7 @@ impl ConnectionManager {
     }
 
     pub async fn detect_config(&self, port: web_sys::SerialPort, current_framing: &str) -> (u32, String, Vec<u8>) {
-        let baud_candidates = vec![115200, 9600, 1500000, 921600, 460800, 230400, 57600, 38400, 19200];
+        let baud_candidates = vec![115200, 1500000, 9600, 921600, 460800, 230400, 57600, 38400, 19200];
         let mut best_score = 0.0;
         let mut best_rate = 115200;
         let mut best_framing = "8N1".to_string();
@@ -378,7 +378,9 @@ impl ConnectionManager {
 
         'outer: for rate in baud_candidates {
             self.set_status.set(format!("Scanning {}...", rate));
-            web_sys::console::log_1(&format!("AUTO: Probing {}...", rate).into());
+            web_sys::console::log_1(&format!("AUTO: Probing [v2] {}...", rate).into());
+            let probe_start_ts = js_sys::Date::now();
+            
             
             // 1. Probe 8N1
             let mut t = WebSerialTransport::new();
@@ -392,14 +394,40 @@ impl ConnectionManager {
 
             let mut buffer = Vec::new();
             if let Ok(_) = t.open(port.clone(), cfg).await {
-                // FLUSH: Read once to clear OS buffer garbage from previous rate
-                let _ = t.read_chunk().await;
+                // FLUSH REMOVED: Was causing blocking delays. 
+                // Adaptive loop below handles data checking naturally.
                 
-                let _ = t.write(b"\r").await;
-                let start = js_sys::Date::now();
-                while js_sys::Date::now() - start < 250.0 {
+                let _ = t.write(b"\r").await; // Wakeup
+                let open_dur = js_sys::Date::now() - probe_start_ts;
+                web_sys::console::log_1(&format!("PROFILE: Rate {} OPENED in {:.1}ms", rate, open_dur).into());
+
+                let start_loop = js_sys::Date::now();
+                let mut max_time = 50.0; // Optimization: Start with strict 50ms timeout for silence detection
+                let mut extended = false;
+
+                while js_sys::Date::now() - start_loop < max_time {
                     if let Ok((chunk, _)) = t.read_chunk().await {
-                         if !chunk.is_empty() { buffer.extend_from_slice(&chunk); }
+                         if !chunk.is_empty() { 
+                             buffer.extend_from_slice(&chunk); 
+                             
+                             // Found data! Extend timeout to gather analysis sample
+                             if max_time < 250.0 { 
+                                 max_time = 250.0; 
+                                 if !extended {
+                                     extended = true;
+                                     web_sys::console::log_1(&format!("PROFILE: Rate {} DETECTED DATA (Size: {}). Extending to 250ms.", rate, buffer.len()).into());
+                                 }
+                             }
+
+                             // Optimization: Early exit if we have enough good data
+                             if buffer.len() > 64 {
+                                 let current_score = analysis::calculate_score_8n1(&buffer);
+                                 if current_score > 0.90 {
+                                     web_sys::console::log_1(&format!("AUTO: Early exit for {} (Size: {}, Score: {:.4})", rate, buffer.len(), current_score).into());
+                                     break; // Stop reading, this rate looks promising
+                                 }
+                             }
+                         }
                     }
                     // Wait 10ms
                      let _ = wasm_bindgen_futures::JsFuture::from(
@@ -408,7 +436,14 @@ impl ConnectionManager {
                         })
                     ).await;
                 }
+                
+                let loop_dur = js_sys::Date::now() - start_loop;
+                web_sys::console::log_1(&format!("PROFILE: Rate {} LOOP END in {:.1}ms. Bytes: {}. Extended: {}", rate, loop_dur, buffer.len(), extended).into());
+
                 let _ = t.close().await;
+                
+                let total_dur = js_sys::Date::now() - probe_start_ts;
+                web_sys::console::log_1(&format!("PROFILE: Rate {} CLOSED. Total: {:.1}ms", rate, total_dur).into());
             }
             
             if buffer.is_empty() { continue; }
@@ -431,6 +466,13 @@ impl ConnectionManager {
                  best_framing = "7E1".to_string();
                  best_buffer = buffer.clone();
             }
+
+            // Optimization: If "Perfect" match found, stop scanning remaining rates
+            if best_score > 0.99 && best_buffer.len() > 64 {
+                web_sys::console::log_1(&format!("AUTO: Perfect match found at {}. Stopping scan.", best_rate).into());
+                break 'outer;
+            }
+
 
             if best_score > 0.95 { break 'outer; }
             

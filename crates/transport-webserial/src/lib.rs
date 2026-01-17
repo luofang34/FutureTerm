@@ -107,14 +107,21 @@ impl Transport for WebSerialTransport {
 
     async fn close(&mut self) -> Result<(), TransportError> {
         // Release locks
+        let start_close = js_sys::Date::now();
         *self.pending_read.borrow_mut() = None; // Drop the promise ref
         if let Some(reader) = self.reader.take() {
+            let start_r = js_sys::Date::now();
             let _ = JsFuture::from(reader.cancel()).await;
             reader.release_lock();
+            let dur_r = js_sys::Date::now() - start_r;
+            web_sys::console::log_1(&format!("WebSerialTransport: reader.cancel() took {:.1}ms", dur_r).into());
         }
         if let Some(writer) = self.writer.take() {
+            let start_w = js_sys::Date::now();
             let _ = JsFuture::from(writer.close()).await;
             writer.release_lock();
+            let dur_w = js_sys::Date::now() - start_w;
+            web_sys::console::log_1(&format!("WebSerialTransport: writer.close() took {:.1}ms", dur_w).into());
         }
         
         if let Some(port) = self.port.take() {
@@ -124,13 +131,20 @@ impl Transport for WebSerialTransport {
                      if let Ok(func) = func_val.dyn_into::<js_sys::Function>() {
                          let promise = func.call0(&port);
                          if let Ok(p) = promise {
+                             web_sys::console::log_1(&"WebSerialTransport: port.close() invoking...".into());
+                             let start_c = js_sys::Date::now();
                              JsFuture::from(js_sys::Promise::from(p)).await.ok();
+                             let dur_c = js_sys::Date::now() - start_c;
+                             web_sys::console::log_1(&format!("WebSerialTransport: port.close() resolved in {:.1}ms", dur_c).into());
                          }
                      }
                 },
                 Err(_) => {}
             };
         }
+        
+        let total_close = js_sys::Date::now() - start_close;
+        web_sys::console::log_1(&format!("WebSerialTransport: close() complete in {:.1}ms", total_close).into());
         Ok(())
     }
 
