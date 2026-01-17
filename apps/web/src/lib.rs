@@ -9,6 +9,9 @@ use std::rc::Rc;
 use std::cell::RefCell;
 use wasm_bindgen_futures::spawn_local;
 
+mod connection;
+use connection::ConnectionManager;
+
 mod xterm;
 pub mod protocol;
 pub mod worker_logic;
@@ -16,28 +19,36 @@ pub mod worker_logic;
 #[component]
 pub fn App() -> impl IntoView {
     let (_terminal_ready, set_terminal_ready) = create_signal(false);
-    let (status, set_status) = create_signal("Idle".to_string());
+    
+    // Worker Signal (Used by ConnectionManager)
     let (worker, set_worker) = create_signal::<Option<Worker>>(None);
+    
+    // Connection Manager encapsulates Status, Connected, Transport, Port
+    let manager = ConnectionManager::new(worker.into());
+    let status = manager.get_status();
+    let connected = manager.get_connected();
+    let is_reconfiguring = manager.is_reconfiguring;
+    let detected_baud = manager.detected_baud;
+    let detected_framing = manager.detected_framing;
+
     let (baud_rate, set_baud_rate) = create_signal(0);
-    // Track connection state for toggle button
-    let (connected, set_connected) = create_signal(false);
     
     // Framing Signal (String "8N1", "8E1", etc.)
     let (framing, set_framing) = create_signal("Auto".to_string());
     
     // Auto-Detect Feedback Signals (Only for UI display when in Auto mode)
-    let (detected_baud, set_detected_baud) = create_signal::<Option<u32>>(None);
-    let (detected_framing, set_detected_framing) = create_signal::<Option<String>>(None);
-    
-    // Transport - Main Thread Logic
-    // Store in Rc<RefCell<Option<T>>> to share with closures
-    let transport = Rc::new(RefCell::new(None::<WebSerialTransport>));
+    // These are now part of ConnectionManager
+    // let (detected_baud, set_detected_baud) = create_signal::<Option<u32>>(None);
+    // let (detected_framing, set_detected_framing) = create_signal::<Option<String>>(None);
     
     // Direct Terminal Handle
     let (term_handle, set_term_handle) = create_signal::<Option<xterm::TerminalHandle>>(None);
 
     // Track parsed events
     let (events_list, set_events_list) = create_signal::<Vec<String>>(Vec::new());
+
+    // Legacy signals removed/replaced by manager:
+    // status, connected, transport, active_port, is_reconfiguring
 
     create_effect(move |_| {
         if let Ok(w) = Worker::new("worker_bootstrap.js") {
@@ -62,7 +73,7 @@ pub fn App() -> impl IntoView {
                          WorkerToUi::Status(s) => {
                              // Ignore "Connected" from worker if it's just config confirmation
                              if !s.contains("Worker Ready") {
-                                 set_status.set(s.clone());
+                                 manager.set_status.set(s.clone());
                              }
                          },
                          WorkerToUi::DataBatch { frames, events } => {
@@ -108,63 +119,48 @@ pub fn App() -> impl IntoView {
             
             set_worker.set(Some(w));
         } else {
-            set_status.set("Failed to spawn worker".into());
+            manager.set_status.set("Failed to spawn worker".into());
         }
     });
 
-    let transport_clone = transport.clone();
-    let transport_term = transport.clone();
+    // Shared Helper
+    let parse_framing = |f: &str| -> (u8, String, u8) {
+         let chars: Vec<char> = f.chars().collect();
+         if chars.len() != 3 { return (8, "none".into(), 1); }
+         let data = chars[0].to_digit(10).unwrap_or(8) as u8;
+         let parity = match chars[1] {
+             'N' => "none",
+             'E' => "even",
+             'O' => "odd",
+             _ => "none"
+         }.to_string();
+         let stop = chars[2].to_digit(10).unwrap_or(1) as u8;
+         (data, parity, stop)
+    };
+
+    // Transport removed
+    let manager_con_main = manager.clone();
+    // Use manager for disconnect
+    let manager_disc = manager.clone();
     
     let on_connect = move |force_picker: bool| {
          let shift_held = force_picker;
          // Toggle Logic
          if connected.get() && !force_picker {
              // Disconnect Logic
-             let t_c = transport_clone.clone();
+             let manager_d = manager_disc.clone();
              spawn_local(async move {
-                 // Retry loop to acquire lock (in case reading is active)
-                 let mut closed = false;
-                 for _ in 0..10 { // Try for 500ms
-                     if let Ok(mut borrow) = t_c.try_borrow_mut() {
-                         if let Some(mut t) = borrow.take() {
-                             let _ = t.close().await;
-                             set_status.set("Disconnected".into());
-                             set_connected.set(false);
-                             closed = true;
-                             
-                             // Notify worker to reset
-                             if let Some(w) = worker.get_untracked() {
-                                 let msg = UiToWorker::Disconnect;
-                                 if let Ok(cmd_val) = serde_wasm_bindgen::to_value(&msg) {
-                                     let envelope = js_sys::Object::new();
-                                     let _ = js_sys::Reflect::set(&envelope, &"cmd".into(), &cmd_val);
-                                     let _ = w.post_message(&envelope);
-                                 }
-                             }
-                         }
-                         break;
-                     }
-                     // Wait 50ms
-                     let _ = wasm_bindgen_futures::JsFuture::from(
-                          js_sys::Promise::new(&mut |r, _| {
-                              let _ = web_sys::window().unwrap().set_timeout_with_callback_and_timeout_and_arguments_0(&r, 50);
-                          })
-                     ).await;
-                 }
-                 
-                 if !closed {
-                     set_status.set("Error: Could not close transport (Busy)".into());
-                 }
+                 manager_d.disconnect().await;
+                 manager_d.set_status.set("Disconnected".into());
              });
              return;
          }
          
          // Reset detected info
-         set_detected_baud.set(None);
-         set_detected_framing.set(None);
+         manager.set_detected_baud.set(0);
+         manager.set_detected_framing.set("".into());
 
          let current_baud = baud_rate.get_untracked();
-         let t_c = transport_clone.clone();
          
          // Store connection info for checking against future events
           // Load connection info from local storage if available
@@ -174,13 +170,14 @@ pub fn App() -> impl IntoView {
           
           let (last_vid, set_last_vid) = create_signal::<Option<u16>>(init_vid);
           let (last_pid, set_last_pid) = create_signal::<Option<u16>>(init_pid);
+          let manager = manager_con_main.clone();
 
          spawn_local(async move {
              let nav = web_sys::window().unwrap().navigator();
              let serial = nav.serial();
              
              if serial.is_undefined() {
-                 set_status.set("Error: WebSerial not supported.".into());
+                 manager.set_status.set("Error: WebSerial not supported.".into());
                  return;
              }
 
@@ -202,7 +199,7 @@ pub fn App() -> impl IntoView {
                                 if vid == Some(l_vid) && pid == Some(l_pid) {
                                     final_port = Some(p);
                                     matched = true;
-                                    set_status.set("Auto-selected known port...".into());
+                                    manager.set_status.set("Auto-selected known port...".into());
                                     break;
                                 }
                             }
@@ -211,7 +208,7 @@ pub fn App() -> impl IntoView {
                         // Fallback: If no match but only 1 port exists, use it
                         if !matched && ports.length() == 1 {
                              final_port = Some(ports.get(0).unchecked_into());
-                             set_status.set("Auto-selected single available port...".into());
+                             manager.set_status.set("Auto-selected single available port...".into());
                         }
                     }
                  }
@@ -239,37 +236,24 @@ pub fn App() -> impl IntoView {
                              Ok(p) => {
                                  match wasm_bindgen_futures::JsFuture::from(js_sys::Promise::from(p)).await {
                                      Ok(val) => { final_port = Some(val.unchecked_into()); },
-                                     Err(_) => { set_status.set("Cancelled".into()); return; }
+                                     Err(_) => { manager.set_status.set("Cancelled".into()); return; }
                                  }
                              },
-                             Err(_) => { set_status.set("Error: requestPort call failed".into()); return; }
+                             Err(_) => { manager.set_status.set("Error: requestPort call failed".into()); return; }
                          }
                      },
-                     Err(_) => { set_status.set("Error: requestPort not found".into()); return; }
+                     Err(_) => { manager.set_status.set("Error: requestPort not found".into()); return; }
                  }
              }
              
              if let Some(port) = final_port {
                              
                              // Hot-Swap: If already connected, close the old connection first!
-                             if connected.get_untracked() {
-                                 set_status.set("Switching Port...".into());
-                                 if let Ok(mut borrow) = t_c.try_borrow_mut() {
-                                     if let Some(mut old_t) = borrow.take() {
-                                          let _ = old_t.close().await;
-                                     }
-                                 }
-                                 // Notify worker to reset (optional but good hygiene)
-                                 if let Some(w) = worker.get_untracked() {
-                                     let msg = UiToWorker::Disconnect;
-                                     if let Ok(cmd_val) = serde_wasm_bindgen::to_value(&msg) {
-                                         let envelope = js_sys::Object::new();
-                                         let _ = js_sys::Reflect::set(&envelope, &"cmd".into(), &cmd_val);
-                                         let _ = w.post_message(&envelope);
-                                     }
-                                 }
-                                 set_connected.set(false);
-                             }
+                             // Hot-Swap: If already connected, close the old connection first!
+                            if manager.connected.get_untracked() {
+                                manager.set_status.set("Switching Port...".into());
+                                manager.disconnect().await;
+                            }
 
                              // Capture VID/PID for Reconnect
                              let info = port.get_info();
@@ -291,308 +275,49 @@ pub fn App() -> impl IntoView {
                              set_last_vid.set(vid);
                              set_last_pid.set(pid);
 
-                             let mut best_buffer = Vec::new(); 
                              
-                             // Helper to parse framing string to Config
-                             let parse_framing = |f: &str| -> (u8, String, u8) {
-                                 // Format: 8N1 (Data Parity Stop)
-                                 // Data: 7 or 8. Parity: N (none), E (even), O (odd). Stop: 1 or 2.
-                                 let chars: Vec<char> = f.chars().collect();
-                                 if chars.len() != 3 { return (8, "none".into(), 1); }
-                                 
-                                 let data = chars[0].to_digit(10).unwrap_or(8) as u8;
-                                 let parity = match chars[1] {
-                                     'N' => "none",
-                                     'E' => "even",
-                                     'O' => "odd",
-                                     _ => "none"
-                                 }.to_string();
-                                 let stop = chars[2].to_digit(10).unwrap_or(1) as u8;
-                                 (data, parity, stop)
-                             };
 
-                             let current_framing = framing.get();
+                             let current_framing = framing.get_untracked();
 
                              let mut final_baud = current_baud;
                              let mut final_framing_str = if current_framing == "Auto" { "8N1".to_string() } else { current_framing.clone() };
 
                              if final_baud == 0 || current_framing == "Auto" {
-                                 set_status.set("Auto-Detecting Config...".into());
+                                 manager.set_status.set("Auto-Detecting Config...".into());
                                  
-                                 // Candidates
-                                 // If Baud is fixed (non-zero) but Framing is Auto, use fixed baud.
-                                 let baud_candidates = if current_baud != 0 {
-                                     vec![current_baud]
-                                 } else {
-                                     vec![115200, 9600, 1500000, 921600, 460800, 230400, 57600, 38400, 19200]
-                                 };
-
-                                 let mut best_score = 0.0;
-                                 let mut best_rate = 115200; 
-                                 let mut best_framing = "8N1".to_string();
-
-                                 // Helper: Score buffer for ASCII density
-                                 let calculate_score = |buf: &[u8]| -> f32 {
-                                     let mut p_count = 0;
-                                     let mut total = 0;
-                                     for &b in buf {
-                                         total += 1;
-                                         let c = b as char;
-                                         if c.is_ascii_graphic() || c == ' ' || c == '\r' || c == '\n' { p_count += 1; }
-                                     }
-                                     if total == 0 { 0.0 } else { p_count as f32 / total as f32 }
-                                 };
-
-                                 // Helper: Check 7E1 (Software Parity)
-                                 let check_7e1 = |buf: &[u8]| -> f32 {
-                                     let mut p_count = 0;
-                                     let mut total = 0;
-                                     for &b in buf {
-                                         total += 1;
-                                         let data = b & 0x7F;
-                                         let received_parity = (b & 0x80) >> 7;
-                                         let ones = data.count_ones();
-                                         let expected_parity = if ones % 2 == 0 { 0 } else { 1 }; // Even Parity
-                                         
-                                         if received_parity == expected_parity {
-                                             let c = data as char;
-                                             if c.is_ascii_graphic() || c == ' ' || c == '\r' || c == '\n' { p_count += 1; }
-                                         }
-                                     }
-                                     if total == 0 { 0.0 } else { p_count as f32 / total as f32 }
-                                 };
-
-                                 'outer: for rate in baud_candidates {
-                                     set_status.set(format!("Scanning {}...", rate));
                                      
-                                     // 1. Probe 8N1 (Covers 8N1, 7E1, 7O1)
-                                     let mut t = WebSerialTransport::new();
-                                     let cfg_8n1 = SerialConfig {
-                                         baud_rate: rate,
-                                         data_bits: 8,
-                                         parity: "none".to_string(),
-                                         stop_bits: 1,
-                                         flow_control: "none".into(),
-                                     };
-
-                                     // Capture Buffer
-                                     let mut buffer = Vec::new();
-                                     if let Ok(_) = t.open(port.clone(), cfg_8n1).await {
-                                          let _ = t.write(b"\r").await; // Provoke
-                                          let start = js_sys::Date::now();
-                                          while js_sys::Date::now() - start < 200.0 {
-                                              if let Ok((chunk, _)) = t.read_chunk().await {
-                                                  if !chunk.is_empty() { buffer.extend_from_slice(&chunk); }
-                                              }
-                                              let _ = wasm_bindgen_futures::JsFuture::from(
-                                                  js_sys::Promise::new(&mut |r, _| {
-                                                       let _ = web_sys::window().unwrap().set_timeout_with_callback_and_timeout_and_arguments_0(&r, 10);
-                                                  })
-                                              ).await;
-                                          }
-                                          let _ = t.close().await;
-                                     }
-
-                                     if buffer.is_empty() { continue; }
-
-                                     // 2. Parallel Analysis (Software)
-                                     let score_8n1 = calculate_score(&buffer);
-                                     let score_7e1 = check_7e1(&buffer);
-                                     
-                                     // Check if we found a winner via Software Analysis
-                                     if score_8n1 > best_score {
-                                         best_score = score_8n1;
-                                         best_rate = rate;
-                                         best_framing = "8N1".to_string();
-                                         best_buffer = buffer.clone();
-                                     }
-                                     if score_7e1 > best_score {
-                                          best_score = score_7e1;
-                                          best_rate = rate;
-                                          best_framing = "7E1".to_string();
-                                          // Note: buffer is raw 8N1, effectively containing 7E1 data.
-                                          // We could transform it here, but re-opening later handles it.
-                                          best_buffer = buffer.clone(); 
-                                     }
-
-                                     if best_score > 0.95 { break 'outer; }
-                                     
-                                     // 3. Fallback: Activity detected but low scores? Try 8E1/8O1 (11-bit)
-                                     // Only if "Auto" framing is enabled
-                                     if current_framing == "Auto" && best_score < 0.5 {
-                                         for fr in ["8E1", "8O1"] {
-                                              set_status.set(format!("Deep Probe {} {}...", rate, fr));
-                                              let mut t2 = WebSerialTransport::new();
-                                              let (d, p, s) = parse_framing(fr);
-                                              let cfg_deep = SerialConfig {
-                                                  baud_rate: rate,
-                                                  data_bits: d,
-                                                  parity: p,
-                                                  stop_bits: s,
-                                                  flow_control: "none".into(),
-                                              };
-                                              
-                                              // Quick Probe (100ms)
-                                              if let Ok(_) = t2.open(port.clone(), cfg_deep).await {
-                                                  let _ = t2.write(b"\r").await; 
-                                                  let mut buf2 = Vec::new();
-                                                  let start = js_sys::Date::now();
-                                                  while js_sys::Date::now() - start < 100.0 {
-                                                      if let Ok((chunk, _)) = t2.read_chunk().await {
-                                                          if !chunk.is_empty() { buf2.extend_from_slice(&chunk); }
-                                                      }
-                                                      let _ = wasm_bindgen_futures::JsFuture::from(
-                                                          js_sys::Promise::new(&mut |r, _| {
-                                                               let _ = web_sys::window().unwrap().set_timeout_with_callback_and_timeout_and_arguments_0(&r, 10);
-                                                          })
-                                                      ).await;
-                                                  }
-                                                  let _ = t2.close().await;
-
-                                                  let score = calculate_score(&buf2);
-                                                  if score > best_score {
-                                                      best_score = score;
-                                                      best_rate = rate;
-                                                      best_framing = fr.to_string();
-                                                      best_buffer = buf2;
-                                                  }
-                                                  if score > 0.95 { break 'outer; }
-                                              }
-                                         }
-                                     }
-                                 } 
-                                 
-                                 // Apply best results
-                                 final_baud = best_rate;
-                                 final_framing_str = best_framing.clone();
-                                 set_status.set(format!("Detected: {} {} (Score: {:.2})", best_rate, best_framing, best_score));
-                                 
-                                 // Feedback only (Keep Auto selected)
-                                 set_detected_baud.set(Some(best_rate));
-                                 
-                                 // If "Auto" was selected, update the UI framing selector too
-                                 if current_framing == "Auto" {
-                                      set_detected_framing.set(Some(best_framing));
-                                 }
-                             }
-
-                             set_status.set(format!("Connecting at {} {}...", final_baud, final_framing_str));
+                             web_sys::console::log_1(&format!("Smart Port Check: VID={:?} PID={:?}", vid, pid).into());
                              
-                             // Open Transport Locally
-                             let mut t = WebSerialTransport::new();
-                             let (d, p, s) = parse_framing(&final_framing_str);
-                             let final_cfg = SerialConfig {
-                                 baud_rate: final_baud,
-                                 data_bits: d,
-                                 parity: p,
-                                 stop_bits: s,
-                                 flow_control: "none".into(),
-                             };
-                             match t.open(port.clone(), final_cfg).await {
-                                 Ok(_) => {
-                                     set_status.set("Connected".into());
-                                     set_connected.set(true);
-                                     
-                                     // Store transport
-                                     if let Ok(mut borrow) = t_c.try_borrow_mut() {
-                                         *borrow = Some(t);
-                                     } else {
-                                         set_status.set("Error: Could not store transport".into());
-                                         return;
-                                      }
-                                      
-                                      // Log Smart Connect Decision
-                                      web_sys::console::log_1(&format!("Smart Port Check: VID={:?} PID={:?}", vid, pid).into());
-                                      
-                                      // Save to LocalStorage
-                                      if let (Some(v), Some(p)) = (vid, pid) {
-                                          if let Ok(Some(storage)) = web_sys::window().unwrap().local_storage() {
-                                              let _ = storage.set_item("last_vid", &v.to_string());
-                                              let _ = storage.set_item("last_pid", &p.to_string());
-                                          }
-                                      }
-
-                                      // Replay Best Buffer (Instant Prompt)
-                                      if !best_buffer.is_empty() {
-                                         if let Some(term) = term_handle.get_untracked() {
-                                              let text = String::from_utf8_lossy(&best_buffer);
-                                              term.write(&text);
-                                         }
+                             let manager_conn = manager.clone();
+                             spawn_local(async move {
+                                // Manager handles detection if baud == 0
+                                match manager_conn.connect(port, current_baud, &current_framing).await {
+                                     Ok(_) => {
+                                         // Save to LocalStorage
+                                        if let (Some(v), Some(p)) = (vid, pid) {
+                                            if let Ok(Some(storage)) = web_sys::window().unwrap().local_storage() {
+                                                let _ = storage.set_item("last_vid", &v.to_string());
+                                                let _ = storage.set_item("last_pid", &p.to_string());
+                                            }
+                                        }
+                                     },
+                                     Err(_) => {
+                                         // Status updated by manager
                                      }
-                                     
-                                     
-                                     // Start Read Loop
-                                     let t_loop = t_c.clone();
-                                     spawn_local(async move {
-                                         loop {
-                                             let mut chunk = Vec::new();
-                                             let mut ts = 0;
-                                             let mut should_break = false;
-                                             
-                                             // 1. Borrow Shared to Read
-                                             if let Ok(borrow) = t_loop.try_borrow() {
-                                                 if let Some(t) = borrow.as_ref() {
-                                                     if !t.is_open() { 
-                                                         should_break = true; 
-                                                     } else {
-                                                         match t.read_chunk().await {
-                                                             Ok((d, t_val)) => { chunk = d; ts = t_val; },
-                                                             Err(_) => { should_break = true; }
-                                                         }
-                                                     }
-                                                 } else { should_break = true; }
-                                             } else {
-                                                  // Failed to borrow (Disconnect is mutating?)
-                                                  should_break = true; 
-                                             }
+                                }
+                             });
 
-                                             if should_break { break; }
-                                             
-                                             // 2. Send to Worker
-                                             if !chunk.is_empty() {
-                                                 if let Some(w) = worker.get_untracked() {
-                                                     let msg = UiToWorker::IngestData { data: chunk, timestamp_us: ts };
-                                                     if let Ok(cmd_val) = serde_wasm_bindgen::to_value(&msg) {
-                                                         let envelope = js_sys::Object::new();
-                                                         let _ = js_sys::Reflect::set(&envelope, &"cmd".into(), &cmd_val);
-                                                         let _ = w.post_message(&envelope);
-                                                     }
-                                                 }
-                                             } else {
-                                                 let _ = wasm_bindgen_futures::JsFuture::from(
-                                                      js_sys::Promise::new(&mut |r, _| {
-                                                          let _ = web_sys::window().unwrap().set_timeout_with_callback_and_timeout_and_arguments_0(&r, 20);
-                                                      })
-                                                 ).await;
-                                             }
-                                         }
-                                         // Loop End - Disconnected unexpectedly?
-                                         // If we are here, and `connected` signal is still true, it means it crashed/unplugged.
-                                         if connected.get_untracked() {
-                                             set_status.set("Device Lost (Reconnecting...)".into());
-                                             set_connected.set(false); // UI toggle off, but we keep state for auto-reconnect
-                                         }
-                                     });
-                                     
-                                     // Send initial config to worker
-                                     if let Some(w) = worker.get_untracked() {
-                                         let msg = UiToWorker::Connect { baud_rate: current_baud };
-                                         if let Ok(cmd_val) = serde_wasm_bindgen::to_value(&msg) {
-                                             let envelope = js_sys::Object::new();
-                                             let _ = js_sys::Reflect::set(&envelope, &"cmd".into(), &cmd_val);
-                                             let _ = w.post_message(&envelope);
-                                         }
-                                     }
-                                     
                                      // --- Auto-Reconnect Listeners ---
                                      // We set these up ONCE per successful requestPort session
                                      // Since `requestPort` gives us permission, we can scan later.
                                      
+                                      let manager_conn_cl = manager.clone();
+                                     let manager_conn = manager_conn_cl.clone();
                                      let on_connect_closure = Closure::wrap(Box::new(move |_e: web_sys::Event| {
                                          // On Connect (Device plugged in)
                                          // Check if it matches our last device
                                          if let (Some(target_vid), Some(target_pid)) = (last_vid.get_untracked(), last_pid.get_untracked()) {
-                                              let t_c = t_c.clone();
+                                               let manager_conn = manager_conn_cl.clone();
                                               spawn_local(async move {
                                                   let nav = web_sys::window().unwrap().navigator();
                                                   let serial = nav.serial();
@@ -608,10 +333,9 @@ pub fn App() -> impl IntoView {
                                                             let pid = js_sys::Reflect::get(&info, &"usbProductId".into()).ok().and_then(|v| v.as_f64()).map(|v| v as u16);
                                                             
                                                             if vid == Some(target_vid) && pid == Some(target_pid) {
-                                                                set_status.set("Device found. Auto-reconnecting...".into());
+                                                                manager_conn.set_status.set("Device found. Auto-reconnecting...".into());
                                                                 
                                                                 // We reuse the `options` / `baud`
-                                                                let mut t = WebSerialTransport::new();
                                                                  // Use default framing for auto-reconnect (or derived from valid config)
                                                                  let current_baud = baud_rate.get_untracked();
                                                                  let current_framing = framing.get_untracked();
@@ -625,75 +349,17 @@ pub fn App() -> impl IntoView {
                                                                      stop_bits: s_r,
                                                                      flow_control: "none".into(),
                                                                  };
-                                                                match t.open(p, cfg).await {
-                                                                    Ok(_) => {
-                                                                        set_status.set("Restored Connection".into());
-                                                                        set_connected.set(true);
-                                                                         if let Ok(mut borrow) = t_c.try_borrow_mut() {
-                                                                             *borrow = Some(t);
-                                                                         }
-                                                                         
-                                                                         // Notify user (Optional, or just update status)
-                                                                         set_status.set("Restored Connection".into());
-
-                                                                         // Start Read Loop (Duplicated for robustness)
-                                                                         let t_loop = t_c.clone();
-                                                                         spawn_local(async move {
-                                                                             loop {
-                                                                                 let mut chunk = Vec::new();
-                                                                                 let mut ts = 0;
-                                                                                 let mut should_break = false;
-                                                                                 
-                                                                                 if let Ok(borrow) = t_loop.try_borrow() {
-                                                                                     if let Some(t) = borrow.as_ref() {
-                                                                                         if !t.is_open() { 
-                                                                                             should_break = true; 
-                                                                                         } else {
-                                                                                             match t.read_chunk().await {
-                                                                                                 Ok((d, t_val)) => { chunk = d; ts = t_val; },
-                                                                                                 Err(_) => { should_break = true; }
-                                                                                             }
-                                                                                         }
-                                                                                     } else { should_break = true; }
-                                                                                 } else { should_break = true; }
-
-                                                                                 if should_break { break; }
-                                                                                 
-                                                                                 if !chunk.is_empty() {
-                                                                                     if let Some(w) = worker.get_untracked() {
-                                                                                         let msg = UiToWorker::IngestData { data: chunk, timestamp_us: ts };
-                                                                                         if let Ok(cmd_val) = serde_wasm_bindgen::to_value(&msg) {
-                                                                                             let envelope = js_sys::Object::new();
-                                                                                             let _ = js_sys::Reflect::set(&envelope, &"cmd".into(), &cmd_val);
-                                                                                             let _ = w.post_message(&envelope);
-                                                                                         }
-                                                                                     }
-                                                                                 } else {
-                                                                                     let _ = wasm_bindgen_futures::JsFuture::from(
-                                                                                          js_sys::Promise::new(&mut |r, _| {
-                                                                                              let _ = web_sys::window().unwrap().set_timeout_with_callback_and_timeout_and_arguments_0(&r, 20);
-                                                                                          })
-                                                                                     ).await;
-                                                                                 }
-                                                                             }
-                                                                             if connected.get_untracked() {
-                                                                                set_status.set("Device Lost (Reconnecting...)".into());
-                                                                                set_connected.set(false);
-                                                                             }
-                                                                         });
-                                                                         
-                                                                         // Re-Send configuration
-                                                                         if let Some(w) = worker.get_untracked() {
-                                                                             let msg = UiToWorker::Connect { baud_rate: current_baud };
-                                                                             if let Ok(cmd_val) = serde_wasm_bindgen::to_value(&msg) {
-                                                                                 let envelope = js_sys::Object::new();
-                                                                                 let _ = js_sys::Reflect::set(&envelope, &"cmd".into(), &cmd_val);
-                                                                                 let _ = w.post_message(&envelope);
-                                                                             }
-                                                                         }
-                                                                    },
-                                                                    Err(e) => set_status.set(format!("Auto-Reconnect Failed: {:?}", e)),
-                                                                }
+                                                                 // Manager Connect (Handles open, loop, worker)
+                                                                 let manager_conn = manager_conn.clone();
+                                                                 spawn_local(async move {
+                                                                    // Manager updates status signals automatically
+                                                                    if let Err(_e) = manager_conn.connect(p, if current_baud == 0 { 115200 } else { current_baud }, &final_framing_str).await {
+                                                                        // Connect failed
+                                                                    } else {
+                                                                        // Manual status update for "Restored" vs just "Connected"
+                                                                        manager_conn.set_status.set("Restored Connection".into());
+                                                                    }
+                                                                 });
                                                                 return; // Stop checking
                                                             }
                                                        }
@@ -719,20 +385,48 @@ pub fn App() -> impl IntoView {
                                      
                                      // On Disconnect
                                      let on_disconnect = Closure::wrap(Box::new(move |_e: web_sys::Event| {
-                                          set_status.set("Device Disconnected (Waiting to Reconnect...)".into());
-                                          set_connected.set(false);
+                                          if is_reconfiguring.get_untracked() { return; }
+                                          manager.set_status.set("Device Disconnected (Waiting to Reconnect...)".into());
+                                          manager.set_connected.set(false);
                                      }) as Box<dyn FnMut(_)>);
                                      serial.set_ondisconnect(Some(on_disconnect.as_ref().unchecked_ref()));
                                      on_disconnect.forget();
 
-                                 },
-                                 Err(e) => set_status.set(format!("Open Error: {:?}", e)),
-                             }
-             }
-         });
+
+                                }
+                                }
+
+          });
     };
+    
+    // --- Dynamic Reconfiguration Effect ---
+    let manager_reconf = manager.clone();
+    
+    create_effect(move |_| {
+         let b = baud_rate.get();
+         let f = framing.get();
+         
+         // Only reconfigure if already connected (Untracked to avoid triggering on connect)
+         if connected.get_untracked() {
+             let manager_r = manager_reconf.clone();
+             
+             spawn_local(async move {
+                 // If b=0 and f=Auto, we assume it's the "Auto" state and don't force reconfig 
+                 // (unless we add a "Re-Scan" button later, but for now this prevents redundant loops if both set to Auto)
+                 // Allow Auto (0 / Auto) to trigger reconfiguration too
+                 
+                 web_sys::console::log_1(&"Dynamically Reconfiguring Port...".into());
+                 
+                 // Manager Reconfigure (Handles Close -> Open -> Loop)
+                 // Pass `b` and `f` directly. If b=0, Manager detects. If f=Auto, Manager probes.
+                 manager_r.reconfigure(b, &f).await;
+             });
+         }
+    });
 
     let on_connect_arrow = on_connect.clone();
+    let manager_tx = manager.clone();
+
     
     view! {
         <div style="display: flex; flex-direction: column; height: 100vh; background: rgb(25, 25, 25); color: #eee;">
@@ -749,9 +443,9 @@ pub fn App() -> impl IntoView {
                     }
                 }
                 prop:value=move || baud_rate.get().to_string()>
-                    <option value="0" selected>
-                        {move || if let Some(b) = detected_baud.get() {
-                            format!("Auto ({})", b)
+                    <option value="0" selected=move || baud_rate.get() == 0>
+                        {move || if baud_rate.get() == 0 && detected_baud.get() > 0 {
+                            format!("Auto ({})", detected_baud.get())
                         } else {
                             "Auto Baudrate".to_string()
                         }}
@@ -768,9 +462,9 @@ pub fn App() -> impl IntoView {
                           set_framing.set(event_target_value(&ev));
                      }
                      prop:value=move || framing.get()>
-                    <option value="Auto" selected>
-                        {move || if let Some(f) = detected_framing.get() {
-                            format!("Auto ({})", f)
+                    <option value="Auto" selected=move || framing.get() == "Auto">
+                        {move || if framing.get() == "Auto" && !detected_framing.get().is_empty() {
+                            format!("Auto ({})", detected_framing.get())
                         } else {
                             "Auto Parity".to_string()
                         }}
@@ -846,26 +540,16 @@ pub fn App() -> impl IntoView {
                             set_term_handle.set(Some(t.clone()));
                             
                             // Bind TX
-                            let t_tx = transport_term.clone(); 
+                            let manager_tx = manager_tx.clone();
                             let on_data_cb = Closure::wrap(Box::new(move |data: JsValue| {
                                 if let Some(text) = data.as_string() {
                                     let bytes = text.into_bytes();
                                     
                                     // Direct TX on Main Thread
-                                    let t = t_tx.clone();
+                                    let active_manager = manager_tx.clone();
                                     spawn_local(async move {
-                                        // Attempt to borrow transport
-                                        // read_loop holds a shared borrow, so we can also take a shared borrow!
-                                        if let Ok(borrow) = t.try_borrow() {
-                                            if let Some(transport) = borrow.as_ref() {
-                                                if transport.is_open() {
-                                                     if let Err(e) = transport.write(&bytes).await {
-                                                         web_sys::console::log_1(&format!("TX Error: {:?}", e).into());
-                                                     }
-                                                }
-                                            }
-                                        } else {
-                                            web_sys::console::log_1(&"TX Dropped: Transport busy/locked".into());
+                                        if let Err(e) = active_manager.write(&bytes).await {
+                                            web_sys::console::log_1(&format!("TX Error: {:?}", e).into());
                                         }
                                     });
                                 }
@@ -889,3 +573,17 @@ pub fn App() -> impl IntoView {
         </div>
     }
 }
+
+pub fn parse_framing(s: &str) -> (u8, String, u8) {
+    let chars: Vec<char> = s.chars().collect();
+    let d = chars[0].to_digit(10).unwrap_or(8) as u8;
+    let p = match chars[1] {
+        'N' => "none",
+        'E' => "even",
+        'O' => "odd",
+        _ => "none",
+    }.to_string();
+    let s_bits = chars[2].to_digit(10).unwrap_or(1) as u8;
+    (d, p, s_bits)
+}
+

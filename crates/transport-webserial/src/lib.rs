@@ -168,8 +168,8 @@ impl Transport for WebSerialTransport {
                          let _ = resolve.call1(&JsValue::NULL, &ts_inner);
                      });
                      
-                     // 100ms timeout
-                     let _ = func.call2(&JsValue::NULL, &callback, &JsValue::from_f64(100.0));
+                     // 20ms timeout
+                     let _ = func.call2(&JsValue::NULL, &callback, &JsValue::from_f64(20.0));
                  }
              }
         });
