@@ -23,7 +23,11 @@ pub fn App() -> impl IntoView {
     let (connected, set_connected) = create_signal(false);
     
     // Framing Signal (String "8N1", "8E1", etc.)
-    let (framing, set_framing) = create_signal("8N1".to_string());
+    let (framing, set_framing) = create_signal("Auto".to_string());
+    
+    // Auto-Detect Feedback Signals (Only for UI display when in Auto mode)
+    let (detected_baud, set_detected_baud) = create_signal::<Option<u32>>(None);
+    let (detected_framing, set_detected_framing) = create_signal::<Option<String>>(None);
     
     // Transport - Main Thread Logic
     // Store in Rc<RefCell<Option<T>>> to share with closures
@@ -154,6 +158,10 @@ pub fn App() -> impl IntoView {
              });
              return;
          }
+         
+         // Reset detected info
+         set_detected_baud.set(None);
+         set_detected_framing.set(None);
 
          let current_baud = baud_rate.get_untracked();
          let t_c = transport_clone.clone();
@@ -304,11 +312,6 @@ pub fn App() -> impl IntoView {
                              };
 
                              let current_framing = framing.get();
-                             let framing_candidates = if current_framing == "Auto" {
-                                 vec!["8N1", "7E1", "8E1", "8O1"]
-                             } else {
-                                 vec![current_framing.as_str()]
-                             };
 
                              let mut final_baud = current_baud;
                              let mut final_framing_str = if current_framing == "Auto" { "8N1".to_string() } else { current_framing.clone() };
@@ -321,40 +324,65 @@ pub fn App() -> impl IntoView {
                                  let baud_candidates = if current_baud != 0 {
                                      vec![current_baud]
                                  } else {
-                                     vec![115200, 1500000, 9600, 57600, 38400, 19200, 230400, 460800, 921600]
+                                     vec![115200, 9600, 1500000, 921600, 460800, 230400, 57600, 38400, 19200]
                                  };
 
                                  let mut best_score = 0.0;
                                  let mut best_rate = 115200; 
                                  let mut best_framing = "8N1".to_string();
 
+                                 // Helper: Score buffer for ASCII density
+                                 let calculate_score = |buf: &[u8]| -> f32 {
+                                     let mut p_count = 0;
+                                     let mut total = 0;
+                                     for &b in buf {
+                                         total += 1;
+                                         let c = b as char;
+                                         if c.is_ascii_graphic() || c == ' ' || c == '\r' || c == '\n' { p_count += 1; }
+                                     }
+                                     if total == 0 { 0.0 } else { p_count as f32 / total as f32 }
+                                 };
+
+                                 // Helper: Check 7E1 (Software Parity)
+                                 let check_7e1 = |buf: &[u8]| -> f32 {
+                                     let mut p_count = 0;
+                                     let mut total = 0;
+                                     for &b in buf {
+                                         total += 1;
+                                         let data = b & 0x7F;
+                                         let received_parity = (b & 0x80) >> 7;
+                                         let ones = data.count_ones();
+                                         let expected_parity = if ones % 2 == 0 { 0 } else { 1 }; // Even Parity
+                                         
+                                         if received_parity == expected_parity {
+                                             let c = data as char;
+                                             if c.is_ascii_graphic() || c == ' ' || c == '\r' || c == '\n' { p_count += 1; }
+                                         }
+                                     }
+                                     if total == 0 { 0.0 } else { p_count as f32 / total as f32 }
+                                 };
+
                                  'outer: for rate in baud_candidates {
-                                     for fr in &framing_candidates {
-                                         set_status.set(format!("Probing {} {}...", rate, fr));
-                                         let mut t = WebSerialTransport::new();
-                                         let (d_p, p_p, s_p) = parse_framing(fr);
+                                     set_status.set(format!("Scanning {}...", rate));
+                                     
+                                     // 1. Probe 8N1 (Covers 8N1, 7E1, 7O1)
+                                     let mut t = WebSerialTransport::new();
+                                     let cfg_8n1 = SerialConfig {
+                                         baud_rate: rate,
+                                         data_bits: 8,
+                                         parity: "none".to_string(),
+                                         stop_bits: 1,
+                                         flow_control: "none".into(),
+                                     };
 
-                                         let cfg = SerialConfig {
-                                             baud_rate: rate,
-                                             data_bits: d_p,
-                                             parity: p_p,
-                                             stop_bits: s_p,
-                                             flow_control: "none".into(),
-                                         };
-
-                                     // Attempt open
-                                     if let Ok(_) = t.open(port.clone(), cfg).await {
-                                          // Probe
-                                          let _ = t.write(b"\r").await;
-                                          
-                                          // Read 200ms
-                                          let mut buffer = Vec::new();
+                                     // Capture Buffer
+                                     let mut buffer = Vec::new();
+                                     if let Ok(_) = t.open(port.clone(), cfg_8n1).await {
+                                          let _ = t.write(b"\r").await; // Provoke
                                           let start = js_sys::Date::now();
                                           while js_sys::Date::now() - start < 200.0 {
                                               if let Ok((chunk, _)) = t.read_chunk().await {
-                                                  if !chunk.is_empty() {
-                                                      buffer.extend_from_slice(&chunk);
-                                                  }
+                                                  if !chunk.is_empty() { buffer.extend_from_slice(&chunk); }
                                               }
                                               let _ = wasm_bindgen_futures::JsFuture::from(
                                                   js_sys::Promise::new(&mut |r, _| {
@@ -363,41 +391,88 @@ pub fn App() -> impl IntoView {
                                               ).await;
                                           }
                                           let _ = t.close().await;
+                                     }
 
-                                          // Score
-                                          if !buffer.is_empty() {
-                                              if let Ok(text) = std::str::from_utf8(&buffer) {
-                                                  let mut p_count = 0;
-                                                  let mut total = 0;
-                                                  for c in text.chars() {
-                                                      total += 1;
-                                                      if c.is_ascii_graphic() || c == ' ' || c == '\r' || c == '\n' { p_count += 1; }
-                                                  }
-                                                  if total > 0 {
-                                                      let score = p_count as f32 / total as f32;
-                                                      if score > best_score {
-                                                          best_score = score;
-                                                          best_rate = rate;
-                                                          best_framing = fr.to_string();
-                                                          best_buffer = buffer.clone(); 
+                                     if buffer.is_empty() { continue; }
+
+                                     // 2. Parallel Analysis (Software)
+                                     let score_8n1 = calculate_score(&buffer);
+                                     let score_7e1 = check_7e1(&buffer);
+                                     
+                                     // Check if we found a winner via Software Analysis
+                                     if score_8n1 > best_score {
+                                         best_score = score_8n1;
+                                         best_rate = rate;
+                                         best_framing = "8N1".to_string();
+                                         best_buffer = buffer.clone();
+                                     }
+                                     if score_7e1 > best_score {
+                                          best_score = score_7e1;
+                                          best_rate = rate;
+                                          best_framing = "7E1".to_string();
+                                          // Note: buffer is raw 8N1, effectively containing 7E1 data.
+                                          // We could transform it here, but re-opening later handles it.
+                                          best_buffer = buffer.clone(); 
+                                     }
+
+                                     if best_score > 0.95 { break 'outer; }
+                                     
+                                     // 3. Fallback: Activity detected but low scores? Try 8E1/8O1 (11-bit)
+                                     // Only if "Auto" framing is enabled
+                                     if current_framing == "Auto" && best_score < 0.5 {
+                                         for fr in ["8E1", "8O1"] {
+                                              set_status.set(format!("Deep Probe {} {}...", rate, fr));
+                                              let mut t2 = WebSerialTransport::new();
+                                              let (d, p, s) = parse_framing(fr);
+                                              let cfg_deep = SerialConfig {
+                                                  baud_rate: rate,
+                                                  data_bits: d,
+                                                  parity: p,
+                                                  stop_bits: s,
+                                                  flow_control: "none".into(),
+                                              };
+                                              
+                                              // Quick Probe (100ms)
+                                              if let Ok(_) = t2.open(port.clone(), cfg_deep).await {
+                                                  let _ = t2.write(b"\r").await; 
+                                                  let mut buf2 = Vec::new();
+                                                  let start = js_sys::Date::now();
+                                                  while js_sys::Date::now() - start < 100.0 {
+                                                      if let Ok((chunk, _)) = t2.read_chunk().await {
+                                                          if !chunk.is_empty() { buf2.extend_from_slice(&chunk); }
                                                       }
-                                                      if score > 0.95 { break 'outer; } 
+                                                      let _ = wasm_bindgen_futures::JsFuture::from(
+                                                          js_sys::Promise::new(&mut |r, _| {
+                                                               let _ = web_sys::window().unwrap().set_timeout_with_callback_and_timeout_and_arguments_0(&r, 10);
+                                                          })
+                                                      ).await;
                                                   }
+                                                  let _ = t2.close().await;
+
+                                                  let score = calculate_score(&buf2);
+                                                  if score > best_score {
+                                                      best_score = score;
+                                                      best_rate = rate;
+                                                      best_framing = fr.to_string();
+                                                      best_buffer = buf2;
+                                                  }
+                                                  if score > 0.95 { break 'outer; }
                                               }
-                                          }
-                                     } 
+                                         }
+                                     }
                                  } 
-                                 }
                                  
                                  // Apply best results
                                  final_baud = best_rate;
                                  final_framing_str = best_framing.clone();
                                  set_status.set(format!("Detected: {} {} (Score: {:.2})", best_rate, best_framing, best_score));
-                                 set_baud_rate.set(best_rate); 
+                                 
+                                 // Feedback only (Keep Auto selected)
+                                 set_detected_baud.set(Some(best_rate));
                                  
                                  // If "Auto" was selected, update the UI framing selector too
                                  if current_framing == "Auto" {
-                                      set_framing.set(best_framing);
+                                      set_detected_framing.set(Some(best_framing));
                                  }
                              }
 
@@ -674,7 +749,13 @@ pub fn App() -> impl IntoView {
                     }
                 }
                 prop:value=move || baud_rate.get().to_string()>
-                    <option value="0" selected>Auto</option>
+                    <option value="0" selected>
+                        {move || if let Some(b) = detected_baud.get() {
+                            format!("Auto ({})", b)
+                        } else {
+                            "Auto Baudrate".to_string()
+                        }}
+                    </option>
                     <option value="9600">9600</option>
                     <option value="115200">115200</option>
                     <option value="1000000">1000000</option>
@@ -685,8 +766,15 @@ pub fn App() -> impl IntoView {
                     style="background: #333; color: white; border: 1px solid #555; padding: 4px; border-radius: 4px; margin-left: 10px;"
                      on:change=move |ev| {
                           set_framing.set(event_target_value(&ev));
-                     }>
-                    <option value="Auto" selected>Auto</option>
+                     }
+                     prop:value=move || framing.get()>
+                    <option value="Auto" selected>
+                        {move || if let Some(f) = detected_framing.get() {
+                            format!("Auto ({})", f)
+                        } else {
+                            "Auto Parity".to_string()
+                        }}
+                    </option>
                     <option value="8N1">8N1</option>
                     <option value="8E1">8E1</option>
                     <option value="8O1">8O1</option>
