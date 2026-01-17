@@ -146,10 +146,13 @@ pub fn App() -> impl IntoView {
              return;
          }
 
-         // Connect Logic
          let current_baud = baud_rate.get_untracked();
          let t_c = transport_clone.clone();
          
+         // Store connection info for checking against future events
+         let (last_vid, set_last_vid) = create_signal::<Option<u16>>(None);
+         let (last_pid, set_last_pid) = create_signal::<Option<u16>>(None);
+
          spawn_local(async move {
              let nav = web_sys::window().unwrap().navigator();
              let serial = nav.serial();
@@ -174,11 +177,29 @@ pub fn App() -> impl IntoView {
                      match wasm_bindgen_futures::JsFuture::from(js_sys::Promise::from(p)).await {
                          Ok(val) => {
                              let port: web_sys::SerialPort = val.unchecked_into();
+                             
+                             // Capture VID/PID for Reconnect
+                             let info = port.get_info();
+                             // web-sys SerialPortInfo doesn't expose fields directly without structural casting usually?
+                             // Let's rely on Reflect for safety or try methods if available.
+                             // Actually web-sys 0.3.69+ exposes `usb_vendor_id` and `usb_product_id`.
+                             // Let's use Reflect to be safe against version mismatch or use provided methods.
+                             // Checking docs: SerialPortInfo has `usb_vendor_id` and `usb_product_id` getters.
+                             
+                             // NOTE: We need to enable `SerialPortInfo` in Cargo.toml (Already Done).
+                             // However, let's use a small helper to extract it safely.
+                             let vid = js_sys::Reflect::get(&info, &"usbVendorId".into()).ok().and_then(|v| v.as_f64()).map(|v| v as u16);
+                             let pid = js_sys::Reflect::get(&info, &"usbProductId".into()).ok().and_then(|v| v.as_f64()).map(|v| v as u16);
+                             
+                             // Store for reconnect
+                             set_last_vid.set(vid);
+                             set_last_pid.set(pid);
+
                              set_status.set("Port selected. Connecting...".into());
                              
                              // Open Transport Locally
                              let mut t = WebSerialTransport::new();
-                             match t.open(port, current_baud).await {
+                             match t.open(port.clone(), current_baud).await {
                                  Ok(_) => {
                                      set_status.set("Connected".into());
                                      set_connected.set(true);
@@ -205,7 +226,6 @@ pub fn App() -> impl IntoView {
                                                      if !t.is_open() { 
                                                          should_break = true; 
                                                      } else {
-                                                         // This await holds the borrow!
                                                          match t.read_chunk().await {
                                                              Ok((d, t_val)) => { chunk = d; ts = t_val; },
                                                              Err(_) => { should_break = true; }
@@ -230,19 +250,19 @@ pub fn App() -> impl IntoView {
                                                      }
                                                  }
                                              } else {
-                                                 // Yield if no data (timeout occurred) to allow Disconnect to grab the lock
-                                                 // read_chunk holds lock for ~100ms. We sleep 20ms to give a 20% window.
                                                  let _ = wasm_bindgen_futures::JsFuture::from(
                                                       js_sys::Promise::new(&mut |r, _| {
                                                           let _ = web_sys::window().unwrap().set_timeout_with_callback_and_timeout_and_arguments_0(&r, 20);
                                                       })
                                                  ).await;
                                              }
-                                             
-                                             // Loop continues. `read_chunk` yields internally via Promise.race
                                          }
-                                         // Loop End
-                                         set_connected.set(false);
+                                         // Loop End - Disconnected unexpectedly?
+                                         // If we are here, and `connected` signal is still true, it means it crashed/unplugged.
+                                         if connected.get_untracked() {
+                                             set_status.set("Device Lost (Reconnecting...)".into());
+                                             set_connected.set(false); // UI toggle off, but we keep state for auto-reconnect
+                                         }
                                      });
                                      
                                      // Send initial config to worker
@@ -255,6 +275,134 @@ pub fn App() -> impl IntoView {
                                          }
                                      }
                                      
+                                     // --- Auto-Reconnect Listeners ---
+                                     // We set these up ONCE per successful requestPort session
+                                     // Since `requestPort` gives us permission, we can scan later.
+                                     
+                                     let on_connect_closure = Closure::wrap(Box::new(move |_e: web_sys::Event| {
+                                         // On Connect (Device plugged in)
+                                         // Check if it matches our last device
+                                         if let (Some(target_vid), Some(target_pid)) = (last_vid.get_untracked(), last_pid.get_untracked()) {
+                                              let t_c = t_c.clone();
+                                              spawn_local(async move {
+                                                  let nav = web_sys::window().unwrap().navigator();
+                                                  let serial = nav.serial();
+                                                  // getPorts() returns Promise directly
+                                                  let promise = serial.get_ports();
+                                                  
+                                                  if let Ok(val) = wasm_bindgen_futures::JsFuture::from(promise).await {
+                                                       let ports: js_sys::Array = val.unchecked_into();
+                                                       for i in 0..ports.length() {
+                                                            let p: web_sys::SerialPort = ports.get(i).unchecked_into();
+                                                            let info = p.get_info();
+                                                            let vid = js_sys::Reflect::get(&info, &"usbVendorId".into()).ok().and_then(|v| v.as_f64()).map(|v| v as u16);
+                                                            let pid = js_sys::Reflect::get(&info, &"usbProductId".into()).ok().and_then(|v| v.as_f64()).map(|v| v as u16);
+                                                            
+                                                            if vid == Some(target_vid) && pid == Some(target_pid) {
+                                                                set_status.set("Device found. Auto-reconnecting...".into());
+                                                                
+                                                                // We reuse the `options` / `baud`
+                                                                let mut t = WebSerialTransport::new();
+                                                                match t.open(p, current_baud).await {
+                                                                    Ok(_) => {
+                                                                        set_status.set("Restored Connection".into());
+                                                                        set_connected.set(true);
+                                                                         if let Ok(mut borrow) = t_c.try_borrow_mut() {
+                                                                             *borrow = Some(t);
+                                                                         }
+                                                                         
+                                                                         // Notify user (Optional, or just update status)
+                                                                         set_status.set("Restored Connection".into());
+
+                                                                         // Start Read Loop (Duplicated for robustness)
+                                                                         let t_loop = t_c.clone();
+                                                                         spawn_local(async move {
+                                                                             loop {
+                                                                                 let mut chunk = Vec::new();
+                                                                                 let mut ts = 0;
+                                                                                 let mut should_break = false;
+                                                                                 
+                                                                                 if let Ok(borrow) = t_loop.try_borrow() {
+                                                                                     if let Some(t) = borrow.as_ref() {
+                                                                                         if !t.is_open() { 
+                                                                                             should_break = true; 
+                                                                                         } else {
+                                                                                             match t.read_chunk().await {
+                                                                                                 Ok((d, t_val)) => { chunk = d; ts = t_val; },
+                                                                                                 Err(_) => { should_break = true; }
+                                                                                             }
+                                                                                         }
+                                                                                     } else { should_break = true; }
+                                                                                 } else { should_break = true; }
+
+                                                                                 if should_break { break; }
+                                                                                 
+                                                                                 if !chunk.is_empty() {
+                                                                                     if let Some(w) = worker.get_untracked() {
+                                                                                         let msg = UiToWorker::IngestData { data: chunk, timestamp_us: ts };
+                                                                                         if let Ok(cmd_val) = serde_wasm_bindgen::to_value(&msg) {
+                                                                                             let envelope = js_sys::Object::new();
+                                                                                             let _ = js_sys::Reflect::set(&envelope, &"cmd".into(), &cmd_val);
+                                                                                             let _ = w.post_message(&envelope);
+                                                                                         }
+                                                                                     }
+                                                                                 } else {
+                                                                                     let _ = wasm_bindgen_futures::JsFuture::from(
+                                                                                          js_sys::Promise::new(&mut |r, _| {
+                                                                                              let _ = web_sys::window().unwrap().set_timeout_with_callback_and_timeout_and_arguments_0(&r, 20);
+                                                                                          })
+                                                                                     ).await;
+                                                                                 }
+                                                                             }
+                                                                             if connected.get_untracked() {
+                                                                                set_status.set("Device Lost (Reconnecting...)".into());
+                                                                                set_connected.set(false);
+                                                                             }
+                                                                         });
+                                                                         
+                                                                         // Re-Send configuration
+                                                                         if let Some(w) = worker.get_untracked() {
+                                                                             let msg = UiToWorker::Connect { baud_rate: current_baud };
+                                                                             if let Ok(cmd_val) = serde_wasm_bindgen::to_value(&msg) {
+                                                                                 let envelope = js_sys::Object::new();
+                                                                                 let _ = js_sys::Reflect::set(&envelope, &"cmd".into(), &cmd_val);
+                                                                                 let _ = w.post_message(&envelope);
+                                                                             }
+                                                                         }
+                                                                    },
+                                                                    Err(e) => set_status.set(format!("Auto-Reconnect Failed: {:?}", e)),
+                                                                }
+                                                                return; // Stop checking
+                                                            }
+                                                       }
+                                                  }
+                                              });
+                                         }
+                                     }) as Box<dyn FnMut(_)>);
+                                     
+                                     // Note: We need to store this closure somewhere or it dies?
+                                     // `Closure::wrap` returns a JS function. We attach it.
+                                     // `serial.set_onconnect(Some(func))`.
+                                     // But `serial` object effectively lives in `navigator`.
+                                     // We need to keep the Closure memory alive (forget it?).
+                                     // If we forget it, it leaks, but that's fine for a singleton app.
+                                     
+                                     // Wait, `on_connect` needs to fire even if we are not connected?
+                                     // This logic is nested inside `on_connect` success.
+                                     // Correct. We only want to auto-reconnect if we successfully connected once.
+                                     
+                                     // Attach listeners
+                                     serial.set_onconnect(Some(on_connect_closure.as_ref().unchecked_ref()));
+                                     on_connect_closure.forget();
+                                     
+                                     // On Disconnect
+                                     let on_disconnect = Closure::wrap(Box::new(move |_e: web_sys::Event| {
+                                          set_status.set("Device Disconnected (Waiting to Reconnect...)".into());
+                                          set_connected.set(false);
+                                     }) as Box<dyn FnMut(_)>);
+                                     serial.set_ondisconnect(Some(on_disconnect.as_ref().unchecked_ref()));
+                                     on_disconnect.forget();
+
                                  },
                                  Err(e) => set_status.set(format!("Open Error: {:?}", e)),
                              }

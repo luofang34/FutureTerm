@@ -14,7 +14,7 @@ path = "src/worker_entry.rs"
 leptos = { version = "0.6", features = ["csr"] }
 wasm-bindgen = "0.2"
 wasm-bindgen-futures = "0.4"
-web-sys = { version = "0.3", features = ["HtmlDivElement", "Window", "Document", "Element", "Worker", "WorkerGlobalScope", "DedicatedWorkerGlobalScope", "MessageEvent", "Serial", "SerialPort", "SerialOptions", "Navigator", "SerialPortRequestOptions", "TextDecoder", "TextDecodeOptions", "ResizeObserver", "ResizeObserverEntry"] }
+web-sys = { version = "0.3", features = ["HtmlDivElement", "Window", "Document", "Element", "Worker", "WorkerGlobalScope", "DedicatedWorkerGlobalScope", "MessageEvent", "Serial", "SerialPort", "SerialOptions", "Navigator", "SerialPortRequestOptions", "TextDecoder", "TextDecodeOptions", "ResizeObserver", "ResizeObserverEntry", "SerialPortInfo"] }
 console_error_panic_hook = "0.1"
 log = "0.4"
 console_log = "1.0"
