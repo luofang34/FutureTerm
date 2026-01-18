@@ -1,6 +1,6 @@
 use leptos::*;
 use core_types::{DecodedEvent, Value};
-use wasm_bindgen::JsCast;
+
 
 #[component]
 pub fn HexView(
@@ -25,7 +25,7 @@ pub fn HexView(
             style="
                 width: 100%; 
                 height: 100%; 
-                background: #1e1e1e; 
+                background: rgb(25, 25, 25); 
                 color: #d4d4d4; 
                 font-family: 'Menlo', 'Monaco', monospace; 
                 font-size: 13px; 

@@ -125,20 +125,7 @@ pub fn App() -> impl IntoView {
         }
     });
 
-    // Shared Helper
-    let parse_framing = |f: &str| -> (u8, String, u8) {
-         let chars: Vec<char> = f.chars().collect();
-         if chars.len() != 3 { return (8, "none".into(), 1); }
-         let data = chars[0].to_digit(10).unwrap_or(8) as u8;
-         let parity = match chars[1] {
-             'N' => "none",
-             'E' => "even",
-             'O' => "odd",
-             _ => "none"
-         }.to_string();
-         let stop = chars[2].to_digit(10).unwrap_or(1) as u8;
-         (data, parity, stop)
-    };
+
 
     // Transport removed
     let manager_con_main = manager.clone();
@@ -226,7 +213,7 @@ pub fn App() -> impl IntoView {
 
                              let current_framing = framing.get_untracked();
 
-                             let mut final_baud = current_baud;
+                             let final_baud = current_baud;
                              // Removed unused final_framing_str variable
                              
                              // Resolve Auto to something concrete if needed, but Manager handles it now.
@@ -261,7 +248,7 @@ pub fn App() -> impl IntoView {
                                      // Since `requestPort` gives us permission, we can scan later.
                                      
                                       let manager_conn_cl = manager.clone();
-                                     let manager_conn = manager_conn_cl.clone();
+
                                      let on_connect_closure = Closure::wrap(Box::new(move |_e: web_sys::Event| {
                                          // On Connect (Device plugged in)
                                          // Check if it matches our last device
@@ -286,21 +273,28 @@ pub fn App() -> impl IntoView {
                                                                 
                                                                 // We reuse the `options` / `baud`
                                                                  // Use default framing for auto-reconnect (or derived from valid config)
-                                                                 let current_baud = baud_rate.get_untracked();
+                                                                 let user_pref_baud = baud_rate.get_untracked();
+                                                                 let last_known_baud = detected_baud.get_untracked();
+                                                                 
+                                                                 // SMART RECONNECT: 
+                                                                 // If user meant "Auto" (0), but we successfully connected before (last_known > 0),
+                                                                 // reuse that rate to avoid a full re-scan (which sends '\r' and takes time).
+                                                                 let target_baud = if user_pref_baud == 0 && last_known_baud > 0 {
+                                                                     last_known_baud
+                                                                 } else if user_pref_baud == 0 {
+                                                                     115200 // Fallback if no history (shouldn't happen on reconnect usually)
+                                                                 } else {
+                                                                     user_pref_baud
+                                                                 };
+
                                                                  let current_framing = framing.get_untracked();
                                                                  let final_framing_str = if current_framing == "Auto" { "8N1".to_string() } else { current_framing };
-                                                                 let (d_r, p_r, s_r) = parse_framing(&final_framing_str);
                                                                  
-                                                                 let cfg = SerialConfig {
-                                                                     baud_rate: if current_baud == 0 { 115200 } else { current_baud },
-                                                                     data_bits: d_r,
-                                                                     parity: p_r,
-                                                                     stop_bits: s_r,
-                                                                     flow_control: "none".into(),
-                                                                 };
+                                                                 let (d_r, p_r, s_r) = ConnectionManager::parse_framing(&final_framing_str);
+                                                                 
                                                                  // Manager Connect (Handles open, loop, worker)
                                                                  // Auto-reconnect not needed here, handled by manager internal state or explicit loop
-                                                                 web_sys::console::log_1(&"DEBUG: Auto-Connect Triggered. Calling disconnect/connect sequence.".into());
+                                                                 web_sys::console::log_1(&format!("DEBUG: Auto-Connect. Pref: {}, Last: {}, Target: {}", user_pref_baud, last_known_baud, target_baud).into());
 
                                                                  spawn_local(async move {
                                                                     // FORCE RESET: Close any stale handles (even if we think we are disconnected, the browser might hold the lock)
@@ -314,8 +308,7 @@ pub fn App() -> impl IntoView {
                                                                     ).await;
 
                                                                     // Manager updates status signals automatically
-                                                                    // We pass `current_baud` directly. If it is 0 (Auto), logic in manager.connect() will trigger detection.
-                                                                    if let Err(_e) = manager_conn.connect(p, current_baud, &final_framing_str).await {
+                                                                    if let Err(_e) = manager_conn.connect(p, target_baud, &final_framing_str).await {
                                                                         // Connect failed
                                                                     } else {
                                                                         // Manual status update for "Restored" vs just "Connected"

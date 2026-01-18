@@ -1,8 +1,8 @@
 use leptos::*;
 use std::rc::Rc;
 use std::cell::RefCell;
-use wasm_bindgen::prelude::*;
 use wasm_bindgen::JsCast;
+
 use web_sys::Worker;
 use transport_webserial::WebSerialTransport;
 use core_types::{Transport, SerialConfig};
@@ -362,7 +362,7 @@ impl ConnectionManager {
         }
     }
     // Helper: Parse Framing String
-    fn parse_framing(&self, s: &str) -> (u8, String, u8) {
+    pub fn parse_framing(s: &str) -> (u8, String, u8) {
         let chars: Vec<char> = s.chars().collect();
         let d = chars[0].to_digit(10).unwrap_or(8) as u8;
         let p = match chars[1] {
@@ -490,7 +490,7 @@ impl ConnectionManager {
                 for fr in ["8E1", "8O1"] {
                      self.set_status.set(format!("Deep Probe {} {}...", rate, fr));
                      let mut t2 = WebSerialTransport::new();
-                     let (d, p, s) = self.parse_framing(fr);
+                     let (d, p, s) = Self::parse_framing(fr);
                      let cfg_deep = SerialConfig {
                          baud_rate: rate,
                          data_bits: d,
@@ -533,7 +533,7 @@ impl ConnectionManager {
     }
     // Internal connect implementation
     async fn connect_impl(&self, port: web_sys::SerialPort, baud: u32, framing: &str, initial_buffer: Option<Vec<u8>>) -> Result<(), String> {
-        let (d, p, s) = self.parse_framing(framing);
+        let (d, p, s) = Self::parse_framing(framing);
 
         let cfg = SerialConfig {
             baud_rate: baud,
