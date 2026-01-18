@@ -32,6 +32,7 @@ pub struct ConnectionManager {
     transport: Rc<RefCell<Option<WebSerialTransport>>>,
     active_port: Rc<RefCell<Option<web_sys::SerialPort>>>,
     worker: Signal<Option<Worker>>, // Read-only access to worker for sending data
+    last_auto_baud: Rc<RefCell<Option<u32>>>,
     
     // Hooks for external UI updates (optional, or we just expose signals)
 }
@@ -58,6 +59,7 @@ impl ConnectionManager {
             transport: Rc::new(RefCell::new(None)),
             active_port: Rc::new(RefCell::new(None)),
             worker: worker_signal,
+            last_auto_baud: Rc::new(RefCell::new(None)),
         }
     }
     
@@ -160,13 +162,22 @@ impl ConnectionManager {
              // 3. Open New
              // We reuse the connect_impl logic, manually handling detection so we can check for cancellation
              let (final_baud, final_framing, initial_buf) = if baud == 0 {
-                 let (b, f, buf) = self.detect_config(port.clone(), framing).await;
-                 // RACE CHECK: If disconnected during detection, abort
-                 if self.active_port.borrow().is_none() {
-                     self.set_is_reconfiguring.set(false);
-                     return;
+                 let cached_auto = *self.last_auto_baud.borrow();
+                 
+                 // IMPROVEMENT: If we have a trusted PAST auto-detection result, use it.
+                 // This persists even if user temporarily switches to a wrong Manual baud rate.
+                 // This also avoids the aggressive 'enter' probe on context switch.
+                 if let Some(cached) = cached_auto {
+                      (cached, framing.to_string(), None)
+                 } else {
+                     let (b, f, buf) = self.detect_config(port.clone(), framing).await;
+                     // RACE CHECK: If disconnected during detection, abort
+                     if self.active_port.borrow().is_none() {
+                         self.set_is_reconfiguring.set(false);
+                         return;
+                     }
+                     (b, f, Some(buf))
                  }
-                 (b, f, Some(buf))
              } else {
                  (baud, framing.to_string(), None)
              };
@@ -479,11 +490,15 @@ impl ConnectionManager {
             // Optimization: If "Perfect" match found, stop scanning remaining rates
             if best_score > 0.99 && best_buffer.len() > 64 {
                 web_sys::console::log_1(&format!("AUTO: Perfect match found at {}. Stopping scan.", best_rate).into());
+                *self.last_auto_baud.borrow_mut() = Some(best_rate); // SAVE CACHE
                 break 'outer;
             }
 
 
-            if best_score > 0.95 { break 'outer; }
+            if best_score > 0.95 { 
+                *self.last_auto_baud.borrow_mut() = Some(best_rate); // SAVE CACHE
+                break 'outer; 
+            }
             
             // 3. Fallback: Deep Probe if Auto Framing
             if current_framing == "Auto" && best_score < 0.5 {
