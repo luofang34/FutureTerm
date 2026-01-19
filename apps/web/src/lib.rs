@@ -409,12 +409,14 @@ pub fn App() -> impl IntoView {
     
     view! {
         <div style="display: flex; flex-direction: column; height: 100vh; background: rgb(25, 25, 25); color: #eee;">
-            <header style="padding: 10px; background: rgb(25, 25, 25); display: flex; align-items: center; gap: 20px; border-bottom: 1px solid rgb(45, 45, 45);">
-                <h1 style="margin: 0; font-size: 1.2rem; font-weight: 600;">FutureTerm</h1>
+            <header style="padding: 10px; background: rgb(25, 25, 25); display: flex; align-items: center; gap: 10px; border-bottom: 1px solid rgb(45, 45, 45);">
+                <h1 style="margin: 0; font-family: 'Magneto', 'Impact', 'Arial Black', sans-serif; font-style: italic; font-size: 1.5rem; font-weight: normal; letter-spacing: 1px;">FutureTerm</h1>
                 <div style="flex: 1;"></div>
                 
+                <span style="font-size: 0.9rem; color: #aaa;">{move || status.get()}</span>
+
                 <select 
-                    style="background: #333; color: white; border: 1px solid #555; padding: 4px; border-radius: 4px;"
+                    style="width: 140px; background: #333; color: white; border: 1px solid #555; padding: 4px; border-radius: 4px;"
                     on:change=move |ev| {
                     let val = event_target_value(&ev);
                     if let Ok(b) = val.parse::<u32>() {
@@ -436,7 +438,7 @@ pub fn App() -> impl IntoView {
                 </select>
 
                 <select 
-                    style="background: #333; color: white; border: 1px solid #555; padding: 4px; border-radius: 4px; margin-left: 10px;"
+                    style="width: 110px; background: #333; color: white; border: 1px solid #555; padding: 4px; border-radius: 4px;"
                      on:change=move |ev| {
                           set_framing.set(event_target_value(&ev));
                      }
@@ -455,7 +457,7 @@ pub fn App() -> impl IntoView {
                 </select>
 
                 <select 
-                    style="background: #333; color: white; border: 1px solid #555; padding: 4px; border-radius: 4px;"
+                    style="width: 80px; background: #333; color: white; border: 1px solid #555; padding: 4px; border-radius: 4px;"
                     on:change={
                         let manager_framer = manager.clone();
                         move |ev| {
@@ -473,7 +475,53 @@ pub fn App() -> impl IntoView {
                 // Encoder / Auto-Decoder Dropdown Removed (Implicit now)
 
 
-                <span style="font-size: 0.9rem; color: #aaa;">{move || status.get()}</span>
+                // Status Light
+                <div style=move || {
+                    let is_conn = connected.get();
+                     // Use status text as proxy for "Connecting..." since is_reconfiguring might not cover initial connection
+                    let s = status.get();
+                    let is_busy = s.to_lowercase().contains("connecting") || s.to_lowercase().contains("scanning") || s.to_lowercase().contains("reconfiguring");
+                    
+                    let color = if is_conn && !is_busy {
+                        "rgb(95, 200, 85)" // Connected (Green)
+                    } else if is_busy {
+                        "rgb(245, 190, 80)" // Connecting/Busy (Orange)
+                    } else {
+                        "rgb(240, 105, 95)" // Disconnected (Red)
+                    };
+                    
+                    format!("width: 12px; height: 12px; border-radius: 50%; background: {}; transition: background 0.3s ease;", color)
+                }></div>
+
+                // RX/TX Indicators (Compact Stack)
+                <div style="display: flex; flex-direction: column; align-items: flex-end; justify-content: center; gap: 2px;">
+                    // TX
+                    <div style="display: flex; align-items: center; gap: 6px; line-height: 1;">
+                         <span style="font-family: sans-serif; font-size: 0.6rem; font-weight: bold; color: #ccc;">TX</span>
+                         <div style=move || {
+                             let active = manager.tx_active.get();
+                             let (color, shadow) = if active { 
+                                 ("rgb(80, 255, 80)", "0 0 4px rgb(80, 255, 80)") 
+                             } else { 
+                                 ("rgb(60, 60, 60)", "none") 
+                             }; 
+                             format!("width: 5px; height: 5px; border-radius: 50%; background: {}; box-shadow: {}; transition: background 0.05s;", color, shadow)
+                         }></div>
+                    </div>
+                    // RX
+                    <div style="display: flex; align-items: center; gap: 6px; line-height: 1;">
+                         <span style="font-family: sans-serif; font-size: 0.6rem; font-weight: bold; color: #ccc;">RX</span>
+                         <div style=move || {
+                             let active = manager.rx_active.get();
+                             let (color, shadow) = if active { 
+                                 ("rgb(255, 50, 50)", "0 0 4px rgb(255, 50, 50)") 
+                             } else { 
+                                 ("rgb(60, 60, 60)", "none") 
+                             };
+                             format!("width: 5px; height: 5px; border-radius: 50%; background: {}; box-shadow: {}; transition: background 0.05s;", color, shadow)
+                         }></div>
+                    </div>
+                </div>
                 
                 <style>
                     {
@@ -482,10 +530,10 @@ pub fn App() -> impl IntoView {
                     .split-btn:active { background-color: #005a96 !important; }"
                     }
                 </style>
-                <div style="display: flex; align-items: stretch; height: 28px; border-radius: 4px; overflow: hidden; margin-left:10px;">
+                <div style="display: flex; align-items: stretch; height: 28px; border-radius: 4px; overflow: hidden;">
                     <button 
                         class="split-btn"
-                        style="padding: 0 12px; background: #007acc; color: white; border: none; cursor: pointer; font-size: 0.9rem; border-right: 1px solid rgba(255,255,255,0.2);"
+                        style="padding: 0 12px; width: 100px; text-align: center; background: #007acc; color: white; border: none; cursor: pointer; font-size: 0.9rem; border-right: 1px solid rgba(255,255,255,0.2);"
                         title="Smart Connect (Auto-detects USB-Serial)"
                         on:click=move |_| on_connect(false)>
                         {move || if connected.get() { "Disconnect" } else { "Connect" }}

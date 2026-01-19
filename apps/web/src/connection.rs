@@ -35,6 +35,12 @@ pub struct ConnectionManager {
     last_auto_baud: Rc<RefCell<Option<u32>>>,
     
     // Hooks for external UI updates (optional, or we just expose signals)
+    
+    // RX/TX Activity Signals
+    pub rx_active: Signal<bool>,
+    set_rx_active: WriteSignal<bool>,
+    pub tx_active: Signal<bool>,
+    set_tx_active: WriteSignal<bool>,
 }
 
 impl ConnectionManager {
@@ -44,6 +50,9 @@ impl ConnectionManager {
         let (is_reconfiguring, set_is_reconfiguring) = create_signal(false);
         let (detected_baud, set_detected_baud) = create_signal(0);
         let (detected_framing, set_detected_framing) = create_signal("".to_string());
+        
+        let (rx_active, set_rx_active) = create_signal(false);
+        let (tx_active, set_tx_active) = create_signal(false);
         
         Self {
             connected: connected.into(),
@@ -60,6 +69,43 @@ impl ConnectionManager {
             active_port: Rc::new(RefCell::new(None)),
             worker: worker_signal,
             last_auto_baud: Rc::new(RefCell::new(None)),
+            
+            rx_active: rx_active.into(),
+            set_rx_active,
+            tx_active: tx_active.into(),
+            set_tx_active,
+        }
+    }
+    
+    pub fn trigger_rx(&self) {
+        if !self.rx_active.get_untracked() {
+             self.set_rx_active.set(true);
+             let s = self.set_rx_active;
+             // Blink for 100ms
+             spawn_local(async move {
+                 let _ = wasm_bindgen_futures::JsFuture::from(
+                     js_sys::Promise::new(&mut |r, _| {
+                          let _ = web_sys::window().unwrap().set_timeout_with_callback_and_timeout_and_arguments_0(&r, 100);
+                     })
+                 ).await;
+                 s.set(false);
+             });
+        }
+    }
+
+    pub fn trigger_tx(&self) {
+        if !self.tx_active.get_untracked() {
+             self.set_tx_active.set(true);
+             let s = self.set_tx_active;
+             // Blink for 70ms
+             spawn_local(async move {
+                 let _ = wasm_bindgen_futures::JsFuture::from(
+                     js_sys::Promise::new(&mut |r, _| {
+                          let _ = web_sys::window().unwrap().set_timeout_with_callback_and_timeout_and_arguments_0(&r, 70);
+                     })
+                 ).await;
+                 s.set(false);
+             });
         }
     }
     
@@ -210,6 +256,8 @@ impl ConnectionManager {
         let is_reconf = self.is_reconfiguring;
         let worker_signal = self.worker;
 
+        let set_rx_active = self.set_rx_active;
+
         spawn_local(async move {
             web_sys::console::log_1(&"DEBUG: Read Loop STARTED".into());
             loop {
@@ -252,6 +300,17 @@ impl ConnectionManager {
                                let _ = w.post_message(&cmd_val);
                            }
                       }
+                      // Trigger RX
+                      set_rx_active.set(true);
+                      let s = set_rx_active;
+                      spawn_local(async move {
+                           let _ = wasm_bindgen_futures::JsFuture::from(
+                               js_sys::Promise::new(&mut |r, _| {
+                                    let _ = web_sys::window().unwrap().set_timeout_with_callback_and_timeout_and_arguments_0(&r, 15);
+                               })
+                           ).await;
+                           s.set(false);
+                      });
                  } else {
                       // Yield
                       let _ = wasm_bindgen_futures::JsFuture::from(
@@ -287,6 +346,7 @@ impl ConnectionManager {
                       if let Err(e) = t.write(data).await {
                           return Err(format!("TX Error: {:?}", e));
                       }
+                      self.trigger_tx();
                       return Ok(());
                  }
              }
