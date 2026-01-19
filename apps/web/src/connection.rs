@@ -35,6 +35,8 @@ pub struct ConnectionManager {
     last_auto_baud: Rc<RefCell<Option<u32>>>,
     // Signal to stop the read loop gracefully
     read_loop_should_stop: Rc<RefCell<bool>>,
+    // Guard against double-connect race conditions
+    is_connecting_internal: Rc<RefCell<bool>>,
 
 
     // Hooks for external UI updates (optional, or we just expose signals)
@@ -73,6 +75,7 @@ impl ConnectionManager {
             worker: worker_signal,
             last_auto_baud: Rc::new(RefCell::new(None)),
             read_loop_should_stop: Rc::new(RefCell::new(false)),
+            is_connecting_internal: Rc::new(RefCell::new(false)),
 
             rx_active: rx_active.into(),
             set_rx_active,
@@ -130,7 +133,20 @@ impl ConnectionManager {
         baud: u32,
         framing: &str,
     ) -> Result<(), String> {
-        if baud > 0 && framing == "Auto" {
+        if *self.is_connecting_internal.borrow() {
+            web_sys::console::warn_1(&"Connection attempt blocked: Already connecting.".into());
+            return Err("Already connecting".to_string());
+        }
+        
+        // Stale UI Guard
+        if self.active_port.borrow().is_some() {
+             web_sys::console::warn_1(&"Connection attempt blocked: Port already active.".into());
+             return Err("Already connected".to_string());
+        }
+
+        *self.is_connecting_internal.borrow_mut() = true;
+
+        let result = if baud > 0 && framing == "Auto" {
             let (detect_framing, initial_buf) = self.smart_probe_framing(port.clone(), baud).await;
             self.connect_impl(port, baud, &detect_framing, Some(initial_buf)).await
         } else {
@@ -144,7 +160,10 @@ impl ConnectionManager {
     
             self.connect_impl(port, final_baud, &final_framing_str, initial_buffer)
                 .await
-        }
+        };
+        
+        *self.is_connecting_internal.borrow_mut() = false;
+        result
     }
 
     pub async fn disconnect(&self) {
@@ -702,6 +721,9 @@ impl ConnectionManager {
         framing: &str,
         initial_buffer: Option<Vec<u8>>,
     ) -> Result<(), String> {
+        // Internal impl assumes is_connecting guard is handled by caller (connect)
+        // or we are called by reconfigure (which handles its own state)
+
         let (d, p, s) = Self::parse_framing(framing);
 
         let cfg = SerialConfig {
@@ -713,50 +735,70 @@ impl ConnectionManager {
         };
 
         let mut t = WebSerialTransport::new();
-        match t.open(port.clone(), cfg).await {
-            Ok(_) => {
-                // Reset stop signal
-                *self.read_loop_should_stop.borrow_mut() = false;
-                
-                // Store state
-                *self.transport.borrow_mut() = Some(t);
-                *self.active_port.borrow_mut() = Some(port);
+        
+        // Retry Loop for "Port already open" race condition (probe cleanup lag)
+        let mut attempts = 0;
+        let result = loop {
+            match t.open(port.clone(), cfg.clone()).await {
+                Ok(_) => {
+                    // Reset stop signal
+                    *self.read_loop_should_stop.borrow_mut() = false;
+                    
+                    // Store state
+                    *self.transport.borrow_mut() = Some(t);
+                    *self.active_port.borrow_mut() = Some(port);
 
-                self.set_connected.set(true);
-                self.set_status.set("Connected".into());
+                    self.set_connected.set(true);
+                    self.set_status.set("Connected".into());
 
-                // Update detected config for UI
-                self.set_detected_baud.set(baud);
-                self.set_detected_framing.set(framing.to_string());
+                    // Update detected config for UI
+                    self.set_detected_baud.set(baud);
+                    self.set_detected_framing.set(framing.to_string());
 
-                // Spawn Read Loop
-                self.spawn_read_loop();
+                    // Spawn Read Loop
+                    self.spawn_read_loop();
 
-                // Notify Worker
-                self.send_worker_config(baud);
+                    // Notify Worker
+                    self.send_worker_config(baud);
 
-                // Replay Initial Buffer (if any)
-                if let Some(buf) = initial_buffer {
-                    if !buf.is_empty() {
-                        if let Some(w) = self.worker.get_untracked() {
-                            let msg = UiToWorker::IngestData {
-                                data: buf,
-                                timestamp_us: (js_sys::Date::now() * 1000.0) as u64,
-                            };
-                            if let Ok(cmd_val) = serde_wasm_bindgen::to_value(&msg) {
-                                let _ = w.post_message(&cmd_val);
+                    // Replay Initial Buffer (if any)
+                    if let Some(buf) = initial_buffer {
+                         if !buf.is_empty() {
+                            if let Some(w) = self.worker.get_untracked() {
+                                let msg = UiToWorker::IngestData {
+                                    data: buf,
+                                    timestamp_us: (js_sys::Date::now() * 1000.0) as u64,
+                                };
+                                if let Ok(cmd_val) = serde_wasm_bindgen::to_value(&msg) {
+                                    let _ = w.post_message(&cmd_val);
+                                }
                             }
                         }
                     }
-                }
 
-                Ok(())
+                    break Ok(());
+                }
+                Err(e) => {
+                     let err_str = format!("{:?}", e);
+                     if (err_str.contains("already open") || err_str.contains("InvalidStateError")) && attempts < 3 {
+                        attempts += 1;
+                        web_sys::console::warn_1(&format!("Connection blocked by busy port. Retrying ({}/3)...", attempts).into());
+                        
+                        // Wait 100ms
+                         let _ = wasm_bindgen_futures::JsFuture::from(js_sys::Promise::new(&mut |r, _| {
+                            let _ = web_sys::window().unwrap().set_timeout_with_callback_and_timeout_and_arguments_0(&r, 100);
+                        })).await;
+                        continue;
+                     }
+                    
+                    self.set_status.set(format!("Connection Failed: {:?}", e));
+                    break Err(format!("{:?}", e));
+                }
             }
-            Err(e) => {
-                self.set_status.set(format!("Connection Failed: {:?}", e));
-                Err(format!("{:?}", e))
-            }
-        }
+        };
+
+        // Guard cleared by caller
+        result
     }
 
     pub fn set_decoder(&self, id: String) {
