@@ -33,6 +33,9 @@ pub struct ConnectionManager {
     active_port: Rc<RefCell<Option<web_sys::SerialPort>>>,
     worker: Signal<Option<Worker>>, // Read-only access to worker for sending data
     last_auto_baud: Rc<RefCell<Option<u32>>>,
+    // Signal to stop the read loop gracefully
+    read_loop_should_stop: Rc<RefCell<bool>>,
+
 
     // Hooks for external UI updates (optional, or we just expose signals)
 
@@ -69,6 +72,7 @@ impl ConnectionManager {
             active_port: Rc::new(RefCell::new(None)),
             worker: worker_signal,
             last_auto_baud: Rc::new(RefCell::new(None)),
+            read_loop_should_stop: Rc::new(RefCell::new(false)),
 
             rx_active: rx_active.into(),
             set_rx_active,
@@ -126,35 +130,45 @@ impl ConnectionManager {
         baud: u32,
         framing: &str,
     ) -> Result<(), String> {
-        // Auto-Detect if Baud is 0
-        let (final_baud, final_framing_str, initial_buffer) = if baud == 0 {
-            let (b, f, buf) = self.detect_config(port.clone(), framing).await;
-            (b, f, Some(buf))
+        if baud > 0 && framing == "Auto" {
+            let (detect_framing, initial_buf) = self.smart_probe_framing(port.clone(), baud).await;
+            self.connect_impl(port, baud, &detect_framing, Some(initial_buf)).await
         } else {
-            (baud, framing.to_string(), None)
-        };
-
-        self.connect_impl(port, final_baud, &final_framing_str, initial_buffer)
-            .await
+            // Auto-Detect if Baud is 0
+            let (final_baud, final_framing_str, initial_buffer) = if baud == 0 {
+                let (b, f, buf) = self.detect_config(port.clone(), framing).await;
+                (b, f, Some(buf))
+            } else {
+                (baud, framing.to_string(), None)
+            };
+    
+            self.connect_impl(port, final_baud, &final_framing_str, initial_buffer)
+                .await
+        }
     }
 
     pub async fn disconnect(&self) {
         self.set_status.set("Disconnecting...".into());
 
-        // 1. Close Transport (Retry loop to avoid panic)
+        // 1. Signal Read Loop to Stop
+        *self.read_loop_should_stop.borrow_mut() = true;
+
+        // 2. Wait for it to exit (e.g. 200ms)
+        // This gives the read loop a chance to see the flag and break, dropping its borrow of transport.
+        let _ = wasm_bindgen_futures::JsFuture::from(js_sys::Promise::new(&mut |r, _| {
+            let _ = web_sys::window()
+                .unwrap()
+                .set_timeout_with_callback_and_timeout_and_arguments_0(&r, 200);
+        }))
+        .await;
+
+        // 3. Close Transport
+        // Try to take lock. If still locked, we warn but don't panic.
         let mut t_opt = None;
-        for _ in 0..100 {
-            if let Ok(mut borrow) = self.transport.try_borrow_mut() {
-                t_opt = borrow.take();
-                break;
-            }
-            // Wait 20ms
-            let _ = wasm_bindgen_futures::JsFuture::from(js_sys::Promise::new(&mut |r, _| {
-                let _ = web_sys::window()
-                    .unwrap()
-                    .set_timeout_with_callback_and_timeout_and_arguments_0(&r, 20);
-            }))
-            .await;
+        if let Ok(mut borrow) = self.transport.try_borrow_mut() {
+            t_opt = borrow.take();
+        } else {
+             web_sys::console::warn_1(&"Disconnect: Could not acquire transport lock even after wait.".into());
         }
 
         if let Some(mut t) = t_opt {
@@ -181,37 +195,28 @@ impl ConnectionManager {
         let port_opt = self.active_port.borrow().clone();
 
         if let Some(port) = port_opt {
-            // 1. Close existing (Internal logic only, distinct from full disconnect)
+            // 1. Signal Read Loop to Stop
+             *self.read_loop_should_stop.borrow_mut() = true;
+
+            // 2. Wait for it to exit (e.g. 200ms)
+            let _ = wasm_bindgen_futures::JsFuture::from(js_sys::Promise::new(&mut |r, _| {
+                let _ = web_sys::window()
+                    .unwrap()
+                    .set_timeout_with_callback_and_timeout_and_arguments_0(&r, 200);
+            }))
+            .await;
+
+            // 3. Close existing
             let mut t_opt = None;
-            // Retry loop to acquire transport (to avoid panic if read_loop holds lock)
-            for _ in 0..100 {
-                if let Ok(mut borrow) = self.transport.try_borrow_mut() {
-                    t_opt = borrow.take();
-                    break;
-                }
-                // Wait 20ms
-                let _ = wasm_bindgen_futures::JsFuture::from(js_sys::Promise::new(&mut |r, _| {
-                    let _ = web_sys::window()
-                        .unwrap()
-                        .set_timeout_with_callback_and_timeout_and_arguments_0(&r, 20);
-                }))
-                .await;
+             if let Ok(mut borrow) = self.transport.try_borrow_mut() {
+                t_opt = borrow.take();
+            } else {
+                 web_sys::console::warn_1(&"Reconfigure: Could not acquire transport lock even after wait.".into());
             }
+
             if let Some(mut t) = t_opt {
-                // Retry loop to close safely
-                for _ in 0..10 {
-                    if t.close().await.is_ok() {
-                        break;
-                    }
-                    // Wait 50ms
-                    let _ =
-                        wasm_bindgen_futures::JsFuture::from(js_sys::Promise::new(&mut |r, _| {
-                            let _ = web_sys::window()
-                                .unwrap()
-                                .set_timeout_with_callback_and_timeout_and_arguments_0(&r, 50);
-                        }))
-                        .await;
-                }
+                // Resize safe close
+                let _ = t.close().await;
             }
 
             // 2. Wait for browser to release lock fully
@@ -231,7 +236,12 @@ impl ConnectionManager {
                 // This persists even if user temporarily switches to a wrong Manual baud rate.
                 // This also avoids the aggressive 'enter' probe on context switch.
                 if let Some(cached) = cached_auto {
-                    (cached, framing.to_string(), None)
+                    let effective_framing = if framing == "Auto" {
+                        "8N1"
+                    } else {
+                        framing
+                    };
+                    (cached, effective_framing.to_string(), None)
                 } else {
                     let (b, f, buf) = self.detect_config(port.clone(), framing).await;
                     // RACE CHECK: If disconnected during detection, abort
@@ -241,6 +251,10 @@ impl ConnectionManager {
                     }
                     (b, f, Some(buf))
                 }
+            } else if framing == "Auto" {
+                 // Smart Probe on Reconfigure as well
+                 let (detect_f, buf) = self.smart_probe_framing(port.clone(), baud).await;
+                 (baud, detect_f, Some(buf))
             } else {
                 (baud, framing.to_string(), None)
             };
@@ -279,9 +293,17 @@ impl ConnectionManager {
 
         let manager = self.clone();
 
+        let should_stop = self.read_loop_should_stop.clone();
+
         spawn_local(async move {
             web_sys::console::log_1(&"DEBUG: Read Loop STARTED".into());
             loop {
+                // Check stop signal FIRST
+                if *should_stop.borrow() {
+                    web_sys::console::log_1(&"DEBUG: Read Loop STOP SIGNAL received.".into());
+                    break;
+                }
+
                 let mut chunk = Vec::new();
                 let mut ts = 0;
                 let mut should_break = false;
@@ -520,91 +542,11 @@ impl ConnectionManager {
             let probe_start_ts = js_sys::Date::now();
 
             // 1. Probe 8N1
-            let mut t = WebSerialTransport::new();
-            let cfg = SerialConfig {
-                baud_rate: rate,
-                data_bits: 8,
-                parity: "none".to_string(),
-                stop_bits: 1,
-                flow_control: "none".into(),
-            };
-
-            let mut buffer = Vec::new();
-            if t.open(port.clone(), cfg).await.is_ok() {
-                // FLUSH REMOVED: Was causing blocking delays.
-                // Adaptive loop below handles data checking naturally.
-
-                let _ = t.write(b"\r").await; // Wakeup
+                let buffer = self.gather_probe_data(port.clone(), rate, "8N1", true).await;
                 let open_dur = js_sys::Date::now() - probe_start_ts;
                 web_sys::console::log_1(
-                    &format!("PROFILE: Rate {} OPENED in {:.1}ms", rate, open_dur).into(),
+                    &format!("PROFILE: Rate {} PROBED in {:.1}ms. Bytes: {}", rate, open_dur, buffer.len()).into(),
                 );
-
-                let start_loop = js_sys::Date::now();
-                let mut max_time = 50.0; // Optimization: Start with strict 50ms timeout for silence detection
-                let mut extended = false;
-
-                while js_sys::Date::now() - start_loop < max_time {
-                    if let Ok((chunk, _)) = t.read_chunk().await {
-                        if !chunk.is_empty() {
-                            buffer.extend_from_slice(&chunk);
-
-                            // Found data! Extend timeout to gather analysis sample
-                            if max_time < 250.0 {
-                                max_time = 250.0;
-                                if !extended {
-                                    extended = true;
-                                    web_sys::console::log_1(&format!("PROFILE: Rate {} DETECTED DATA (Size: {}). Extending to 250ms.", rate, buffer.len()).into());
-                                }
-                            }
-
-                            // Optimization: Early exit if we have enough good data
-                            if buffer.len() > 64 {
-                                let current_score = analysis::calculate_score_8n1(&buffer);
-                                if current_score > 0.90 {
-                                    web_sys::console::log_1(
-                                        &format!(
-                                            "AUTO: Early exit for {} (Size: {}, Score: {:.4})",
-                                            rate,
-                                            buffer.len(),
-                                            current_score
-                                        )
-                                        .into(),
-                                    );
-                                    break; // Stop reading, this rate looks promising
-                                }
-                            }
-                        }
-                    }
-                    // Wait 10ms
-                    let _ =
-                        wasm_bindgen_futures::JsFuture::from(js_sys::Promise::new(&mut |r, _| {
-                            let _ = web_sys::window()
-                                .unwrap()
-                                .set_timeout_with_callback_and_timeout_and_arguments_0(&r, 10);
-                        }))
-                        .await;
-                }
-
-                let loop_dur = js_sys::Date::now() - start_loop;
-                web_sys::console::log_1(
-                    &format!(
-                        "PROFILE: Rate {} LOOP END in {:.1}ms. Bytes: {}. Extended: {}",
-                        rate,
-                        loop_dur,
-                        buffer.len(),
-                        extended
-                    )
-                    .into(),
-                );
-
-                let _ = t.close().await;
-
-                let total_dur = js_sys::Date::now() - probe_start_ts;
-                web_sys::console::log_1(
-                    &format!("PROFILE: Rate {} CLOSED. Total: {:.1}ms", rate, total_dur).into(),
-                );
-            }
 
             if buffer.is_empty() {
                 continue;
@@ -657,50 +599,20 @@ impl ConnectionManager {
                 for fr in ["8E1", "8O1"] {
                     self.set_status
                         .set(format!("Deep Probe {} {}...", rate, fr));
-                    let mut t2 = WebSerialTransport::new();
-                    let (d, p, s) = Self::parse_framing(fr);
-                    let cfg_deep = SerialConfig {
-                        baud_rate: rate,
-                        data_bits: d,
-                        parity: p,
-                        stop_bits: s,
-                        flow_control: "none".into(),
-                    };
-
-                    if t2.open(port.clone(), cfg_deep).await.is_ok() {
-                        let _ = t2.write(b"\r").await;
-                        let mut buf2 = Vec::new();
-                        let start = js_sys::Date::now();
-                        while js_sys::Date::now() - start < 100.0 {
-                            if let Ok((chunk, _)) = t2.read_chunk().await {
-                                if !chunk.is_empty() {
-                                    buf2.extend_from_slice(&chunk);
-                                }
-                            }
-                            let _ = wasm_bindgen_futures::JsFuture::from(js_sys::Promise::new(
-                                &mut |r, _| {
-                                    let _ = web_sys::window()
-                                        .unwrap()
-                                        .set_timeout_with_callback_and_timeout_and_arguments_0(
-                                            &r, 10,
-                                        );
-                                },
-                            ))
-                            .await;
-                        }
-                        let _ = t2.close().await;
-
-                        let score = analysis::calculate_score_8n1(&buf2);
-                        if score > best_score {
-                            best_score = score;
-                            best_rate = rate;
-                            best_framing = fr.to_string();
-                            best_buffer = buf2;
-                        }
-                        if score > 0.95 {
-                            break 'outer;
-                        }
-                    }
+                    
+                    let buf2 = self.gather_probe_data(port.clone(), rate, fr, true).await; // Use helper
+                    
+                    /* Original Deep Probe Logic Removed - replaced by helper call */
+                    let score = analysis::calculate_score_8n1(&buf2);
+                    if score > best_score {
+                         best_score = score;
+                         best_rate = rate;
+                         best_framing = fr.to_string();
+                         best_buffer = buf2;
+                     }
+                     if score > 0.95 {
+                         break 'outer;
+                     }
                 }
             }
         }
@@ -710,6 +622,77 @@ impl ConnectionManager {
             best_rate, best_framing, best_score
         ));
         (best_rate, best_framing, best_buffer)
+    }
+
+    // Helper: Gather Probe Data (Extracted)
+    async fn gather_probe_data(&self, port: web_sys::SerialPort, rate: u32, framing: &str, send_wakeup: bool) -> Vec<u8> {
+         let mut t = WebSerialTransport::new();
+         let (d,p,s) = Self::parse_framing(framing);
+         let cfg = SerialConfig {
+            baud_rate: rate,
+            data_bits: d,
+            parity: p,
+            stop_bits: s,
+            flow_control: "none".into(),
+        };
+
+        let mut buffer = Vec::new();
+        if t.open(port, cfg).await.is_ok() {
+            if send_wakeup {
+                let _ = t.write(b"\r").await;
+            }
+            
+            let start_loop = js_sys::Date::now();
+            let mut max_time = 50.0;
+
+            while js_sys::Date::now() - start_loop < max_time {
+                if let Ok((chunk, _)) = t.read_chunk().await {
+                     if !chunk.is_empty() {
+                        buffer.extend_from_slice(&chunk);
+                        if max_time < 250.0 {
+                            max_time = 250.0; 
+                        }
+                        if buffer.len() > 64 {
+                             // Use analysis crate if available or simple check (Assuming analysis crate in scope)
+                             if analysis::calculate_score_8n1(&buffer) > 0.90 {
+                                 break;
+                             }
+                        }
+                     }
+                }
+                let _ = wasm_bindgen_futures::JsFuture::from(js_sys::Promise::new(&mut |r, _| {
+                    let _ = web_sys::window().unwrap().set_timeout_with_callback_and_timeout_and_arguments_0(&r, 10);
+                })).await;
+            }
+            let _ = t.close().await;
+        }
+        buffer
+    }
+
+    // New: Smart Probe for Single Baud
+    pub async fn smart_probe_framing(&self, port: web_sys::SerialPort, rate: u32) -> (String, Vec<u8>) {
+        self.set_status.set(format!("Smart Probing {}...", rate));
+        
+        // 1. Probe 8N1 (Most common) - PASSIVE (No Wakeup)
+        let buf_8n1 = self.gather_probe_data(port.clone(), rate, "8N1", false).await;
+        if !buf_8n1.is_empty() {
+             let score = analysis::calculate_score_8n1(&buf_8n1);
+             if score > 0.90 {
+                 return ("8N1".to_string(), buf_8n1);
+             }
+        }
+
+        // 2. Probe 7E1 (Common alternative) - PASSIVE
+        if !buf_8n1.is_empty() { // Only if we saw SOME data (garbage or not), try parity
+             let buf_7e1 = self.gather_probe_data(port.clone(), rate, "7E1", false).await;
+             let score = analysis::calculate_score_7e1(&buf_7e1); // Assuming 7E1 score calc
+             if score > 0.90 {
+                 return ("7E1".to_string(), buf_7e1);
+             }
+        }
+        
+        // Default to 8N1 if silent or unsure
+        ("8N1".to_string(), buf_8n1)
     }
     // Internal connect implementation
     async fn connect_impl(
@@ -732,6 +715,9 @@ impl ConnectionManager {
         let mut t = WebSerialTransport::new();
         match t.open(port.clone(), cfg).await {
             Ok(_) => {
+                // Reset stop signal
+                *self.read_loop_should_stop.borrow_mut() = false;
+                
                 // Store state
                 *self.transport.borrow_mut() = Some(t);
                 *self.active_port.borrow_mut() = Some(port);
