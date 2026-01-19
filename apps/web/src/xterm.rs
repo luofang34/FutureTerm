@@ -61,6 +61,7 @@ impl TerminalHandle {
     pub fn write(&self, data: &str) {
         self.0.write(data);
     }
+    #[allow(dead_code)]
     pub fn clear(&self) {
         self.0.clear();
     }

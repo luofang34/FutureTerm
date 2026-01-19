@@ -1,6 +1,7 @@
 use leptos::*;
 use std::rc::Rc;
 use std::cell::RefCell;
+use wasm_bindgen::prelude::*;
 use wasm_bindgen::JsCast;
 
 use web_sys::Worker;
@@ -256,7 +257,8 @@ impl ConnectionManager {
         let is_reconf = self.is_reconfiguring;
         let worker_signal = self.worker;
 
-        let set_rx_active = self.set_rx_active;
+
+        let manager = self.clone();
 
         spawn_local(async move {
             web_sys::console::log_1(&"DEBUG: Read Loop STARTED".into());
@@ -300,17 +302,8 @@ impl ConnectionManager {
                                let _ = w.post_message(&cmd_val);
                            }
                       }
-                      // Trigger RX
-                      set_rx_active.set(true);
-                      let s = set_rx_active;
-                      spawn_local(async move {
-                           let _ = wasm_bindgen_futures::JsFuture::from(
-                               js_sys::Promise::new(&mut |r, _| {
-                                    let _ = web_sys::window().unwrap().set_timeout_with_callback_and_timeout_and_arguments_0(&r, 15);
-                               })
-                           ).await;
-                           s.set(false);
-                      });
+                       // Trigger RX
+                       manager.trigger_rx();
                  } else {
                       // Yield
                       let _ = wasm_bindgen_futures::JsFuture::from(
@@ -675,6 +668,114 @@ impl ConnectionManager {
                  let _ = w.post_message(&cmd_val);
              }
         }
+    }
+
+    // --- Auto-Reconnect Logic ---
+    pub fn setup_auto_reconnect(
+        &self,
+        last_vid: Signal<Option<u16>>,
+        last_pid: Signal<Option<u16>>,
+        baud_signal: Signal<u32>,
+        detected_baud: Signal<u32>,
+        framing_signal: Signal<String>
+    ) {
+         let manager_conn = self.clone();
+         let manager_disc = self.clone();
+         let is_reconfiguring = self.is_reconfiguring;
+
+         let on_connect_closure = Closure::wrap(Box::new(move |_e: web_sys::Event| {
+             // On Connect (Device plugged in)
+             // Check if it matches our last device
+             if let (Some(target_vid), Some(target_pid)) = (last_vid.get_untracked(), last_pid.get_untracked()) {
+                   let manager_conn = manager_conn.clone();
+                  spawn_local(async move {
+                      let nav = web_sys::window().unwrap().navigator();
+                      let serial = nav.serial();
+                      // getPorts() returns Promise directly
+                      let promise = serial.get_ports();
+                      
+                      if let Ok(val) = wasm_bindgen_futures::JsFuture::from(promise).await {
+                           let ports: js_sys::Array = val.unchecked_into();
+                           for i in 0..ports.length() {
+                                let p: web_sys::SerialPort = ports.get(i).unchecked_into();
+                                let info = p.get_info();
+                                let vid = js_sys::Reflect::get(&info, &"usbVendorId".into()).ok().and_then(|v| v.as_f64()).map(|v| v as u16);
+                                let pid = js_sys::Reflect::get(&info, &"usbProductId".into()).ok().and_then(|v| v.as_f64()).map(|v| v as u16);
+                                
+                                if vid == Some(target_vid) && pid == Some(target_pid) {
+                                    manager_conn.set_status.set("Device found. Auto-reconnecting...".into());
+                                    
+                                    // We reuse the `options` / `baud`
+                                     // Use default framing for auto-reconnect (or derived from valid config)
+                                     let user_pref_baud = baud_signal.get_untracked();
+                                     let last_known_baud = detected_baud.get_untracked();
+                                     
+                                     // SMART RECONNECT: 
+                                     // If user meant "Auto" (0), but we successfully connected before (last_known > 0),
+                                     // reuse that rate to avoid a full re-scan (which sends '\r' and takes time).
+                                     let target_baud = if user_pref_baud == 0 && last_known_baud > 0 {
+                                         last_known_baud
+                                     } else if user_pref_baud == 0 {
+                                         115200 // Fallback if no history (shouldn't happen on reconnect usually)
+                                     } else {
+                                         user_pref_baud
+                                     };
+
+                                     let current_framing = framing_signal.get_untracked();
+                                     let final_framing_str = if current_framing == "Auto" { "8N1".to_string() } else { current_framing };
+                                     
+                                     let (_d_r, _p_r, _s_r) = ConnectionManager::parse_framing(&final_framing_str);
+                                     
+                                     // Manager Connect (Handles open, loop, worker)
+                                     // Auto-reconnect not needed here, handled by manager internal state or explicit loop
+                                     web_sys::console::log_1(&format!("DEBUG: Auto-Connect. Pref: {}, Last: {}, Target: {}", user_pref_baud, last_known_baud, target_baud).into());
+
+                                     spawn_local(async move {
+                                        // FORCE RESET: Close any stale handles (even if we think we are disconnected, the browser might hold the lock)
+                                        manager_conn.disconnect().await;
+                                        
+                                        // Wait for OS/Browser to release resource fully (Crucial for auto-reconnect)
+                                        let _ = wasm_bindgen_futures::JsFuture::from(
+                                            js_sys::Promise::new(&mut |r, _| {
+                                                let _ = web_sys::window().unwrap().set_timeout_with_callback_and_timeout_and_arguments_0(&r, 500);
+                                            })
+                                        ).await;
+
+                                        // Manager updates status signals automatically
+                                        if let Err(_e) = manager_conn.connect(p, target_baud, &final_framing_str).await {
+                                            // Connect failed
+                                        } else {
+                                            // Manual status update for "Restored" vs just "Connected"
+                                            manager_conn.set_status.set("Restored Connection".into());
+                                        }
+                                     });
+                                    return; // Stop checking
+                                }
+                           }
+                      }
+                  });
+             }
+         }) as Box<dyn FnMut(_)>);
+
+         // On Disconnect
+         let on_disconnect_closure = Closure::wrap(Box::new(move |_e: web_sys::Event| {
+              if is_reconfiguring.get_untracked() { return; }
+              manager_disc.set_status.set("Device Disconnected (Waiting to Reconnect...)".into());
+              manager_disc.set_connected.set(false);
+         }) as Box<dyn FnMut(_)>);
+
+         // Attach listeners
+         let nav = web_sys::window().unwrap().navigator();
+         let serial = nav.serial();
+         
+         if !serial.is_undefined() {
+             serial.set_onconnect(Some(on_connect_closure.as_ref().unchecked_ref()));
+             serial.set_ondisconnect(Some(on_disconnect_closure.as_ref().unchecked_ref()));
+             
+             // Leak closures to keep them alive
+             on_connect_closure.forget();
+             on_disconnect_closure.forget();
+         }
     }
 }
 
