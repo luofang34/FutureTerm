@@ -352,7 +352,7 @@ pub fn App() -> impl IntoView {
                         FutureTerm requires the <strong>WebSerial API</strong> to communicate with hardware devices.<br/>
                         This feature is currently missing from your browser (e.g., Safari, Firefox).
                     </p>
-                    
+
                     <div style="display: flex; gap: 30px; flex-wrap: wrap; justify-content: center;">
                          <div style="padding: 20px 40px; background: #252525; border-radius: 12px; border: 1px solid #444; text-align: center;">
                             <div style="font-weight: bold; font-size: 1.1rem; margin-bottom: 10px; color: #4CAF50;">Supported Browsers</div>

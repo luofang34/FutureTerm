@@ -38,7 +38,6 @@ pub struct ConnectionManager {
     // Guard against double-connect race conditions
     is_connecting_internal: Rc<RefCell<bool>>,
 
-
     // Hooks for external UI updates (optional, or we just expose signals)
 
     // RX/TX Activity Signals
@@ -137,18 +136,19 @@ impl ConnectionManager {
             web_sys::console::warn_1(&"Connection attempt blocked: Already connecting.".into());
             return Err("Already connecting".to_string());
         }
-        
+
         // Stale UI Guard
         if self.active_port.borrow().is_some() {
-             web_sys::console::warn_1(&"Connection attempt blocked: Port already active.".into());
-             return Err("Already connected".to_string());
+            web_sys::console::warn_1(&"Connection attempt blocked: Port already active.".into());
+            return Err("Already connected".to_string());
         }
 
         *self.is_connecting_internal.borrow_mut() = true;
 
         let result = if baud > 0 && framing == "Auto" {
             let (detect_framing, initial_buf) = self.smart_probe_framing(port.clone(), baud).await;
-            self.connect_impl(port, baud, &detect_framing, Some(initial_buf)).await
+            self.connect_impl(port, baud, &detect_framing, Some(initial_buf))
+                .await
         } else {
             // Auto-Detect if Baud is 0
             let (final_baud, final_framing_str, initial_buffer) = if baud == 0 {
@@ -157,11 +157,11 @@ impl ConnectionManager {
             } else {
                 (baud, framing.to_string(), None)
             };
-    
+
             self.connect_impl(port, final_baud, &final_framing_str, initial_buffer)
                 .await
         };
-        
+
         *self.is_connecting_internal.borrow_mut() = false;
         result
     }
@@ -187,7 +187,9 @@ impl ConnectionManager {
         if let Ok(mut borrow) = self.transport.try_borrow_mut() {
             t_opt = borrow.take();
         } else {
-             web_sys::console::warn_1(&"Disconnect: Could not acquire transport lock even after wait.".into());
+            web_sys::console::warn_1(
+                &"Disconnect: Could not acquire transport lock even after wait.".into(),
+            );
         }
 
         if let Some(mut t) = t_opt {
@@ -215,7 +217,7 @@ impl ConnectionManager {
 
         if let Some(port) = port_opt {
             // 1. Signal Read Loop to Stop
-             *self.read_loop_should_stop.borrow_mut() = true;
+            *self.read_loop_should_stop.borrow_mut() = true;
 
             // 2. Wait for it to exit (e.g. 200ms)
             let _ = wasm_bindgen_futures::JsFuture::from(js_sys::Promise::new(&mut |r, _| {
@@ -227,10 +229,12 @@ impl ConnectionManager {
 
             // 3. Close existing
             let mut t_opt = None;
-             if let Ok(mut borrow) = self.transport.try_borrow_mut() {
+            if let Ok(mut borrow) = self.transport.try_borrow_mut() {
                 t_opt = borrow.take();
             } else {
-                 web_sys::console::warn_1(&"Reconfigure: Could not acquire transport lock even after wait.".into());
+                web_sys::console::warn_1(
+                    &"Reconfigure: Could not acquire transport lock even after wait.".into(),
+                );
             }
 
             if let Some(mut t) = t_opt {
@@ -255,11 +259,7 @@ impl ConnectionManager {
                 // This persists even if user temporarily switches to a wrong Manual baud rate.
                 // This also avoids the aggressive 'enter' probe on context switch.
                 if let Some(cached) = cached_auto {
-                    let effective_framing = if framing == "Auto" {
-                        "8N1"
-                    } else {
-                        framing
-                    };
+                    let effective_framing = if framing == "Auto" { "8N1" } else { framing };
                     (cached, effective_framing.to_string(), None)
                 } else {
                     let (b, f, buf) = self.detect_config(port.clone(), framing).await;
@@ -271,9 +271,9 @@ impl ConnectionManager {
                     (b, f, Some(buf))
                 }
             } else if framing == "Auto" {
-                 // Smart Probe on Reconfigure as well
-                 let (detect_f, buf) = self.smart_probe_framing(port.clone(), baud).await;
-                 (baud, detect_f, Some(buf))
+                // Smart Probe on Reconfigure as well
+                let (detect_f, buf) = self.smart_probe_framing(port.clone(), baud).await;
+                (baud, detect_f, Some(buf))
             } else {
                 (baud, framing.to_string(), None)
             };
@@ -561,11 +561,19 @@ impl ConnectionManager {
             let probe_start_ts = js_sys::Date::now();
 
             // 1. Probe 8N1
-                let buffer = self.gather_probe_data(port.clone(), rate, "8N1", true).await;
-                let open_dur = js_sys::Date::now() - probe_start_ts;
-                web_sys::console::log_1(
-                    &format!("PROFILE: Rate {} PROBED in {:.1}ms. Bytes: {}", rate, open_dur, buffer.len()).into(),
-                );
+            let buffer = self
+                .gather_probe_data(port.clone(), rate, "8N1", true)
+                .await;
+            let open_dur = js_sys::Date::now() - probe_start_ts;
+            web_sys::console::log_1(
+                &format!(
+                    "PROFILE: Rate {} PROBED in {:.1}ms. Bytes: {}",
+                    rate,
+                    open_dur,
+                    buffer.len()
+                )
+                .into(),
+            );
 
             if buffer.is_empty() {
                 continue;
@@ -618,20 +626,20 @@ impl ConnectionManager {
                 for fr in ["8E1", "8O1"] {
                     self.set_status
                         .set(format!("Deep Probe {} {}...", rate, fr));
-                    
+
                     let buf2 = self.gather_probe_data(port.clone(), rate, fr, true).await; // Use helper
-                    
+
                     /* Original Deep Probe Logic Removed - replaced by helper call */
                     let score = analysis::calculate_score_8n1(&buf2);
                     if score > best_score {
-                         best_score = score;
-                         best_rate = rate;
-                         best_framing = fr.to_string();
-                         best_buffer = buf2;
-                     }
-                     if score > 0.95 {
-                         break 'outer;
-                     }
+                        best_score = score;
+                        best_rate = rate;
+                        best_framing = fr.to_string();
+                        best_buffer = buf2;
+                    }
+                    if score > 0.95 {
+                        break 'outer;
+                    }
                 }
             }
         }
@@ -644,10 +652,16 @@ impl ConnectionManager {
     }
 
     // Helper: Gather Probe Data (Extracted)
-    async fn gather_probe_data(&self, port: web_sys::SerialPort, rate: u32, framing: &str, send_wakeup: bool) -> Vec<u8> {
-         let mut t = WebSerialTransport::new();
-         let (d,p,s) = Self::parse_framing(framing);
-         let cfg = SerialConfig {
+    async fn gather_probe_data(
+        &self,
+        port: web_sys::SerialPort,
+        rate: u32,
+        framing: &str,
+        send_wakeup: bool,
+    ) -> Vec<u8> {
+        let mut t = WebSerialTransport::new();
+        let (d, p, s) = Self::parse_framing(framing);
+        let cfg = SerialConfig {
             baud_rate: rate,
             data_bits: d,
             parity: p,
@@ -656,60 +670,107 @@ impl ConnectionManager {
         };
 
         let mut buffer = Vec::new();
-        if t.open(port, cfg).await.is_ok() {
+        // Retry Loop for "Port already open" race condition
+        let mut attempts = 0;
+        let success = loop {
+            match t.open(port.clone(), cfg.clone()).await {
+                Ok(_) => break true,
+                Err(e) => {
+                    let err_str = format!("{:?}", e);
+                    if (err_str.contains("already open") || err_str.contains("InvalidStateError"))
+                        && attempts < 3
+                    {
+                        attempts += 1;
+                        // Wait 100ms
+                        let _ = wasm_bindgen_futures::JsFuture::from(js_sys::Promise::new(
+                            &mut |r, _| {
+                                let _ = web_sys::window()
+                                    .unwrap()
+                                    .set_timeout_with_callback_and_timeout_and_arguments_0(&r, 100);
+                            },
+                        ))
+                        .await;
+                        continue;
+                    }
+                    break false;
+                }
+            }
+        };
+
+        if success {
             if send_wakeup {
                 let _ = t.write(b"\r").await;
             }
-            
+
             let start_loop = js_sys::Date::now();
             let mut max_time = 50.0;
 
             while js_sys::Date::now() - start_loop < max_time {
                 if let Ok((chunk, _)) = t.read_chunk().await {
-                     if !chunk.is_empty() {
+                    if !chunk.is_empty() {
                         buffer.extend_from_slice(&chunk);
                         if max_time < 250.0 {
-                            max_time = 250.0; 
+                            max_time = 250.0;
                         }
                         if buffer.len() > 64 {
-                             // Use analysis crate if available or simple check (Assuming analysis crate in scope)
-                             if analysis::calculate_score_8n1(&buffer) > 0.90 {
-                                 break;
-                             }
+                            // Use analysis crate if available or simple check (Assuming analysis crate in scope)
+                            if analysis::calculate_score_8n1(&buffer) > 0.90 {
+                                break;
+                            }
                         }
-                     }
+                    }
                 }
                 let _ = wasm_bindgen_futures::JsFuture::from(js_sys::Promise::new(&mut |r, _| {
-                    let _ = web_sys::window().unwrap().set_timeout_with_callback_and_timeout_and_arguments_0(&r, 10);
-                })).await;
+                    let _ = web_sys::window()
+                        .unwrap()
+                        .set_timeout_with_callback_and_timeout_and_arguments_0(&r, 10);
+                }))
+                .await;
             }
             let _ = t.close().await;
+
+            // Mandatory Cool-down: Give OS/Browser 50ms to release the lock completely
+            let _ = wasm_bindgen_futures::JsFuture::from(js_sys::Promise::new(&mut |r, _| {
+                let _ = web_sys::window()
+                    .unwrap()
+                    .set_timeout_with_callback_and_timeout_and_arguments_0(&r, 50);
+            }))
+            .await;
         }
         buffer
     }
 
     // New: Smart Probe for Single Baud
-    pub async fn smart_probe_framing(&self, port: web_sys::SerialPort, rate: u32) -> (String, Vec<u8>) {
+    pub async fn smart_probe_framing(
+        &self,
+        port: web_sys::SerialPort,
+        rate: u32,
+    ) -> (String, Vec<u8>) {
         self.set_status.set(format!("Smart Probing {}...", rate));
-        
-        // 1. Probe 8N1 (Most common) - PASSIVE (No Wakeup)
-        let buf_8n1 = self.gather_probe_data(port.clone(), rate, "8N1", false).await;
+
+        // 1. Probe 8N1 (Most common) - ACTIVE (Wakeup)
+        let buf_8n1 = self
+            .gather_probe_data(port.clone(), rate, "8N1", true)
+            .await;
         if !buf_8n1.is_empty() {
-             let score = analysis::calculate_score_8n1(&buf_8n1);
-             if score > 0.90 {
-                 return ("8N1".to_string(), buf_8n1);
-             }
+            let score = analysis::calculate_score_8n1(&buf_8n1);
+            if score > 0.90 {
+                return ("8N1".to_string(), buf_8n1);
+            }
         }
 
         // 2. Probe 7E1 (Common alternative) - PASSIVE
-        if !buf_8n1.is_empty() { // Only if we saw SOME data (garbage or not), try parity
-             let buf_7e1 = self.gather_probe_data(port.clone(), rate, "7E1", false).await;
-             let score = analysis::calculate_score_7e1(&buf_7e1); // Assuming 7E1 score calc
-             if score > 0.90 {
-                 return ("7E1".to_string(), buf_7e1);
-             }
+        if !buf_8n1.is_empty() {
+            // Only if we saw SOME data (garbage or not), try parity
+            let buf_7e1 = self
+                .gather_probe_data(port.clone(), rate, "7E1", true)
+                .await;
+            let score = analysis::calculate_score_7e1(&buf_7e1); // Assuming 7E1 score calc
+            if score > 0.90 {
+                return ("7E1".to_string(), buf_7e1);
+            }
         }
-        
+
         // Default to 8N1 if silent or unsure
         ("8N1".to_string(), buf_8n1)
     }
@@ -735,7 +796,7 @@ impl ConnectionManager {
         };
 
         let mut t = WebSerialTransport::new();
-        
+
         // Retry Loop for "Port already open" race condition (probe cleanup lag)
         let mut attempts = 0;
         let result = loop {
@@ -743,7 +804,7 @@ impl ConnectionManager {
                 Ok(_) => {
                     // Reset stop signal
                     *self.read_loop_should_stop.borrow_mut() = false;
-                    
+
                     // Store state
                     *self.transport.borrow_mut() = Some(t);
                     *self.active_port.borrow_mut() = Some(port);
@@ -763,14 +824,27 @@ impl ConnectionManager {
 
                     // Replay Initial Buffer (if any)
                     if let Some(buf) = initial_buffer {
-                         if !buf.is_empty() {
-                            if let Some(w) = self.worker.get_untracked() {
-                                let msg = UiToWorker::IngestData {
-                                    data: buf,
-                                    timestamp_us: (js_sys::Date::now() * 1000.0) as u64,
-                                };
-                                if let Ok(cmd_val) = serde_wasm_bindgen::to_value(&msg) {
-                                    let _ = w.post_message(&cmd_val);
+                        if !buf.is_empty() {
+                            // Strip leading CR/LF/Whitespace (cleanup wakeup echo)
+                            let start_idx = buf
+                                .iter()
+                                .position(|&x| x != b'\r' && x != b'\n')
+                                .unwrap_or(0);
+                            let clean_buf = if start_idx < buf.len() {
+                                buf[start_idx..].to_vec()
+                            } else {
+                                Vec::new()
+                            };
+
+                            if !clean_buf.is_empty() {
+                                if let Some(w) = self.worker.get_untracked() {
+                                    let msg = UiToWorker::IngestData {
+                                        data: clean_buf,
+                                        timestamp_us: (js_sys::Date::now() * 1000.0) as u64,
+                                    };
+                                    if let Ok(cmd_val) = serde_wasm_bindgen::to_value(&msg) {
+                                        let _ = w.post_message(&cmd_val);
+                                    }
                                 }
                             }
                         }
@@ -779,18 +853,31 @@ impl ConnectionManager {
                     break Ok(());
                 }
                 Err(e) => {
-                     let err_str = format!("{:?}", e);
-                     if (err_str.contains("already open") || err_str.contains("InvalidStateError")) && attempts < 3 {
+                    let err_str = format!("{:?}", e);
+                    if (err_str.contains("already open") || err_str.contains("InvalidStateError"))
+                        && attempts < 3
+                    {
                         attempts += 1;
-                        web_sys::console::warn_1(&format!("Connection blocked by busy port. Retrying ({}/3)...", attempts).into());
-                        
+                        web_sys::console::warn_1(
+                            &format!(
+                                "Connection blocked by busy port. Retrying ({}/3)...",
+                                attempts
+                            )
+                            .into(),
+                        );
+
                         // Wait 100ms
-                         let _ = wasm_bindgen_futures::JsFuture::from(js_sys::Promise::new(&mut |r, _| {
-                            let _ = web_sys::window().unwrap().set_timeout_with_callback_and_timeout_and_arguments_0(&r, 100);
-                        })).await;
+                        let _ = wasm_bindgen_futures::JsFuture::from(js_sys::Promise::new(
+                            &mut |r, _| {
+                                let _ = web_sys::window()
+                                    .unwrap()
+                                    .set_timeout_with_callback_and_timeout_and_arguments_0(&r, 100);
+                            },
+                        ))
+                        .await;
                         continue;
-                     }
-                    
+                    }
+
                     self.set_status.set(format!("Connection Failed: {:?}", e));
                     break Err(format!("{:?}", e));
                 }
