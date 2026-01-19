@@ -24,6 +24,7 @@ enum ViewMode {
 #[component]
 pub fn App() -> impl IntoView {
     let (_terminal_ready, set_terminal_ready) = create_signal(false);
+    let (is_webserial_supported, set_is_webserial_supported) = create_signal(true);
 
     // Worker Signal (Used by ConnectionManager)
     let (worker, set_worker) = create_signal::<Option<Worker>>(None);
@@ -55,6 +56,14 @@ pub fn App() -> impl IntoView {
 
     // Legacy signals removed/replaced by manager:
     // status, connected, transport, active_port, is_reconfiguring
+
+    create_effect(move |_| {
+        let nav = web_sys::window().unwrap().navigator();
+        let serial = nav.serial();
+        if serial.is_undefined() {
+            set_is_webserial_supported.set(false);
+        }
+    });
 
     create_effect(move |_| {
         if let Ok(w) = Worker::new("worker_bootstrap.js") {
@@ -336,6 +345,23 @@ pub fn App() -> impl IntoView {
 
     view! {
         <div style="display: flex; flex-direction: column; height: 100vh; background: rgb(25, 25, 25); color: #eee;">
+            <Show when=move || !is_webserial_supported.get() fallback=|| ()>
+                <div style="position: fixed; top: 0; left: 0; width: 100vw; height: 100vh; background: rgba(15, 15, 15, 0.98); z-index: 9999; display: flex; flex-direction: column; align-items: center; justify-content: center; text-align: center; color: white;">
+                    <h1 style="font-family: 'Magneto', 'Impact', sans-serif; font-size: 3rem; margin-bottom: 2rem; color: #ff5555; text-shadow: 0 0 10px rgba(255, 85, 85, 0.3);">Browser Not Supported</h1>
+                    <p style="font-size: 1.2rem; max-width: 800px; line-height: 1.6; color: #ccc; margin-bottom: 3rem;">
+                        FutureTerm requires the <strong>WebSerial API</strong> to communicate with hardware devices.<br/>
+                        This feature is currently missing from your browser (e.g., Safari, Firefox).
+                    </p>
+                    
+                    <div style="display: flex; gap: 30px; flex-wrap: wrap; justify-content: center;">
+                         <div style="padding: 20px 40px; background: #252525; border-radius: 12px; border: 1px solid #444; text-align: center;">
+                            <div style="font-weight: bold; font-size: 1.1rem; margin-bottom: 10px; color: #4CAF50;">Supported Browsers</div>
+                            <div style="font-size: 1.5rem;">Chrome, Edge, Opera</div>
+                        </div>
+                    </div>
+                </div>
+            </Show>
+
             <header style="padding: 10px; background: rgb(25, 25, 25); display: flex; align-items: center; gap: 10px; border-bottom: 1px solid rgb(45, 45, 45);">
                 <h1 style="margin: 0; font-family: 'Magneto', 'Impact', 'Arial Black', sans-serif; font-style: italic; font-size: 1.5rem; font-weight: normal; letter-spacing: 1px;">FutureTerm</h1>
                 <div style="flex: 1;"></div>
