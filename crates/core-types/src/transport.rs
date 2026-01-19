@@ -12,7 +12,6 @@ pub enum TransportError {
     Other(String),
 }
 
-
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -28,10 +27,10 @@ pub struct SignalState {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SerialConfig {
     pub baud_rate: u32,
-    pub data_bits: u8, // 7 or 8
+    pub data_bits: u8,        // 7 or 8
     pub flow_control: String, // "none" or "hardware"
-    pub parity: String, // "none", "even", "odd"
-    pub stop_bits: u8, // 1 or 2
+    pub parity: String,       // "none", "even", "odd"
+    pub stop_bits: u8,        // 1 or 2
 }
 
 impl Default for SerialConfig {
@@ -53,10 +52,10 @@ pub trait Transport: Send + Sync {
     /// Read a chunk of bytes.
     /// Returns (data, timestamp_in_microseconds).
     async fn read_chunk(&self) -> Result<(Vec<u8>, u64), TransportError>;
-    
+
     /// Write bytes to the transport.
     async fn write(&self, data: &[u8]) -> Result<(), TransportError>;
-    
+
     /// Control DTR and RTS signals.
     async fn set_signals(&self, dtr: bool, rts: bool) -> Result<(), TransportError>;
 

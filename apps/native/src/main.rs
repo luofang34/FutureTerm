@@ -1,4 +1,4 @@
-use core_types::{Frame, DecodedEvent, Decoder};
+use core_types::{DecodedEvent, Decoder, Frame};
 use dec_nmea::NmeaDecoder;
 use std::time::Instant;
 
@@ -13,9 +13,11 @@ fn main() {
 
     // 2. Prepare Data (A mix of valid and invalid frames)
     // GPGGA example
-    let gpgga = b"$GPGGA,092750.000,5321.6802,N,00630.3372,W,1,8,1.03,61.7,M,55.2,M,,*76\r\n".to_vec();
+    let gpgga =
+        b"$GPGGA,092750.000,5321.6802,N,00630.3372,W,1,8,1.03,61.7,M,55.2,M,,*76\r\n".to_vec();
     // GPRMC example
-    let gprmc = b"$GPRMC,092750.000,A,5321.6802,N,00630.3372,W,0.02,31.66,280511,,,A*43\r\n".to_vec();
+    let gprmc =
+        b"$GPRMC,092750.000,A,5321.6802,N,00630.3372,W,0.02,31.66,280511,,,A*43\r\n".to_vec();
     // Invalid example
     let invalid = b"$NOTNMEA,123,456*00\r\n".to_vec();
 
@@ -36,23 +38,26 @@ fn main() {
     // 4. Benchmark Loop
     let start = Instant::now();
     let mut count = 0;
-    
+
     for _ in 0..BENCH_ITERATIONS {
         for frame in &frames {
-            // "Zero-Allocation" pattern: 
+            // "Zero-Allocation" pattern:
             // Reuse `event` buffer, avoiding malloc/free for every packet.
             if decoder.ingest_into(frame, &mut event) {
                 count += 1;
             }
         }
     }
-    
+
     let duration = start.elapsed();
     let total_ops = BENCH_ITERATIONS * frames.len() as u64;
-    
+
     println!("Benchmark Complete.");
     println!("Total Operations: {}", total_ops);
     println!("Found Events: {}", count);
     println!("Duration: {:.2?}", duration);
-    println!("Throughput: {:.2} ops/sec", total_ops as f64 / duration.as_secs_f64());
+    println!(
+        "Throughput: {:.2} ops/sec",
+        total_ops as f64 / duration.as_secs_f64()
+    );
 }

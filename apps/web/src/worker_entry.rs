@@ -1,5 +1,4 @@
 use app_web::worker_logic::start_worker;
-use console_error_panic_hook;
 
 pub fn main() {
     console_error_panic_hook::set_once();

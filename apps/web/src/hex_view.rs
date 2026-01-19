@@ -1,25 +1,22 @@
-use leptos::*;
 use core_types::{DecodedEvent, Value};
-
+use leptos::*;
 
 #[component]
-pub fn HexView(
-    events: ReadSignal<Vec<DecodedEvent>>
-) -> impl IntoView {
+pub fn HexView(events: ReadSignal<Vec<DecodedEvent>>) -> impl IntoView {
     let container_ref = create_node_ref::<html::Div>();
-    
+
     // Auto-scroll logic
     create_effect(move |_| {
         events.with(|_| {}); // Track changes
         if let Some(div) = container_ref.get() {
-            // Simple auto-scroll: If we were at bottom, stay at bottom? 
+            // Simple auto-scroll: If we were at bottom, stay at bottom?
             // For now, just forced scroll to bottom like terminal for "live" feel
             div.set_scroll_top(div.scroll_height());
         }
     });
 
     view! {
-        <div 
+        <div
             _ref=container_ref
             class="hex-view"
             style="
@@ -39,7 +36,7 @@ pub fn HexView(
                 <div>HEX REPRESENTATION</div>
                 <div>ASCII</div>
             </div>
-            
+
             <For
                 each=move || events.get()
                 key=|evt| evt.timestamp_us // Use unique timestamp
@@ -49,14 +46,14 @@ pub fn HexView(
                         Value::String(s) => Some(s.clone()),
                         _ => None
                     }).unwrap_or_else(|| evt.summary.to_string()); // Fallback
-                    
+
                     let ascii_val = evt.get_field("ascii").and_then(|v| match v {
                         Value::String(s) => Some(s.clone()),
                         _ => None
                     }).unwrap_or_else(|| ".".to_string());
 
                     // Calculate a virtual offset based on timestamp (pseudo) or just sequence
-                    // Real offset would require accumulating bytes. 
+                    // Real offset would require accumulating bytes.
                     // For now, use timestamp last 4 digits as "virtual ID"
                     let offset = (evt.timestamp_us % 10000).to_string();
 

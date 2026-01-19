@@ -1,6 +1,7 @@
 use crate::Framer;
 use core_types::Frame;
 
+#[derive(Default)]
 pub struct RawFramer;
 
 impl RawFramer {
@@ -38,5 +39,23 @@ mod tests {
         assert_eq!(frames.len(), 1);
         assert_eq!(frames[0].bytes, vec![0x01, 0x02]);
         assert_eq!(frames[0].timestamp_us, 100);
+    }
+
+    #[test]
+    fn test_raw_framer_empty_input() {
+        let mut framer = RawFramer::new();
+        let frames = framer.push(&[], 100);
+        assert_eq!(frames.len(), 0);
+    }
+
+    #[test]
+    fn test_raw_framer_multiple_chunks() {
+        let mut framer = RawFramer::new();
+        let f1 = framer.push(&[0x01, 0x02], 100);
+        let f2 = framer.push(&[0x03, 0x04], 200);
+        assert_eq!(f1.len(), 1);
+        assert_eq!(f2.len(), 1);
+        assert_eq!(f1[0].timestamp_us, 100);
+        assert_eq!(f2[0].timestamp_us, 200);
     }
 }

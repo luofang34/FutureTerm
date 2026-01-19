@@ -1,5 +1,5 @@
+use core_types::{DecodedEvent, Frame};
 use serde::{Deserialize, Serialize};
-use core_types::{Frame, DecodedEvent};
 
 #[derive(Debug, Serialize, Deserialize)]
 pub enum UiToWorker {
@@ -24,5 +24,35 @@ pub enum WorkerToUi {
         frames: Vec<Frame>,
         events: Vec<DecodedEvent>,
     },
-    AnalyzeResult { baud_rate: u32, score: f32 },
+    AnalyzeResult {
+        baud_rate: u32,
+        score: f32,
+    },
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_ui_to_worker_serialization() {
+        let msg = UiToWorker::Connect { baud_rate: 115200 };
+        let json = serde_json::to_string(&msg).unwrap();
+        let decoded: UiToWorker = serde_json::from_str(&json).unwrap();
+        match decoded {
+            UiToWorker::Connect { baud_rate } => assert_eq!(baud_rate, 115200),
+            _ => panic!("Wrong variant"),
+        }
+    }
+
+    #[test]
+    fn test_worker_to_ui_serialization() {
+        let msg = WorkerToUi::Status("Connected".to_string());
+        let json = serde_json::to_string(&msg).unwrap();
+        let decoded: WorkerToUi = serde_json::from_str(&json).unwrap();
+        match decoded {
+            WorkerToUi::Status(s) => assert_eq!(s, "Connected"),
+            _ => panic!("Wrong variant"),
+        }
+    }
 }

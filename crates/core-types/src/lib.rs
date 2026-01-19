@@ -1,8 +1,7 @@
 use serde::{Deserialize, Serialize};
 
-
 pub mod transport;
-pub use transport::{Transport, TransportError, SignalState, SerialConfig};
+pub use transport::{SerialConfig, SignalState, Transport, TransportError};
 
 /// Represents the direction of data flow.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -53,14 +52,46 @@ pub enum Value {
     String(String),
 }
 
-impl From<bool> for Value { fn from(v: bool) -> Self { Value::Bool(v) } }
-impl From<i64> for Value { fn from(v: i64) -> Self { Value::I64(v) } }
-impl From<i32> for Value { fn from(v: i32) -> Self { Value::I64(v as i64) } }
-impl From<f64> for Value { fn from(v: f64) -> Self { Value::F64(v) } }
-impl From<f32> for Value { fn from(v: f32) -> Self { Value::F64(v as f64) } }
-impl From<String> for Value { fn from(v: String) -> Self { Value::String(v) } }
-impl From<&str> for Value { fn from(v: &str) -> Self { Value::String(v.to_string()) } }
-impl From<usize> for Value { fn from(v: usize) -> Self { Value::I64(v as i64) } }
+impl From<bool> for Value {
+    fn from(v: bool) -> Self {
+        Value::Bool(v)
+    }
+}
+impl From<i64> for Value {
+    fn from(v: i64) -> Self {
+        Value::I64(v)
+    }
+}
+impl From<i32> for Value {
+    fn from(v: i32) -> Self {
+        Value::I64(v as i64)
+    }
+}
+impl From<f64> for Value {
+    fn from(v: f64) -> Self {
+        Value::F64(v)
+    }
+}
+impl From<f32> for Value {
+    fn from(v: f32) -> Self {
+        Value::F64(v as f64)
+    }
+}
+impl From<String> for Value {
+    fn from(v: String) -> Self {
+        Value::String(v)
+    }
+}
+impl From<&str> for Value {
+    fn from(v: &str) -> Self {
+        Value::String(v.to_string())
+    }
+}
+impl From<usize> for Value {
+    fn from(v: usize) -> Self {
+        Value::I64(v as i64)
+    }
+}
 
 /// A semantic interpretation of a Frame.
 /// Optimized for low allocation frequency.
@@ -80,7 +111,11 @@ pub struct DecodedEvent {
 }
 
 impl DecodedEvent {
-    pub fn new(timestamp_us: u64, protocol: &'static str, summary: impl Into<Cow<'static, str>>) -> Self {
+    pub fn new(
+        timestamp_us: u64,
+        protocol: &'static str,
+        summary: impl Into<Cow<'static, str>>,
+    ) -> Self {
         Self {
             timestamp_us,
             protocol: Cow::Borrowed(protocol),
@@ -94,7 +129,7 @@ impl DecodedEvent {
         self.fields.push((Cow::Borrowed(key), value.into()));
         self
     }
-    
+
     // Helper to get a field for tests
     pub fn get_field(&self, key: &str) -> Option<&Value> {
         self.fields.iter().find(|(k, _)| k == key).map(|(_, v)| v)
@@ -114,14 +149,14 @@ impl DecodedEvent {
 pub trait Decoder: Send {
     /// Attempt to parse a frame.
     /// Returns None if the frame does not match the protocol validation.
-    /// 
+    ///
     /// # Arguments
     /// * `frame` - The input frame (contains bytes, timestamp, channel).
     fn ingest(&mut self, frame: &Frame) -> Option<DecodedEvent>;
 
     /// Attempt to parse a frame into an existing DecodedEvent buffer.
     /// Returns true if successful, false otherwise.
-    /// 
+    ///
     /// Detailed Instructions:
     /// Implementations should call `output.clear()` before populating.
     fn ingest_into(&mut self, frame: &Frame, output: &mut DecodedEvent) -> bool {
@@ -157,9 +192,20 @@ mod tests {
         let event = DecodedEvent::new(123456, "TEST", "Test Event")
             .with_field("temperature", 25.5)
             .with_field("valid", true);
-        
+
         assert_eq!(event.protocol, "TEST");
-        assert_eq!(event.fields.iter().find(|(k, _)| k == "temperature").unwrap().1, Value::F64(25.5));
-        assert_eq!(event.fields.iter().find(|(k, _)| k == "valid").unwrap().1, Value::Bool(true));
+        assert_eq!(
+            event
+                .fields
+                .iter()
+                .find(|(k, _)| k == "temperature")
+                .unwrap()
+                .1,
+            Value::F64(25.5)
+        );
+        assert_eq!(
+            event.fields.iter().find(|(k, _)| k == "valid").unwrap().1,
+            Value::Bool(true)
+        );
     }
 }

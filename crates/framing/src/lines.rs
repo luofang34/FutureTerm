@@ -22,10 +22,16 @@ impl LineFramer {
     }
 }
 
+impl Default for LineFramer {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl Framer for LineFramer {
     fn push(&mut self, bytes: &[u8], timestamp_us: u64) -> Vec<Frame> {
         let mut frames = Vec::new();
-        
+
         // If buffer was empty, this chunk marks the start of potential new frames.
         if self.buffer.is_empty() {
             self.start_timestamp_us = Some(timestamp_us);
@@ -36,7 +42,7 @@ impl Framer for LineFramer {
             if b == b'\n' {
                 // Determine timestamp: use the start time of this line
                 let ts = self.start_timestamp_us.unwrap_or(timestamp_us);
-                
+
                 // Clone buffer as frame (including the newline)
                 // We leave the newline in the frame because decoders (like NMEA) might need it for validation,
                 // or the UI might want to render it.
@@ -44,24 +50,24 @@ impl Framer for LineFramer {
                 // Let's stick to "Framer preserves bytes, Decoder interprets".
                 let frame_bytes = self.buffer.clone();
                 frames.push(Frame::new_rx(frame_bytes, ts));
-                
+
                 // Reset buffer
                 self.buffer.clear();
                 // The next byte (if any) will start a new line, so we'll need a new timestamp.
-                // Since strictly speaking we don't know the exact arrival time of the *next* byte 
+                // Since strictly speaking we don't know the exact arrival time of the *next* byte
                 // within this batch, we can assume it's part of the current batch or just use current ts.
                 // Better approach: set start_timestamp_us to None, and if we loop again, logic below handles it.
                 self.start_timestamp_us = None;
             }
         }
-        
-        // If we still have data in buffer (incomplete line), 
+
+        // If we still have data in buffer (incomplete line),
         // ensure start_timestamp_us is set for the *next* push call reference.
         if !self.buffer.is_empty() && self.start_timestamp_us.is_none() {
-             // This edge case happens if the *current batch* started a new line.
-             // Ideally we should have captured strict per-byte timing but we only have per-chunk.
-             // We use the current chunk's timestamp as best effort.
-             self.start_timestamp_us = Some(timestamp_us);
+            // This edge case happens if the *current batch* started a new line.
+            // Ideally we should have captured strict per-byte timing but we only have per-chunk.
+            // We use the current chunk's timestamp as best effort.
+            self.start_timestamp_us = Some(timestamp_us);
         }
 
         frames
@@ -103,17 +109,59 @@ mod tests {
         // Chunk 2: "lo\n" at T=200
         let f2 = framer.push(b"lo\n", 200);
         assert_eq!(f2.len(), 1);
-        
+
         assert_eq!(f2[0].bytes, b"Hello\n");
         // Should preserve the timestamp of the START of the frame (T=100)
         assert_eq!(f2[0].timestamp_us, 100);
     }
-    
+
     #[test]
     fn test_crlf_handling() {
         // We do typically just break on \n. Implementation preserves \r.
         let mut framer = LineFramer::new();
         let f = framer.push(b"Test\r\n", 100);
         assert_eq!(f[0].bytes, b"Test\r\n");
+    }
+
+    #[test]
+    fn test_lines_empty_input() {
+        let mut framer = LineFramer::new();
+        let frames = framer.push(b"", 100);
+        assert_eq!(frames.len(), 0);
+    }
+
+    #[test]
+    fn test_lines_empty_line() {
+        let mut framer = LineFramer::new();
+        let frames = framer.push(b"\n\n", 100);
+        assert_eq!(frames.len(), 2);
+        assert_eq!(frames[0].bytes, b"\n");
+        assert_eq!(frames[1].bytes, b"\n");
+    }
+
+    #[test]
+    fn test_lines_reset() {
+        let mut framer = LineFramer::new();
+        // Push partial line
+        framer.push(b"Hello", 100);
+        // Reset
+        framer.reset();
+        // Push new complete line
+        let frames = framer.push(b"World\n", 200);
+        assert_eq!(frames.len(), 1);
+        assert_eq!(frames[0].bytes, b"World\n");
+        assert_eq!(frames[0].timestamp_us, 200);
+    }
+
+    #[test]
+    fn test_lines_no_trailing_newline() {
+        let mut framer = LineFramer::new();
+        let f1 = framer.push(b"NoNewline", 100);
+        assert_eq!(f1.len(), 0); // No complete frame yet
+
+        // Complete with newline later
+        let f2 = framer.push(b"\n", 200);
+        assert_eq!(f2.len(), 1);
+        assert_eq!(f2[0].bytes, b"NoNewline\n");
     }
 }
