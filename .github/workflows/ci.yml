@@ -10,13 +10,13 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
 
       - name: Run tests
-        run: cargo test --workspace
+        run: cargo test --workspace --exclude transport-webserial --exclude app-web
 
       - name: Check formatting
         run: cargo fmt --all -- --check
 
       - name: Clippy
-        run: cargo clippy --workspace -- -D warnings
+        run: cargo clippy --workspace --exclude transport-webserial --exclude app-web -- -D warnings
 
   wasm-build:
     runs-on: ubuntu-latest
