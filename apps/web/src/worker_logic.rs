@@ -7,8 +7,8 @@ use leptos::logging::log;
 use serde_wasm_bindgen::{from_value, to_value};
 use std::cell::RefCell;
 use std::rc::Rc;
+
 use wasm_bindgen::prelude::*;
-use wasm_bindgen_futures::JsFuture;
 use web_sys::{DedicatedWorkerGlobalScope, MessageEvent};
 
 // Types
@@ -31,6 +31,8 @@ pub fn create_decoder(id: &str) -> Option<Box<dyn Decoder>> {
     match id {
         "hex" => Some(Box::new(decoders::hex::HexDecoder::new())),
         "nmea" => Some(Box::new(decoders::nmea::NmeaDecoder::new())),
+        #[cfg(feature = "mavlink")]
+        "mavlink" => Some(Box::new(decoders::mavlink::MavlinkDecoder::new())),
         "utf8" => Some(Box::new(Utf8Decoder::new())),
         _ => None,
     }
@@ -48,141 +50,147 @@ fn post_to_ui(msg: &WorkerToUi) {
 }
 
 // Handler for incoming messages from UI
-async fn handle_message(event: MessageEvent, framer: SharedFramer, decoder: SharedDecoder) {
+
+// We need to change the signature of handle_message to accept the heartbeat flag
+async fn handle_message(
+    event: MessageEvent,
+    framer: SharedFramer,
+    decoder: SharedDecoder,
+    hb_active: Rc<RefCell<bool>>,
+) {
     let data = event.data();
+    if let Ok(cmd) = from_value::<UiToWorker>(data) {
+        match cmd {
+            UiToWorker::Connect { baud_rate } => {
+                log!("Worker: Connect command received (Baud: {})", baud_rate);
+            }
+            UiToWorker::StartHeartbeat => {
+                let mut active = hb_active.borrow_mut();
+                if !*active {
+                    // Only start if not already active
+                    *active = true;
+                    log!("Worker: Starting Heartbeat Loop (1Hz)");
 
-    // Direct deserialization (Legacy envelope logic removed)
-    match from_value::<UiToWorker>(data) {
-        Ok(cmd) => {
-            match cmd {
-                UiToWorker::IngestData { data, timestamp_us } => {
-                    // 1. Frame
-                    // 1. Frame
-                    let frames_out = framer.borrow_mut().push(&data, timestamp_us);
-
-                    // 2. Decode & Batch
-                    let mut events_out = Vec::new();
-                    if !frames_out.is_empty() {
-                        let mut d = decoder.borrow_mut();
-                        for frame in &frames_out {
-                            if let Some(event) = d.ingest(frame) {
-                                events_out.push(event);
-                            }
-                        }
-                    }
-
-                    // 3. Send back
-                    if !frames_out.is_empty() || !events_out.is_empty() {
-                        post_to_ui(&WorkerToUi::DataBatch {
-                            frames: frames_out,
-                            events: events_out,
-                        });
-                    }
-                }
-                UiToWorker::Connect { baud_rate } => {
-                    log!(
-                        "Worker: Connect msg received (Config only). Baud: {}",
-                        baud_rate
-                    );
-                    // Just acknowledge. Connection happens on Main Thread now.
-                    post_to_ui(&WorkerToUi::Status(format!(
-                        "Worker Ready (Baud {} - Processor Mode)",
-                        baud_rate
-                    )));
-                }
-                UiToWorker::Disconnect => {
-                    log!("Worker: Disconnect msg received. Resetting state.");
-                    // Reset state
-                    framer.borrow_mut().reset();
-                    // decoder.borrow_mut().reset(); // Decoder trait doesn't have reset?
-                    post_to_ui(&WorkerToUi::Status("Worker State Reset".into()));
-                }
-                UiToWorker::Send { data: _ } => {
-                    post_to_ui(&WorkerToUi::Status(
-                        "Worker cannot Send (IO on Main Thread)".into(),
-                    ));
-                }
-                UiToWorker::SetDecoder { id } => {
-                    if let Some(new_decoder) = create_decoder(&id) {
-                        *decoder.borrow_mut() = new_decoder;
-                        post_to_ui(&WorkerToUi::Status(format!("Decoder set to {}", id)));
-                    } else {
-                        log!("Unknown decoder: {}", id);
-                    }
-                }
-                UiToWorker::SetFramer { id } => {
-                    if let Some(new_framer) = create_framer(&id) {
-                        *framer.borrow_mut() = new_framer;
-                        post_to_ui(&WorkerToUi::Status(format!("Framer set to {}", id)));
-                    } else {
-                        log!("Unknown framer: {}", id);
-                    }
-                }
-                UiToWorker::Simulate { duration_ms } => {
-                    post_to_ui(&WorkerToUi::Status(format!(
-                        "Starting Simulation ({}ms)...",
-                        duration_ms
-                    )));
-                    let f_metrics = framer.clone();
-                    let d_metrics = decoder.clone();
-
-                    #[allow(clippy::await_holding_refcell_ref)]
+                    let hb_flag = hb_active.clone();
                     wasm_bindgen_futures::spawn_local(async move {
-                        let start = js_sys::Date::now();
-                        let base_sentence =
-                            "$GPGGA,123519,4807.038,N,01131.000,E,1,08,0.9,545.4,M,46.9,M,,*47\r\n";
-                        while js_sys::Date::now() - start < duration_ms as f64 {
-                            // Inject
-                            let bytes = base_sentence.as_bytes();
-                            let mut f = f_metrics.borrow_mut();
-                            let ts = (js_sys::Date::now() * 1000.0) as u64;
-                            let frames = f.push(bytes, ts);
-                            drop(f);
+                        let mut seq = 0u8;
+                        while *hb_flag.borrow() {
+                            #[cfg(feature = "mavlink")]
+                            {
+                                use mavlink::common::MavMessage;
+                                use mavlink::MavHeader;
 
-                            let mut events = Vec::new();
-                            let mut d = d_metrics.borrow_mut();
-                            for frame in &frames {
-                                if let Some(event) = d.ingest(frame) {
-                                    events.push(event);
+                                let header = MavHeader {
+                                    system_id: 255,
+                                    component_id: 190,
+                                    sequence: seq,
+                                };
+
+                                let data = mavlink::common::HEARTBEAT_DATA {
+                                    custom_mode: 0,
+                                    mavtype: mavlink::common::MavType::MAV_TYPE_GCS,
+                                    autopilot: mavlink::common::MavAutopilot::MAV_AUTOPILOT_INVALID,
+                                    base_mode: mavlink::common::MavModeFlag::empty(),
+                                    system_status: mavlink::common::MavState::MAV_STATE_ACTIVE,
+                                    mavlink_version: 3,
+                                };
+
+                                let msg = MavMessage::HEARTBEAT(data);
+                                let mut buf = Vec::new();
+                                // Send v1 for max compatibility
+                                if mavlink::write_v1_msg(&mut buf, header, &msg).is_ok() {
+                                    post_to_ui(&WorkerToUi::TxData { data: buf });
                                 }
                             }
-                            drop(d);
-
-                            if !frames.is_empty() {
-                                post_to_ui(&WorkerToUi::DataBatch { frames, events });
+                            #[cfg(not(feature = "mavlink"))]
+                            {
+                                // No-op if disabled
                             }
 
-                            // Sleep 500ms
-                            let _ = JsFuture::from(js_sys::Promise::new(&mut |resolve, _| {
-                                let _ = worker_scope()
-                                    .set_timeout_with_callback_and_timeout_and_arguments_0(
-                                        &resolve, 500,
-                                    );
-                            }))
+                            // Sleep 1s
+                            let _ = wasm_bindgen_futures::JsFuture::from(js_sys::Promise::new(
+                                &mut |r, _| {
+                                    let _ = worker_scope()
+                                        .set_timeout_with_callback_and_timeout_and_arguments_0(
+                                            &r, 1000,
+                                        );
+                                },
+                            ))
                             .await;
+
+                            seq = seq.wrapping_add(1);
                         }
-                        post_to_ui(&WorkerToUi::Status("Simulation Complete".into()));
+                        log!("Worker: Heartbeat Loop Exited");
+                    });
+                } else {
+                    log!("Worker: Heartbeat already active");
+                }
+            }
+            UiToWorker::StopHeartbeat => {
+                *hb_active.borrow_mut() = false;
+                // log!("Worker: Stopping Heartbeat");
+            }
+            UiToWorker::IngestData { data, timestamp_us } => {
+                // 1. Frame
+                // log!("Worker: Ingesting {} bytes", data.len());
+                let frames_out = framer.borrow_mut().push(&data, timestamp_us);
+
+                // 2. Decode & Batch
+                let mut events_out = Vec::new();
+                if !frames_out.is_empty() {
+                    let mut d = decoder.borrow_mut();
+                    for frame in &frames_out {
+                        // log!("Worker: Ingesting frame len={}", frame.bytes.len());
+                        d.ingest(frame, &mut events_out);
+                    }
+                } else {
+                    // log!("Worker: IngestData received {} bytes but produced 0 frames", data.len());
+                }
+
+                // 3. Send back
+                if !frames_out.is_empty() || !events_out.is_empty() {
+                    // if !events_out.is_empty() { log!("Worker: Sending {} events", events_out.len()); }
+                    post_to_ui(&WorkerToUi::DataBatch {
+                        frames: frames_out,
+                        events: events_out,
                     });
                 }
-                UiToWorker::AnalyzeRequest { baud_rate, data } => {
-                    // Heuristic Logic (Using Shared Analysis Crate):
-                    // 1. Valid UTF-8 / ASCII ratio
-
-                    if data.is_empty() {
-                        post_to_ui(&WorkerToUi::AnalyzeResult {
-                            baud_rate,
-                            score: 0.0,
-                        });
-                        return;
-                    }
-
-                    let score = analysis::calculate_score_8n1(&data);
-                    post_to_ui(&WorkerToUi::AnalyzeResult { baud_rate, score });
+            }
+            UiToWorker::SetDecoder { id } => {
+                if let Some(new_decoder) = create_decoder(&id) {
+                    *decoder.borrow_mut() = new_decoder;
+                    post_to_ui(&WorkerToUi::Status(format!("Decoder set to {}", id)));
+                } else {
+                    log!("Unknown decoder: {}", id);
                 }
-                _ => {}
+            }
+            UiToWorker::SetFramer { id } => {
+                if let Some(new_framer) = create_framer(&id) {
+                    *framer.borrow_mut() = new_framer;
+                    post_to_ui(&WorkerToUi::Status(format!("Framer set to {}", id)));
+                } else {
+                    log!("Unknown framer: {}", id);
+                }
+            }
+            UiToWorker::AnalyzeRequest { baud_rate, data } => {
+                if data.is_empty() {
+                    post_to_ui(&WorkerToUi::AnalyzeResult {
+                        baud_rate,
+                        score: 0.0,
+                    });
+                    return;
+                }
+                let score = analysis::calculate_score_8n1(&data);
+                post_to_ui(&WorkerToUi::AnalyzeResult { baud_rate, score });
+            }
+            UiToWorker::SetSignals { dtr, rts } => {
+                log!("Worker: SetSignals DTR={} RTS={}", dtr, rts);
+            }
+            // Catch-all for other variants to match exhaustively
+            _ => {
+                // Ignore others or log
             }
         }
-        Err(e) => post_to_ui(&WorkerToUi::Status(format!("Worker Parse Error: {:?}", e))),
     }
 }
 
@@ -193,6 +201,9 @@ pub async fn start_worker() {
     // Default to Utf8 for ANSI colors
     let decoder: SharedDecoder = Rc::new(RefCell::new(Box::new(Utf8Decoder::new())));
 
+    // Heartbeat Active Flag (Shared across closure invocations)
+    let hb_active = Rc::new(RefCell::new(false));
+
     // Setup message handler
     let f_clone = framer.clone();
     let d_clone = decoder.clone();
@@ -200,9 +211,10 @@ pub async fn start_worker() {
     let closure = Closure::wrap(Box::new(move |event: MessageEvent| {
         let f = f_clone.clone();
         let d = d_clone.clone();
+        let hb = hb_active.clone();
 
         wasm_bindgen_futures::spawn_local(async move {
-            handle_message(event, f, d).await;
+            handle_message(event, f, d, hb).await;
         });
     }) as Box<dyn FnMut(_)>);
 
@@ -231,6 +243,8 @@ mod tests {
     fn test_create_decoder_valid() {
         assert!(create_decoder("hex").is_some());
         assert!(create_decoder("nmea").is_some());
+        #[cfg(feature = "mavlink")]
+        assert!(create_decoder("mavlink").is_some());
         assert!(create_decoder("utf8").is_some());
     }
 

@@ -5,5 +5,7 @@ edition = "2021"
 
 [dependencies]
 core-types = { path = "../../core-types" }
-decoders = { path = ".." }
-mavlink = "0.12"
+mavlink = { version = "0.12", default-features = false, features = ["common", "serde", "std"] }
+embedded-hal = "0.2"
+nb = "1.0"
+web-sys = { version = "0.3", features = ["console"] }

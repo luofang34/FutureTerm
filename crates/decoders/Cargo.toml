@@ -7,3 +7,6 @@ edition = "2021"
 core-types = { path = "../core-types" }
 
 dec-nmea = { path = "dec-nmea" }
+dec-mavlink = { path = "dec-mavlink", optional = true }
+[features]
+mavlink = ["dep:dec-mavlink"]

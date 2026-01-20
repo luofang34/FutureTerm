@@ -26,6 +26,12 @@ transport-webserial = { path = "../../crates/transport-webserial" }
 framing = { path = "../../crates/framing" }
 decoders = { path = "../../crates/decoders" }
 analysis = { path = "../../crates/analysis" }
+mavlink = { version = "0.12", default-features = false, features = ["common", "serde", "std"] }
+embedded-hal = "0.2"
+nb = "1.0"
 js-sys = "0.3"
 
 
+[features]
+default = ["mavlink"]
+mavlink = ["decoders/mavlink"]

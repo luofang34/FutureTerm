@@ -17,7 +17,7 @@ impl Default for HexDecoder {
 }
 
 impl Decoder for HexDecoder {
-    fn ingest(&mut self, frame: &Frame) -> Option<DecodedEvent> {
+    fn ingest(&mut self, frame: &Frame, results: &mut Vec<DecodedEvent>) {
         // HexDecoder accepts everything.
         // It produces an event with "Hex" protocol.
 
@@ -51,12 +51,12 @@ impl Decoder for HexDecoder {
             hex_str.clone()
         };
 
-        Some(
+        results.push(
             DecodedEvent::new(frame.timestamp_us, "Hex", summary)
                 .with_field("hex", hex_str)
                 .with_field("ascii", ascii_str)
                 .with_field("len", frame.bytes.len()),
-        )
+        );
     }
 
     fn id(&self) -> &'static str {
@@ -78,7 +78,9 @@ mod tests {
         let mut decoder = HexDecoder::new();
         let frame = Frame::new_rx(vec![0x41, 0x42, 0x00, 0xFF], 1000);
 
-        let event = decoder.ingest(&frame).expect("Hex decoder always succeeds");
+        let mut results = Vec::new();
+        decoder.ingest(&frame, &mut results);
+        let event = results.get(0).expect("Hex decoder always succeeds");
 
         assert_eq!(event.protocol, "Hex");
 
@@ -103,7 +105,9 @@ mod tests {
         let mut decoder = HexDecoder::new();
         let frame = Frame::new_rx(vec![], 1000);
 
-        let event = decoder.ingest(&frame).expect("Hex decoder always succeeds");
+        let mut results = Vec::new();
+        decoder.ingest(&frame, &mut results);
+        let event = results.get(0).expect("Hex decoder always succeeds");
 
         match event.get_field("len") {
             Some(Value::I64(v)) => assert_eq!(*v, 0),
@@ -117,7 +121,9 @@ mod tests {
         // Create a long frame (> 50 chars in hex representation)
         let frame = Frame::new_rx(vec![0xAA; 50], 1000);
 
-        let event = decoder.ingest(&frame).expect("Hex decoder always succeeds");
+        let mut results = Vec::new();
+        decoder.ingest(&frame, &mut results);
+        let event = results.get(0).expect("Hex decoder always succeeds");
 
         // Summary should be truncated
         assert!(event.summary.ends_with("..."));
@@ -129,7 +135,9 @@ mod tests {
         let mut decoder = HexDecoder::new();
         let frame = Frame::new_rx(b"Hello".to_vec(), 1000);
 
-        let event = decoder.ingest(&frame).expect("Hex decoder always succeeds");
+        let mut results = Vec::new();
+        decoder.ingest(&frame, &mut results);
+        let event = results.get(0).expect("Hex decoder always succeeds");
 
         match event.get_field("ascii") {
             Some(Value::String(s)) => assert_eq!(s, "Hello"),

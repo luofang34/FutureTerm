@@ -11,9 +11,22 @@ mod connection;
 use connection::ConnectionManager;
 
 mod hex_view;
+// mod mavlink_view; // Removed duplicate
 pub mod protocol;
 pub mod worker_logic;
 mod xterm;
+
+pub mod mavlink_view;
+// use hex_view::HexView; // Conditionally used? No, actually used in view! down below?
+// Wait, warning said it was unused.
+// Let's check where it's used.
+// view! { ... <HexView ...> }
+// If it is used in view!, it shouldn't be unused.
+// Maybe because it's inside a `move ||` block or feature gated?
+// Actually, `MavlinkView` and `HexView` were flagged unused.
+// This implies the macro expansion might hide usage or they are genuinely not used because I replaced them?
+// I see `<MavlinkView .../>` in the code I edited earlier.
+// Let's suppress warning for now to be safe or just ignore it if build passes.
 
 #[derive(Clone, Copy, PartialEq)]
 enum ViewMode {
@@ -65,7 +78,10 @@ pub fn App() -> impl IntoView {
         }
     });
 
+    // Worker Logic
+    let manager_worker_init = manager.clone();
     create_effect(move |_| {
+        let manager = manager_worker_init.clone();
         if let Ok(w) = Worker::new("worker_bootstrap.js") {
             // Restore TextDecoder for RX to Main Thread (if we ever want to decode locally? No, worker does that)
             // But wait, worker sends BACK a 'DataBatch' with frames.
@@ -93,28 +109,30 @@ pub fn App() -> impl IntoView {
                         }
                         WorkerToUi::DataBatch { frames, events } => {
                             if let Some(term) = term_handle.get_untracked() {
-                                for f in frames {
-                                    if !f.bytes.is_empty() {
-                                        if let Ok(text) = decoder
-                                            .decode_with_u8_array_and_options(&f.bytes, &opts)
-                                        {
-                                            let text: String = text;
-                                            if !text.is_empty() {
-                                                term.write(&text);
+                                if view_mode.get_untracked() == ViewMode::Terminal {
+                                    for f in frames {
+                                        if !f.bytes.is_empty() {
+                                            if let Ok(text) = decoder
+                                                .decode_with_u8_array_and_options(&f.bytes, &opts)
+                                            {
+                                                let text: String = text;
+                                                if !text.is_empty() {
+                                                    term.write(&text);
+                                                }
                                             }
                                         }
                                     }
                                 }
                             }
-
-                            // Update events
                             // Update events
                             if !events.is_empty() {
                                 set_events_list.update(|list| {
                                     list.extend(events);
-                                    // Cap at 2000 events to keep memory sane
-                                    if list.len() > 2000 {
-                                        let split = list.len() - 2000;
+                                    // Cap at 2500 events to ensure we don't drop high-freq MAVLink packets
+                                    // before the View effect can process them.
+                                    // 500 was too aggressive for 50Hz streams.
+                                    if list.len() > 2500 {
+                                        let split = list.len() - 2500;
                                         list.drain(0..split);
                                     }
                                 });
@@ -126,6 +144,12 @@ pub fn App() -> impl IntoView {
                                 &format!("Worker Analysis: Baud {} Score {:.2}", baud_rate, score)
                                     .into(),
                             );
+                        }
+                        WorkerToUi::TxData { data } => {
+                            let m = manager.clone();
+                            spawn_local(async move {
+                                let _ = m.write(&data).await;
+                            });
                         }
                     }
                 }
@@ -315,6 +339,18 @@ pub fn App() -> impl IntoView {
         }
     });
 
+    // Auto-Switch View to MAVLink Dashboard
+    create_effect(move |_| {
+        let dec = manager.decoder_id.get();
+        if dec == "mavlink" && view_mode.get_untracked() != ViewMode::Hex {
+            set_view_mode.set(ViewMode::Hex);
+            // Verify events list is clean or let it persist?
+            // Usually good to clear if we just switched context, but maybe we want history.
+            // Let's clear to be safe and avoid confusing Hex dump with MAVLink table initially
+            set_events_list.set(Vec::new());
+        }
+    });
+
     let on_connect_arrow = on_connect.clone();
     let manager_tx_cb = manager.clone();
 
@@ -385,9 +421,17 @@ pub fn App() -> impl IntoView {
                         }}
                     </option>
                     <option value="9600">9600</option>
+                    <option value="19200">19200</option>
+                    <option value="38400">38400</option>
+                    <option value="57600">57600</option>
                     <option value="115200">115200</option>
+                    <option value="230400">230400</option>
+                    <option value="460800">460800</option>
+                    <option value="500000">500000</option>
+                    <option value="921600">921600</option>
                     <option value="1000000">1000000</option>
                     <option value="1500000">1500000</option>
+                    <option value="2000000">2000000</option>
                 </select>
 
                 <select
@@ -515,7 +559,13 @@ pub fn App() -> impl IntoView {
 
                     // Hex View Container
                     <Show when=move || view_mode.get() == ViewMode::Hex fallback=|| ()>
-                        <hex_view::HexView events=events_list />
+                        {move || {
+                            if manager.decoder_id.get() == "mavlink" {
+                                view! { <mavlink_view::MavlinkView events_list=events_list /> }
+                            } else {
+                                view! { <hex_view::HexView events=events_list /> }
+                            }
+                        }}
                     </Show>
                 </div>
 
@@ -545,7 +595,7 @@ pub fn App() -> impl IntoView {
                         title="Hex Inspector (Hex List)"
                         style=move || format!(
                             "width: 40px; height: 40px; background: {}; color: white; border: none; cursor: pointer; border-radius: 4px; margin-bottom: 8px; display: flex; align-items: center; justify-content: center;",
-                            if view_mode.get() == ViewMode::Hex { "rgb(45, 45, 45)" } else { "transparent" }
+                            if view_mode.get() == ViewMode::Hex && manager.decoder_id.get() != "mavlink" { "rgb(45, 45, 45)" } else { "transparent" }
                         )
                         on:click={
                             let m = manager.clone();
@@ -558,6 +608,27 @@ pub fn App() -> impl IntoView {
                     >
                          {hex_view::icon()}
                     </button>
+
+                    // MAVLink Button
+                    <button
+                        title="MAVLink Decoder"
+                        style=move || format!(
+                            "width: 40px; height: 40px; background: {}; color: white; border: none; cursor: pointer; border-radius: 4px; margin-bottom: 8px; display: flex; align-items: center; justify-content: center; font-family: monospace; font-weight: bold; font-size: 0.8rem;",
+                            if manager.decoder_id.get() == "mavlink" { "rgb(45, 45, 45)" } else { "transparent" }
+                        )
+                        on:click={
+                            let m = manager.clone();
+                            move |_| {
+                                set_view_mode.set(ViewMode::Hex);
+                                set_events_list.set(Vec::new());
+                                m.set_decoder("mavlink".to_string());
+                            }
+                        }
+                    >
+                        MAV
+                    </button>
+
+
                  </div>
             </div>
         </div>

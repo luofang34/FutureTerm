@@ -1,4 +1,4 @@
-use core_types::{DecodedEvent, Decoder, Frame};
+use core_types::{Decoder, Frame};
 use dec_nmea::NmeaDecoder;
 use std::time::Instant;
 
@@ -28,10 +28,11 @@ fn main() {
     ];
 
     // 3. Warmup
-    let mut event = DecodedEvent::new(0, "", "");
+    let mut results = Vec::with_capacity(10);
     for _ in 0..1000 {
         for frame in &frames {
-            let _ = decoder.ingest_into(frame, &mut event);
+            decoder.ingest(frame, &mut results);
+            results.clear();
         }
     }
 
@@ -41,11 +42,11 @@ fn main() {
 
     for _ in 0..BENCH_ITERATIONS {
         for frame in &frames {
-            // "Zero-Allocation" pattern:
-            // Reuse `event` buffer, avoiding malloc/free for every packet.
-            if decoder.ingest_into(frame, &mut event) {
-                count += 1;
-            }
+            // "Reuse Vector" pattern:
+            // Clear results between calls to recycle memory
+            decoder.ingest(frame, &mut results);
+            count += results.len();
+            results.clear();
         }
     }
 

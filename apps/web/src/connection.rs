@@ -45,6 +45,10 @@ pub struct ConnectionManager {
     set_rx_active: WriteSignal<bool>,
     pub tx_active: Signal<bool>,
     set_tx_active: WriteSignal<bool>,
+
+    // Decoder State
+    pub decoder_id: Signal<String>,
+    pub set_decoder_id: WriteSignal<String>,
 }
 
 impl ConnectionManager {
@@ -57,6 +61,7 @@ impl ConnectionManager {
 
         let (rx_active, set_rx_active) = create_signal(false);
         let (tx_active, set_tx_active) = create_signal(false);
+        let (decoder_id, set_decoder_id) = create_signal("utf8".to_string());
 
         Self {
             connected: connected.into(),
@@ -80,6 +85,8 @@ impl ConnectionManager {
             set_rx_active,
             tx_active: tx_active.into(),
             set_tx_active,
+            decoder_id: decoder_id.into(),
+            set_decoder_id,
         }
     }
 
@@ -146,17 +153,28 @@ impl ConnectionManager {
         *self.is_connecting_internal.borrow_mut() = true;
 
         let result = if baud > 0 && framing == "Auto" {
-            let (detect_framing, initial_buf) = self.smart_probe_framing(port.clone(), baud).await;
+            let (detect_framing, initial_buf, proto) =
+                self.smart_probe_framing(port.clone(), baud).await;
+
+            if let Some(p) = proto {
+                self.set_decoder(p);
+            }
+
             self.connect_impl(port, baud, &detect_framing, Some(initial_buf))
                 .await
         } else {
             // Auto-Detect if Baud is 0
-            let (final_baud, final_framing_str, initial_buffer) = if baud == 0 {
-                let (b, f, buf) = self.detect_config(port.clone(), framing).await;
-                (b, f, Some(buf))
+            let (final_baud, final_framing_str, initial_buffer, detected_proto) = if baud == 0 {
+                let (b, f, buf, proto) = self.detect_config(port.clone(), framing).await;
+                (b, f, Some(buf), proto)
             } else {
-                (baud, framing.to_string(), None)
+                (baud, framing.to_string(), None, None)
             };
+
+            // Switch Decoder if detected
+            if let Some(p) = detected_proto {
+                self.set_decoder(p);
+            }
 
             self.connect_impl(port, final_baud, &final_framing_str, initial_buffer)
                 .await
@@ -252,7 +270,7 @@ impl ConnectionManager {
 
             // 3. Open New
             // We reuse the connect_impl logic, manually handling detection so we can check for cancellation
-            let (final_baud, final_framing, initial_buf) = if baud == 0 {
+            let (final_baud, final_framing, initial_buf, proto) = if baud == 0 {
                 let cached_auto = *self.last_auto_baud.borrow();
 
                 // IMPROVEMENT: If we have a trusted PAST auto-detection result, use it.
@@ -260,28 +278,35 @@ impl ConnectionManager {
                 // This also avoids the aggressive 'enter' probe on context switch.
                 if let Some(cached) = cached_auto {
                     let effective_framing = if framing == "Auto" { "8N1" } else { framing };
-                    (cached, effective_framing.to_string(), None)
+                    (cached, effective_framing.to_string(), None, None)
                 } else {
-                    let (b, f, buf) = self.detect_config(port.clone(), framing).await;
+                    let (b, f, buf, proto) = self.detect_config(port.clone(), framing).await;
                     // RACE CHECK: If disconnected during detection, abort
                     if self.active_port.borrow().is_none() {
                         self.set_is_reconfiguring.set(false);
                         return;
                     }
-                    (b, f, Some(buf))
+                    (b, f, Some(buf), proto)
                 }
             } else if framing == "Auto" {
                 // Smart Probe on Reconfigure as well
-                let (detect_f, buf) = self.smart_probe_framing(port.clone(), baud).await;
-                (baud, detect_f, Some(buf))
+                let (detect_f, buf, proto) = self.smart_probe_framing(port.clone(), baud).await;
+                if let Some(p) = proto.clone() {
+                    self.set_decoder(p);
+                }
+                (baud, detect_f, Some(buf), proto)
             } else {
-                (baud, framing.to_string(), None)
+                (baud, framing.to_string(), None, None)
             };
 
             // Final sanity check before opening
             if self.active_port.borrow().is_none() {
                 self.set_is_reconfiguring.set(false);
                 return;
+            }
+
+            if let Some(p) = proto {
+                self.set_decoder(p);
             }
 
             match self
@@ -422,6 +447,39 @@ impl ConnectionManager {
         }
         Err("TX Dropped: Transport busy/locked or closed".to_string())
     }
+    pub fn set_framer(&self, id: String) {
+        if let Some(w) = self.worker.get_untracked() {
+            let msg = UiToWorker::SetFramer { id: id.clone() };
+            if let Ok(cmd_val) = serde_wasm_bindgen::to_value(&msg) {
+                let _ = w.post_message(&cmd_val);
+            }
+        }
+    }
+
+    pub fn set_decoder(&self, id: String) {
+        self.set_decoder_id.set(id.clone());
+        if let Some(w) = self.worker.get_untracked() {
+            let msg = UiToWorker::SetDecoder { id: id.clone() };
+            if let Ok(cmd_val) = serde_wasm_bindgen::to_value(&msg) {
+                let _ = w.post_message(&cmd_val);
+            }
+
+            // Auto-Start Heartbeat for MAVLink
+            if id == "mavlink" {
+                let msg_hb = UiToWorker::StartHeartbeat;
+                if let Ok(val) = serde_wasm_bindgen::to_value(&msg_hb) {
+                    let _ = w.post_message(&val);
+                }
+                web_sys::console::log_1(&"MAVLink Heartbeat Started".into());
+            } else {
+                let msg_hb = UiToWorker::StopHeartbeat;
+                if let Ok(val) = serde_wasm_bindgen::to_value(&msg_hb) {
+                    let _ = w.post_message(&val);
+                }
+            }
+        }
+    }
+
     pub async fn auto_select_port(
         &self,
         last_vid: Option<u16>,
@@ -474,8 +532,6 @@ impl ConnectionManager {
     }
 
     pub async fn request_port(&self) -> Option<web_sys::SerialPort> {
-        use wasm_bindgen::JsValue; // Added this line to make JsValue available
-
         let nav = web_sys::window().unwrap().navigator();
         let serial = nav.serial();
 
@@ -486,18 +542,8 @@ impl ConnectionManager {
         }
 
         let options = js_sys::Object::new();
-        // Common USB-Serial VIDs (Filtered)
-        let vids = vec![
-            0x0403, 0x10C4, 0x1A86, 0x067B, 0x303A, 0x2341, 0x239A, 0x0483, 0x1366, 0x2E8A, 0x03EB,
-            0x1FC9, 0x0D28,
-        ];
-        let filters = js_sys::Array::new();
-        for vid in vids {
-            let f = js_sys::Object::new();
-            let _ = js_sys::Reflect::set(&f, &"usbVendorId".into(), &JsValue::from(vid));
-            filters.push(&f);
-        }
-        let _ = js_sys::Reflect::set(&options, &"filters".into(), &filters);
+        // Filters removed to allow all devices (MAVLink/PX4 support)
+        // let _ = js_sys::Reflect::set(&options, &"filters".into(), &js_sys::Array::new());
 
         match js_sys::Reflect::get(&serial, &"requestPort".into()) {
             Ok(func_val) => {
@@ -543,14 +589,15 @@ impl ConnectionManager {
         &self,
         port: web_sys::SerialPort,
         current_framing: &str,
-    ) -> (u32, String, Vec<u8>) {
+    ) -> (u32, String, Vec<u8>, Option<String>) {
         let baud_candidates = vec![
-            115200, 1500000, 9600, 921600, 460800, 230400, 57600, 38400, 19200,
+            115200, 1500000, 1000000, 2000000, 921600, 57600, 460800, 230400, 38400, 19200, 9600,
         ];
         let mut best_score = 0.0;
         let mut best_rate = 115200;
         let mut best_framing = "8N1".to_string();
         let mut best_buffer = Vec::new();
+        let mut best_proto = None;
 
         // Helpers
         // Local scoring logic removed in favor of `analysis` crate.
@@ -582,17 +629,46 @@ impl ConnectionManager {
             // 2. Analyze
             let score_8n1 = analysis::calculate_score_8n1(&buffer);
             let score_7e1 = analysis::calculate_score_7e1(&buffer);
+            let score_mav = analysis::calculate_score_mavlink(&buffer);
 
             web_sys::console::log_1(
                 &format!(
-                    "AUTO: Rate {} => 8N1 Score: {:.4} (Size: {}), 7E1 Score: {:.4}",
+                    "AUTO: Rate {} => 8N1: {:.4}, 7E1: {:.4}, MAV: {:.4} (Size: {})",
                     rate,
                     score_8n1,
-                    buffer.len(),
-                    score_7e1
+                    score_7e1,
+                    score_mav,
+                    buffer.len()
                 )
                 .into(),
             );
+
+            // MAVLink Priority Check (Robust)
+            #[cfg(feature = "mavlink")]
+            if self.verify_mavlink_integrity(&buffer) {
+                best_score = 1.0;
+                best_rate = rate;
+                best_framing = "8N1".to_string(); // MAVLink is 8N1
+                best_buffer = buffer.clone();
+                best_proto = Some("mavlink".to_string());
+                web_sys::console::log_1(
+                    &"AUTO: MAVLink Verified (Magic+Parse)! Stopping probe.".into(),
+                );
+                break 'outer;
+            }
+
+            // Fallback to statistical score if verification inconclusive but score high
+            if score_mav >= 0.99 {
+                best_score = 1.0;
+                best_rate = rate;
+                best_framing = "8N1".to_string(); // MAVLink is 8N1
+                best_buffer = buffer.clone();
+                best_proto = Some("mavlink".to_string());
+                web_sys::console::log_1(
+                    &"AUTO: MAVLink Detected (Statistical). Stopping probe.".into(),
+                );
+                break 'outer;
+            }
 
             if score_8n1 > best_score {
                 best_score = score_8n1;
@@ -616,7 +692,18 @@ impl ConnectionManager {
                 break 'outer;
             }
 
-            if best_score > 0.95 {
+            // High-Speed Optimization: Accept lower confidence for >= 1M baud
+            // reasoning: High speed signals are sparse. If we see one, it's likely the right one.
+            let threshold = if best_rate >= 1000000 { 0.85 } else { 0.98 };
+
+            if best_score > threshold {
+                web_sys::console::log_1(
+                    &format!(
+                        "AUTO: Early Break at {} (Score: {:.2} > {})",
+                        best_rate, best_score, threshold
+                    )
+                    .into(),
+                );
                 *self.last_auto_baud.borrow_mut() = Some(best_rate); // SAVE CACHE
                 break 'outer;
             }
@@ -648,7 +735,7 @@ impl ConnectionManager {
             "Detected: {} {} (Score: {:.2})",
             best_rate, best_framing, best_score
         ));
-        (best_rate, best_framing, best_buffer)
+        (best_rate, best_framing, best_buffer, best_proto)
     }
 
     // Helper: Gather Probe Data (Extracted)
@@ -698,10 +785,30 @@ impl ConnectionManager {
         };
 
         if success {
-            if send_wakeup {
+            // PASSIVE FIRST: Listen for 100ms
+            let start_passive = js_sys::Date::now();
+            let mut received_passive = false;
+            while js_sys::Date::now() - start_passive < 100.0 {
+                if let Ok((chunk, _)) = t.read_chunk().await {
+                    if !chunk.is_empty() {
+                        buffer.extend_from_slice(&chunk);
+                        received_passive = true;
+                    }
+                } else {
+                    break;
+                }
+                // Small breaks done by read_chunk internally usually
+                if received_passive {
+                    break;
+                }
+            }
+
+            // IF NO DATA & WAKEUP REQUESTED -> Send Wakeup
+            if !received_passive && buffer.is_empty() && send_wakeup {
                 let _ = t.write(b"\r").await;
             }
 
+            // Continue Reading (Active Phase or Extended Passive)
             let start_loop = js_sys::Date::now();
             let mut max_time = 50.0;
 
@@ -719,25 +826,76 @@ impl ConnectionManager {
                             }
                         }
                     }
+                } else {
+                    break;
                 }
-                let _ = wasm_bindgen_futures::JsFuture::from(js_sys::Promise::new(&mut |r, _| {
-                    let _ = web_sys::window()
-                        .unwrap()
-                        .set_timeout_with_callback_and_timeout_and_arguments_0(&r, 10);
-                }))
-                .await;
             }
+
             let _ = t.close().await;
 
-            // Mandatory Cool-down: Give OS/Browser 50ms to release the lock completely
+            // Mandatory Cool-down: Give OS/Browser 200ms to release the lock completely
             let _ = wasm_bindgen_futures::JsFuture::from(js_sys::Promise::new(&mut |r, _| {
                 let _ = web_sys::window()
                     .unwrap()
-                    .set_timeout_with_callback_and_timeout_and_arguments_0(&r, 50);
+                    .set_timeout_with_callback_and_timeout_and_arguments_0(&r, 200);
             }))
             .await;
         }
         buffer
+    }
+
+    // Verify MAVLink Integrity (Magic Byte + Parse Test)
+    #[cfg(feature = "mavlink")]
+    fn verify_mavlink_integrity(&self, buffer: &[u8]) -> bool {
+        // 1. Quick Magic Byte Scan
+        let mut reader = buffer;
+        loop {
+            let magic_idx = reader.iter().position(|&b| b == 0xFE || b == 0xFD);
+            if let Some(idx) = magic_idx {
+                // Advance reader to magic
+                if idx + 1 >= reader.len() {
+                    return false;
+                }
+                let magic = reader[idx];
+                // Make sure we have AT LEAST enough for a minimal valid header/payload
+                // v1 min: 8 + 0 = 8. v2 min: 12 + 0 = 12.
+                let min_packet_size = if magic == 0xFE { 8 } else { 12 };
+
+                if idx + min_packet_size > reader.len() {
+                    return false;
+                }
+
+                let sub_slice = &reader[idx..];
+
+                // Try Parse
+                let mut try_reader = sub_slice;
+                let res = if magic == 0xFE {
+                    mavlink::read_v1_msg::<mavlink::common::MavMessage, _>(&mut try_reader)
+                } else {
+                    mavlink::read_v2_msg::<mavlink::common::MavMessage, _>(&mut try_reader)
+                };
+
+                if res.is_ok() {
+                    web_sys::console::log_1(
+                        &format!("DEBUG: MAVLink VERIFIED. Magic: {:02X}", magic).into(),
+                    );
+                    return true; // Valid packet found!
+                } else {
+                    web_sys::console::log_1(
+                        &format!(
+                            "DEBUG: MAVLink Magic found but parse failed ({:?}).",
+                            res.err()
+                        )
+                        .into(),
+                    );
+                }
+
+                // Failed? Advance past this magic and retry
+                reader = &reader[idx + 1..];
+            } else {
+                return false;
+            }
+        }
     }
 
     // New: Smart Probe for Single Baud
@@ -745,7 +903,7 @@ impl ConnectionManager {
         &self,
         port: web_sys::SerialPort,
         rate: u32,
-    ) -> (String, Vec<u8>) {
+    ) -> (String, Vec<u8>, Option<String>) {
         self.set_status.set(format!("Smart Probing {}...", rate));
 
         // 1. Probe 8N1 (Most common) - ACTIVE (Wakeup)
@@ -754,8 +912,14 @@ impl ConnectionManager {
             .await;
         if !buf_8n1.is_empty() {
             let score = analysis::calculate_score_8n1(&buf_8n1);
+            let score_mav = analysis::calculate_score_mavlink(&buf_8n1);
+
+            if score_mav >= 0.99 {
+                return ("8N1".to_string(), buf_8n1, Some("mavlink".to_string()));
+            }
+
             if score > 0.90 {
-                return ("8N1".to_string(), buf_8n1);
+                return ("8N1".to_string(), buf_8n1, None);
             }
         }
 
@@ -767,12 +931,13 @@ impl ConnectionManager {
                 .await;
             let score = analysis::calculate_score_7e1(&buf_7e1); // Assuming 7E1 score calc
             if score > 0.90 {
-                return ("7E1".to_string(), buf_7e1);
+                return ("7E1".to_string(), buf_7e1, None);
             }
         }
 
         // Default to 8N1 if silent or unsure
-        ("8N1".to_string(), buf_8n1)
+        // Default to 8N1 if silent or unsure
+        ("8N1".to_string(), buf_8n1, None)
     }
     // Internal connect implementation
     async fn connect_impl(
@@ -855,23 +1020,23 @@ impl ConnectionManager {
                 Err(e) => {
                     let err_str = format!("{:?}", e);
                     if (err_str.contains("already open") || err_str.contains("InvalidStateError"))
-                        && attempts < 3
+                        && attempts < 10
                     {
                         attempts += 1;
                         web_sys::console::warn_1(
                             &format!(
-                                "Connection blocked by busy port. Retrying ({}/3)...",
+                                "Connection blocked by busy port. Retrying ({}/10)...",
                                 attempts
                             )
                             .into(),
                         );
 
-                        // Wait 100ms
+                        // Wait 200ms
                         let _ = wasm_bindgen_futures::JsFuture::from(js_sys::Promise::new(
                             &mut |r, _| {
                                 let _ = web_sys::window()
                                     .unwrap()
-                                    .set_timeout_with_callback_and_timeout_and_arguments_0(&r, 100);
+                                    .set_timeout_with_callback_and_timeout_and_arguments_0(&r, 200);
                             },
                         ))
                         .await;
@@ -886,24 +1051,6 @@ impl ConnectionManager {
 
         // Guard cleared by caller
         result
-    }
-
-    pub fn set_decoder(&self, id: String) {
-        if let Some(w) = self.worker.get_untracked() {
-            let msg = UiToWorker::SetDecoder { id };
-            if let Ok(cmd_val) = serde_wasm_bindgen::to_value(&msg) {
-                let _ = w.post_message(&cmd_val);
-            }
-        }
-    }
-
-    pub fn set_framer(&self, id: String) {
-        if let Some(w) = self.worker.get_untracked() {
-            let msg = UiToWorker::SetFramer { id };
-            if let Ok(cmd_val) = serde_wasm_bindgen::to_value(&msg) {
-                let _ = w.post_message(&cmd_val);
-            }
-        }
     }
 
     // --- Auto-Reconnect Logic ---
@@ -979,13 +1126,6 @@ impl ConnectionManager {
 
                                 // Manager Connect (Handles open, loop, worker)
                                 // Auto-reconnect not needed here, handled by manager internal state or explicit loop
-                                web_sys::console::log_1(
-                                    &format!(
-                                        "DEBUG: Auto-Connect. Pref: {}, Last: {}, Target: {}",
-                                        user_pref_baud, last_known_baud, target_baud
-                                    )
-                                    .into(),
-                                );
 
                                 spawn_local(async move {
                                     // FORCE RESET: Close any stale handles (even if we think we are disconnected, the browser might hold the lock)
