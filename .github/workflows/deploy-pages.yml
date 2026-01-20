@@ -30,7 +30,7 @@ jobs:
       - name: Build WASM app
         run: |
           cd apps/web
-          RUSTFLAGS="--cfg=web_sys_unstable_apis" trunk build --release --public-url /FutureTerm/
+          RUSTFLAGS="--cfg=web_sys_unstable_apis" trunk build --release
 
       - name: Upload artifact
         uses: actions/upload-pages-artifact@v3
