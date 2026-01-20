@@ -2,6 +2,13 @@ use core_types::{DecodedEvent, Decoder, Frame};
 use mavlink::{MavHeader, Message};
 // Use std::io traits
 
+const MAX_BUFFER_SIZE: usize = 1024;
+const INITIAL_BUFFER_CAPACITY: usize = 1024;
+const GARBAGE_SKIP_THRESHOLD: usize = 200;
+const MAVLINK_V1_MAGIC: u8 = 0xFE;
+const MAVLINK_V2_MAGIC: u8 = 0xFD;
+const MAVLINK_V2_SIGNATURE_SIZE: usize = 13;
+
 pub struct MavlinkDecoder {
     buffer: Vec<u8>,
 }
@@ -9,7 +16,7 @@ pub struct MavlinkDecoder {
 impl MavlinkDecoder {
     pub fn new() -> Self {
         Self {
-            buffer: Vec::with_capacity(1024),
+            buffer: Vec::with_capacity(INITIAL_BUFFER_CAPACITY),
         }
     }
 
@@ -20,8 +27,6 @@ impl MavlinkDecoder {
     ) -> DecodedEvent {
         let msg_name = body.message_name();
         let mut event = DecodedEvent::new(0, "MAVLink", msg_name); // Timestamp set later
-
-        event.confidence = 1.0;
 
         event.confidence = 1.0;
 
@@ -85,6 +90,13 @@ impl Decoder for MavlinkDecoder {
     fn ingest(&mut self, frame: &Frame, results: &mut Vec<DecodedEvent>) {
         self.buffer.extend_from_slice(&frame.bytes);
 
+        // Safety Cap
+        if self.buffer.len() > MAX_BUFFER_SIZE {
+             #[cfg(target_arch = "wasm32")]
+             web_sys::console::warn_1(&"MAVLink buffer exceeded limit, clearing".into());
+             self.buffer.clear();
+        }
+
         // Process buffer
         loop {
             // Minimal length check (header)
@@ -96,7 +108,7 @@ impl Decoder for MavlinkDecoder {
 
             // Look for magic byte
             // v1 (0xFE) or v2 (0xFD)
-            let magic_idx = self.buffer.iter().position(|&b| b == 0xFE || b == 0xFD);
+            let magic_idx = self.buffer.iter().position(|&b| b == MAVLINK_V1_MAGIC || b == MAVLINK_V2_MAGIC);
 
             if let Some(idx) = magic_idx {
                 // Discard garbage before magic byte
@@ -105,7 +117,7 @@ impl Decoder for MavlinkDecoder {
                     self.buffer.drain(0..idx);
                 }
             } else {
-                if self.buffer.len() > 200 {
+                if self.buffer.len() > GARBAGE_SKIP_THRESHOLD {
                     // leptos::logging::log!("MAVLink: Buffer full ({}) no magic found, clearing", self.buffer.len());
                     self.buffer.clear();
                 }
@@ -115,7 +127,7 @@ impl Decoder for MavlinkDecoder {
             let magic = self.buffer[0];
             let payload_len = self.buffer[1] as usize;
 
-            let base_len = if magic == 0xFE {
+            let base_len = if magic == MAVLINK_V1_MAGIC {
                 // v1: header(6) + payload + crc(2)
                 8 + payload_len
             } else {
@@ -124,10 +136,10 @@ impl Decoder for MavlinkDecoder {
             };
 
             let mut total_len = base_len;
-            if magic == 0xFD && self.buffer.len() >= 3 {
+            if magic == MAVLINK_V2_MAGIC && self.buffer.len() >= 3 {
                 let incompat_flags = self.buffer[2];
                 if incompat_flags & 0x01 != 0 {
-                    total_len += 13; // MAVLink v2 signature
+                    total_len += MAVLINK_V2_SIGNATURE_SIZE; // MAVLink v2 signature
                 }
             }
 
@@ -139,7 +151,7 @@ impl Decoder for MavlinkDecoder {
             // Try parse using slice reader (requires std::io::Read for &[u8])
             let mut reader = &self.buffer[0..total_len];
 
-            let parse_result = if magic == 0xFE {
+            let parse_result = if magic == MAVLINK_V1_MAGIC {
                 mavlink::read_v1_msg::<mavlink::common::MavMessage, _>(&mut reader)
             } else {
                 mavlink::read_v2_msg::<mavlink::common::MavMessage, _>(&mut reader)
@@ -149,7 +161,7 @@ impl Decoder for MavlinkDecoder {
                 Ok((header, body)) => {
                     let mut event = self.parse_message(&header, &body);
                     event.timestamp_us = frame.timestamp_us; // Inherit timestamp
-                    let ver_str = if magic == 0xFE { "v1" } else { "v2" };
+                    let ver_str = if magic == MAVLINK_V1_MAGIC { "v1" } else { "v2" };
                     event = event.with_field("version", ver_str.to_string());
                     results.push(event);
 

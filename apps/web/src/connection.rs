@@ -644,6 +644,7 @@ impl ConnectionManager {
             );
 
             // MAVLink Priority Check (Robust)
+            #[cfg(feature = "mavlink")]
             if self.verify_mavlink_integrity(&buffer) {
                 best_score = 1.0;
                 best_rate = rate;
@@ -851,6 +852,7 @@ impl ConnectionManager {
     }
 
     // Verify MAVLink Integrity (Magic Byte + Parse Test)
+    #[cfg(feature = "mavlink")]
     fn verify_mavlink_integrity(&self, buffer: &[u8]) -> bool {
         // 1. Quick Magic Byte Scan
         let mut reader = buffer;

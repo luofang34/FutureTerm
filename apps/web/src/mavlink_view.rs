@@ -30,8 +30,8 @@ pub fn MavlinkView(events_list: ReadSignal<Vec<DecodedEvent>>) -> impl IntoView 
                 return;
             }
             // debug log
-            web_sys::console::log_1(&format!("View Processing {} events", events.len()).into());
-
+            // web_sys::console::log_1(&format!("View Processing {} events", events.len()).into());
+            
             set_state.update(|map| {
                 for e in events {
                     if e.protocol != "MAVLink" {
@@ -213,8 +213,11 @@ pub fn MavlinkView(events_list: ReadSignal<Vec<DecodedEvent>>) -> impl IntoView 
                                     // Rows
                                     <For
                                         each=move || messages.get()
-                                        // Key MUST include timestamp to force re-render/flash on update
-                                        key=|item| format!("{}-{}", item.summary, item.timestamp_us)
+                                        // Key MUST include seq to force re-render even if timestamp is identical (batching)
+                                        key=|item| {
+                                            let seq = item.fields.iter().find(|(k, _)| k == "seq").map(|(_, v)| v.to_string()).unwrap_or_default();
+                                            format!("{}-{}-{}", item.summary, item.timestamp_us, seq)
+                                        }
                                         children=move |event| {
 
                                             // Extract Seq
