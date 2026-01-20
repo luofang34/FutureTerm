@@ -70,6 +70,9 @@ pub fn App() -> impl IntoView {
     // Unified raw event log (append-only, survives view switches)
     let (raw_log, set_raw_log) = create_signal::<Vec<RawEvent>>(Vec::new());
 
+    // Per-decoder view cursors (for persistent scroll position)
+    let (hex_cursor, set_hex_cursor) = create_signal(0usize);
+
     // Legacy signals removed/replaced by manager:
     // status, connected, transport, active_port, is_reconfiguring
 
@@ -600,7 +603,7 @@ pub fn App() -> impl IntoView {
                             if manager.decoder_id.get() == "mavlink" {
                                 view! { <mavlink_view::MavlinkView events_list=events_list /> }
                             } else {
-                                view! { <hex_view::HexView events=events_list /> }
+                                view! { <hex_view::HexView raw_log=raw_log cursor=hex_cursor set_cursor=set_hex_cursor /> }
                             }
                         }}
                     </Show>

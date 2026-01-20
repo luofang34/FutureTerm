@@ -1,4 +1,4 @@
-use core_types::{DecodedEvent, Value};
+use core_types::RawEvent;
 use leptos::*;
 use wasm_bindgen::closure::Closure;
 use wasm_bindgen::JsCast;
@@ -30,15 +30,12 @@ impl HexRow {
     }
 }
 
-/// Parse hex string like "41 42 FF" into Vec<u8>
-fn parse_hex_string(s: &str) -> Vec<u8> {
-    s.split_whitespace()
-        .filter_map(|hex| u8::from_str_radix(hex, 16).ok())
-        .collect()
-}
-
 #[component]
-pub fn HexView(events: ReadSignal<Vec<DecodedEvent>>) -> impl IntoView {
+pub fn HexView(
+    raw_log: ReadSignal<Vec<RawEvent>>,
+    cursor: ReadSignal<usize>,
+    set_cursor: WriteSignal<usize>,
+) -> impl IntoView {
     let container_ref = create_node_ref::<html::Div>();
 
     // Signal State
@@ -94,22 +91,40 @@ pub fn HexView(events: ReadSignal<Vec<DecodedEvent>>) -> impl IntoView {
         }
     });
 
-    // Process all events into rows based on current bytes_per_row
+    // Auto-advance cursor in tail-follow mode
+    // This effect runs when raw_log grows, and advances cursor if we're at the end
+    create_effect(move |prev_len: Option<usize>| {
+        let log = raw_log.get();
+        let current_len = log.len();
+
+        // Only auto-advance if we were at the end (tail-follow mode)
+        if let Some(prev) = prev_len {
+            if cursor.get_untracked() == prev {
+                set_cursor.set(current_len);
+            }
+        } else {
+            // First run, set cursor to end
+            set_cursor.set(current_len);
+        }
+
+        current_len
+    });
+
+    // Process raw events into rows based on current bytes_per_row
     let all_hex_rows = create_memo(move |_| {
         let mut rows = Vec::new();
         let mut current_offset = 0;
         let bpr = bytes_per_row.get();
 
-        for event in events.get() {
-            if let Some(Value::String(hex_str)) = event.get_field("hex") {
-                let bytes = parse_hex_string(hex_str);
-                for chunk in bytes.chunks(bpr) {
-                    rows.push(HexRow {
-                        offset: current_offset,
-                        bytes: chunk.to_vec(),
-                    });
-                    current_offset += chunk.len();
-                }
+        // Process all events from raw log (cursor used for tail-follow, not filtering)
+        for raw_event in raw_log.get() {
+            let bytes = &raw_event.bytes;
+            for chunk in bytes.chunks(bpr) {
+                rows.push(HexRow {
+                    offset: current_offset,
+                    bytes: chunk.to_vec(),
+                });
+                current_offset += chunk.len();
             }
         }
         rows
