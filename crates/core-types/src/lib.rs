@@ -39,6 +39,41 @@ impl Frame {
     }
 }
 
+/// A raw event stored in the unified append-only log.
+/// This is the persistent storage format for all received/sent data,
+/// from which each decoder view derives its own interpretation.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct RawEvent {
+    /// Timestamp in microseconds (relative to session start or epoch).
+    pub timestamp_us: u64,
+    /// Direction of data flow (RX from device, TX to device).
+    pub channel: Channel,
+    /// The raw bytes.
+    pub bytes: Vec<u8>,
+}
+
+impl RawEvent {
+    pub fn new(timestamp_us: u64, channel: Channel, bytes: Vec<u8>) -> Self {
+        Self {
+            timestamp_us,
+            channel,
+            bytes,
+        }
+    }
+
+    pub fn from_frame(frame: &Frame) -> Self {
+        Self {
+            timestamp_us: frame.timestamp_us,
+            channel: frame.channel,
+            bytes: frame.bytes.clone(),
+        }
+    }
+
+    pub fn byte_size(&self) -> usize {
+        self.bytes.len()
+    }
+}
+
 use std::borrow::Cow;
 
 /// Lightweight value wrapper to avoid serde_json allocations for common types.
