@@ -384,10 +384,7 @@ pub fn App() -> impl IntoView {
         let dec = manager.decoder_id.get();
         if dec == "mavlink" && view_mode.get_untracked() != ViewMode::Hex {
             set_view_mode.set(ViewMode::Hex);
-            // Verify events list is clean or let it persist?
-            // Usually good to clear if we just switched context, but maybe we want history.
-            // Let's clear to be safe and avoid confusing Hex dump with MAVLink table initially
-            set_events_list.set(Vec::new());
+            // History now persists across decoder switches
         }
     });
 
@@ -622,7 +619,6 @@ pub fn App() -> impl IntoView {
                             let m = manager.clone();
                             move |_| {
                                 set_view_mode.set(ViewMode::Terminal);
-                                set_events_list.set(Vec::new()); // Clear history on switch
                                 m.set_decoder("utf8".to_string());
                             }
                         }
@@ -641,7 +637,6 @@ pub fn App() -> impl IntoView {
                             let m = manager.clone();
                             move |_| {
                                 set_view_mode.set(ViewMode::Hex);
-                                set_events_list.set(Vec::new()); // Clear history on switch
                                 m.set_decoder("hex".to_string());
                             }
                         }
@@ -660,7 +655,6 @@ pub fn App() -> impl IntoView {
                             let m = manager.clone();
                             move |_| {
                                 set_view_mode.set(ViewMode::Hex);
-                                set_events_list.set(Vec::new());
                                 m.set_decoder("mavlink".to_string());
                             }
                         }
