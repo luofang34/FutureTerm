@@ -350,6 +350,7 @@ dependencies = [
  "embedded-hal",
  "mavlink",
  "nb 1.1.0",
+ "web-sys",
 ]
 
 [[package]]

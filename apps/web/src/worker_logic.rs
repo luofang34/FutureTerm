@@ -131,6 +131,7 @@ async fn handle_message(
         }
         UiToWorker::IngestData { data, timestamp_us } => {
             // 1. Frame
+            // log!("Worker: Ingesting {} bytes", data.len());
             let frames_out = framer.borrow_mut().push(&data, timestamp_us);
 
             // 2. Decode & Batch

@@ -88,7 +88,9 @@ impl Decoder for MavlinkDecoder {
         // Process buffer
         loop {
             // Minimal length check (header)
-            if self.buffer.len() < 8 {
+            // Minimal length check (header)
+            // Check for minimum v2 size (more conservative)
+            if self.buffer.len() < 12 {
                 break;
             }
 
@@ -113,20 +115,19 @@ impl Decoder for MavlinkDecoder {
             let magic = self.buffer[0];
             let payload_len = self.buffer[1] as usize;
 
-            let expected_len = if magic == 0xFE {
-                // v1
+            let base_len = if magic == 0xFE {
+                // v1: header(6) + payload + crc(2)
                 8 + payload_len
             } else {
-                // v2 (0xFD)
-                12 + payload_len // Assumes no signature strictly here, but let's be lenient
+                // v2: header(10) + payload + crc(2)
+                12 + payload_len
             };
 
-            // Refine expected len for v2 signature
-            let mut total_len = expected_len;
+            let mut total_len = base_len;
             if magic == 0xFD && self.buffer.len() >= 3 {
                 let incompat_flags = self.buffer[2];
                 if incompat_flags & 0x01 != 0 {
-                    total_len += 13;
+                    total_len += 13; // MAVLink v2 signature
                 }
             }
 
@@ -155,8 +156,12 @@ impl Decoder for MavlinkDecoder {
                     // Remove consumed bytes
                     self.buffer.drain(0..total_len);
                 }
-                Err(_) => {
+                Err(_e) => {
                     // CRC fail or parse error?
+                    // Log the error for visibility
+                    #[cfg(target_arch = "wasm32")] 
+                    web_sys::console::log_1(&format!("MAVLink parse failed: {:?}", _e).into());
+
                     // Advance 1 byte to try resync
                     self.buffer.drain(0..1);
                 }

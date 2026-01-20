@@ -48,22 +48,44 @@ pub fn calculate_score_7e1(buf: &[u8]) -> f32 {
 }
 
 /// Calculates the likelihood of MAVLink data (v1 0xFE or v2 0xFD).
-/// Returns 1.0 if magic bytes are found, 0.0 otherwise.
+/// Uses structural validation (header length checks) since we don't have CRC in this crate.
 pub fn calculate_score_mavlink(buf: &[u8]) -> f32 {
-    let mut magic_count = 0;
-    for &b in buf {
-        if b == 0xFE || b == 0xFD {
-            magic_count += 1;
-        }
+    if buf.is_empty() {
+        return 0.0;
     }
-    // If > 5% of bytes are magic (unlikely in random noise unless stream is pure MAVLink),
-    // OR if we have at least 1 magic byte in a small buffer.
-    // Better: simply presence of valid magic byte at expected interval?
-    // For now, heuristic: finding *any* 0xFE/0xFD is a strong hint.
-    if magic_count > 0 {
-        1.0
-    } else {
+
+    let mut matched_bytes = 0;
+    let mut i = 0;
+    while i < buf.len() {
+        let b = buf[i];
+        if b == 0xFE || b == 0xFD {
+            // Potential Magic
+            if i + 1 < buf.len() {
+                let payload_len = buf[i + 1] as usize;
+                let header_overhead = if b == 0xFE { 8 } else { 12 }; // v1=8, v2=12 (min)
+                let total_len = payload_len + header_overhead;
+
+                // Check specifically for v2 flags if possible to refine length?
+                // For now, assume min v2 length. 
+                // If we have enough data for the full packet, assume it's valid for scoring.
+                // If we DON'T have enough data, we can't verify, so valid_bytes is just 0 for this chunk?
+                // Or should we count it if it LOOKS like a header?
+                
+                // Strict approach: only count bytes if we can see the whole packet.
+                if i + total_len <= buf.len() {
+                    matched_bytes += total_len;
+                    i += total_len; 
+                    continue;
+                }
+            }
+        }
+        i += 1;
+    }
+
+    if matched_bytes == 0 {
         0.0
+    } else {
+        matched_bytes as f32 / buf.len() as f32
     }
 }
 
@@ -137,5 +159,36 @@ mod tests {
         let garbage: Vec<u8> = vec![0xFF, 0xFE, 0x7F, 0x80, 0x00, 0x01, 0xFF, 0x82];
         assert!(calculate_score_8n1(&garbage) < 0.3);
         assert!(calculate_score_7e1(&garbage) < 0.3);
+    }
+
+    #[test]
+    fn test_mavlink_score_valid() {
+        // v1 packet: FE len=3 ... total=3+8=11 bytes
+        let valid = vec![
+            0xFE, 0x03, 0x01, 0x01, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00
+        ];
+        assert!(calculate_score_mavlink(&valid) > 0.99);
+    }
+
+    #[test]
+    fn test_mavlink_score_noise_with_magic() {
+        // Random noise with 0xFE but invalid length implied
+        // 0xFE followed by 0xFF (255) -> requires 263 bytes.
+        // Buffer is short. Should score 0.0 because strictly check bounds.
+        let noise = vec![0xFE, 0xFF, 0x00, 0x00];
+        assert_eq!(calculate_score_mavlink(&noise), 0.0);
+    }
+
+    #[test]
+    fn test_mavlink_score_mixed() {
+        // Garbage + Valid Packet
+        let mut mixed = vec![0x00, 0x01, 0x02]; // 3 bytes garbage
+        // Valid packet (11 bytes)
+        mixed.extend_from_slice(&[
+            0xFE, 0x03, 0x01, 0x01, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00
+        ]);
+        // Total 14 bytes. 11 matched. Score = 11/14 ~= 0.78
+        let score = calculate_score_mavlink(&mixed);
+        assert!(score > 0.7 && score < 0.8);
     }
 }

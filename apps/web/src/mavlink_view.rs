@@ -13,48 +13,79 @@ pub fn MavlinkView(events_list: ReadSignal<Vec<DecodedEvent>>) -> impl IntoView 
         messages: Vec<DecodedEvent>,
     }
 
-    // 1. Efficiently map state using a Memo (Derived Signal)
-    // We transform the flat event list into a Map of Systems
-    let systems_map = create_memo(move |_| {
-        let events = events_list.get();
-        // log::info!("Processing {} events", events.len());
+    // 1. Persistent State for the Dashboard
+    // We maintain a map of (sys_id, comp_id) -> (Heartbeat, Map<MsgName, Event>)
+    // This accumulates data and never drops it, solving the flickering issue.
+    // The inner map stores the LATEST event for each message type.
+    type SystemState = BTreeMap<(i64, i64), (Option<DecodedEvent>, BTreeMap<String, DecodedEvent>)>;
+    let (state, set_state) = create_signal::<SystemState>(BTreeMap::new());
 
-        let mut sys_map: BTreeMap<
-            (i64, i64),
-            (Option<DecodedEvent>, BTreeMap<String, DecodedEvent>),
-        > = BTreeMap::new();
-
-        for e in &events {
-            if e.protocol != "MAVLink" {
-                continue;
+    // Effect: Sync events to state
+    // We scan the entire event buffer (max 2500) on update. 
+    // This is cheap (O(N) * log(M)) and much faster than rebuilding the map (O(N) allocs).
+    // We iterate forward (Old -> New) to naturally let newer events overwrite older ones.
+    create_effect(move |_| {
+        events_list.with(|events| {
+            if events.is_empty() {
+                return;
             }
+            // debug log
+            web_sys::console::log_1(&format!("View Processing {} events", events.len()).into());
 
-            let mut sys_id = 0;
-            let mut comp_id = 0;
-            for (k, v) in &e.fields {
-                if k == "sys_id" {
-                    if let core_types::Value::I64(val) = v {
-                        sys_id = *val;
+            set_state.update(|map| {
+                for e in events {
+                    if e.protocol != "MAVLink" {
+                        continue;
                     }
-                } else if k == "comp_id" {
-                    if let core_types::Value::I64(val) = v {
-                        comp_id = *val;
+
+                    let mut sys_id = 0;
+                    let mut comp_id = 0;
+                    for (k, v) in &e.fields {
+                        if k == "sys_id" {
+                            if let core_types::Value::I64(val) = v {
+                                sys_id = *val;
+                            }
+                        } else if k == "comp_id" {
+                            if let core_types::Value::I64(val) = v {
+                                comp_id = *val;
+                            }
+                        }
+                    }
+
+                    let entry = map
+                        .entry((sys_id, comp_id))
+                        .or_insert((None, BTreeMap::new()));
+
+                    if e.summary == "HEARTBEAT" {
+                        // Forward iteration: Newer overwrites older automatically if we just set it.
+                        // But we verify timestamps just to be safe against buffer weirdness.
+                        if let Some(existing) = &entry.0 {
+                            if e.timestamp_us >= existing.timestamp_us {
+                                entry.0 = Some(e.clone());
+                            }
+                        } else {
+                            entry.0 = Some(e.clone());
+                        }
+                    } else {
+                        // Standard Message
+                        match entry.1.get(e.summary.as_ref()) {
+                            Some(existing) => {
+                                if e.timestamp_us >= existing.timestamp_us {
+                                    entry.1.insert(e.summary.to_string(), e.clone());
+                                }
+                            },
+                            None => {
+                                entry.1.insert(e.summary.to_string(), e.clone());
+                            }
+                        }
                     }
                 }
-            }
-
-            let entry = sys_map
-                .entry((sys_id, comp_id))
-                .or_insert((None, BTreeMap::new()));
-
-            if e.summary == "HEARTBEAT" {
-                entry.0 = Some(e.clone());
-            } else {
-                entry.1.insert(e.summary.to_string(), e.clone());
-            }
-        }
-        sys_map
+            });
+        });
     });
+
+    // 2. Systems Map Helper (Read Access)
+    let systems_map = state;
 
     // 2. Derive the list of Keys (stable identifiers)
     // This allows the <For> to only create rows when new systems appear, not on every update.

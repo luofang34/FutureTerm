@@ -129,9 +129,11 @@ pub fn App() -> impl IntoView {
                             if !events.is_empty() {
                                 set_events_list.update(|list| {
                                     list.extend(events);
-                                    // Cap at 2000 events to keep memory sane
-                                    if list.len() > 2000 {
-                                        let split = list.len() - 2000;
+                                    // Cap at 2500 events to ensure we don't drop high-freq MAVLink packets
+                                    // before the View effect can process them.
+                                    // 500 was too aggressive for 50Hz streams.
+                                    if list.len() > 2500 {
+                                        let split = list.len() - 2500;
                                         list.drain(0..split);
                                     }
                                 });
