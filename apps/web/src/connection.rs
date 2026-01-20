@@ -805,17 +805,12 @@ impl ConnectionManager {
 
             // IF NO DATA & WAKEUP REQUESTED -> Send Wakeup
             if !received_passive && buffer.is_empty() && send_wakeup {
-                // web_sys::console::log_1(&"DEBUG: Passive found nothing. Sending Wakeup.".into());
                 let _ = t.write(b"\r").await;
-            } else if !buffer.is_empty() {
-                // web_sys::console::log_1(&format!("DEBUG: Passive found {} bytes!", buffer.len()).into());
             }
 
             // Continue Reading (Active Phase or Extended Passive)
             let start_loop = js_sys::Date::now();
             let mut max_time = 50.0;
-
-            // web_sys::console::log_1(&format!("DEBUG: Probe Start (Rate: {})", rate).into());
 
             while js_sys::Date::now() - start_loop < max_time {
                 if let Ok((chunk, _)) = t.read_chunk().await {
@@ -832,11 +827,9 @@ impl ConnectionManager {
                         }
                     }
                 } else {
-                    // web_sys::console::log_1(&"DEBUG: Probe Read Failed".into());
                     break;
                 }
             }
-            // web_sys::console::log_1(&format!("DEBUG: Probe Got {} bytes", buffer.len()).into());
 
             let _ = t.close().await;
 
@@ -1133,13 +1126,6 @@ impl ConnectionManager {
 
                                 // Manager Connect (Handles open, loop, worker)
                                 // Auto-reconnect not needed here, handled by manager internal state or explicit loop
-                                web_sys::console::log_1(
-                                    &format!(
-                                        "DEBUG: Auto-Connect. Pref: {}, Last: {}, Target: {}",
-                                        user_pref_baud, last_known_baud, target_baud
-                                    )
-                                    .into(),
-                                );
 
                                 spawn_local(async move {
                                     // FORCE RESET: Close any stale handles (even if we think we are disconnected, the browser might hold the lock)
