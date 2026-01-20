@@ -1,4 +1,4 @@
-use core_types::RawEvent;
+use core_types::{RawEvent, SelectionRange, SelectionSource};
 use leptos::*;
 use wasm_bindgen::closure::Closure;
 use wasm_bindgen::JsCast;
@@ -35,6 +35,8 @@ pub fn HexView(
     raw_log: ReadSignal<Vec<RawEvent>>,
     cursor: ReadSignal<usize>,
     set_cursor: WriteSignal<usize>,
+    #[prop(optional)] global_selection: Option<ReadSignal<Option<SelectionRange>>>,
+    #[prop(optional)] set_global_selection: Option<WriteSignal<Option<SelectionRange>>>,
 ) -> impl IntoView {
     let container_ref = create_node_ref::<html::Div>();
 
@@ -42,6 +44,10 @@ pub fn HexView(
     let (bytes_per_row, set_bytes_per_row) = create_signal(16usize);
     let (container_height, set_container_height) = create_signal(600.0); // Default height
     let (scroll_top, set_scroll_top) = create_signal(0.0);
+
+    // Local selection state (during drag operation)
+    let (local_selection_start, set_local_selection_start) = create_signal::<Option<usize>>(None);
+    let (is_selecting, set_is_selecting) = create_signal(false);
 
     // Row Height Constant (Estimate based on CSS)
     const ROW_HEIGHT: f64 = 28.0;
@@ -186,10 +192,28 @@ pub fn HexView(
         }
     });
 
+    // Auto-scroll to selection when it comes from another view
+    create_effect(move |_| {
+        if let Some(global_sel) = global_selection {
+            if let Some(range) = global_sel.get() {
+                if range.source_view != SelectionSource::HexView {
+                    // Selection came from another view, scroll to it
+                    let bpr = bytes_per_row.get();
+                    let target_row = range.start_byte_offset / bpr;
+                    let target_scroll = (target_row as f64) * ROW_HEIGHT;
+
+                    if let Some(div) = container_ref.get() {
+                        div.set_scroll_top(target_scroll as i32);
+                    }
+                }
+            }
+        }
+    });
+
     // Grid Template: Offset | Hex Data | Separator | ASCII
+    // Use max-content for ASCII column to prevent layout issues with partial rows
     let grid_template = create_memo(move |_| {
-        let bpr = bytes_per_row.get();
-        format!("8ch max-content 1px {}ch", bpr)
+        "8ch max-content 1px max-content".to_string()
     });
 
     view! {
@@ -305,17 +329,87 @@ pub fn HexView(
                                         let current_groups = groups.len();
 
                                         // 1. Render actual data groups
-                                        let mut views = groups.into_iter().enumerate().map(|(idx, group)| {
-                                            let hex_bytes: Vec<String> = group.iter().map(|b| format!("{:02X}", b)).collect();
-                                            // Pad internal bytes if chunk < 4 (very rare, usually at end)
-                                            let padded: Vec<String> = (0..4).map(|i| hex_bytes.get(i).cloned().unwrap_or_else(|| "  ".to_string())).collect();
-                                            let is_sep = idx < total_groups - 1;
+                                        let mut views = groups.into_iter().enumerate().map(|(group_idx, group)| {
+                                            let is_sep = group_idx < total_groups - 1;
+
+                                            // Render each byte with selection support
+                                            let byte_views: Vec<_> = (0..4).map(|byte_idx| {
+                                                let byte_offset = offset + (group_idx * 4) + byte_idx;
+
+                                                // Get the hex string for this byte (or padding)
+                                                let hex_str = group.get(byte_idx)
+                                                    .map(|b| format!("{:02X}", b))
+                                                    .unwrap_or_else(|| "  ".to_string());
+
+                                                // Check if this byte is selected
+                                                let is_selected = move || {
+                                                    if let Some(global_sel) = global_selection {
+                                                        if let Some(range) = global_sel.get() {
+                                                            return range.contains_offset(byte_offset);
+                                                        }
+                                                    }
+
+                                                    // Check local selection during drag
+                                                    if let Some(start) = local_selection_start.get() {
+                                                        if is_selecting.get() {
+                                                            // Get current mouse position from a potential end point
+                                                            // For now, we'll just highlight from start onwards during drag
+                                                            return byte_offset >= start;
+                                                        }
+                                                    }
+
+                                                    false
+                                                };
+
+                                                view! {
+                                                    <span
+                                                        style=move || format!(
+                                                            "flex: 1; text-align: center; cursor: pointer; user-select: none; {}",
+                                                            if is_selected() {
+                                                                "background-color: rgba(86, 156, 214, 0.3); border-radius: 2px;"
+                                                            } else {
+                                                                ""
+                                                            }
+                                                        )
+                                                        on:mousedown=move |ev| {
+                                                            ev.prevent_default();
+                                                            set_local_selection_start.set(Some(byte_offset));
+                                                            set_is_selecting.set(true);
+                                                        }
+                                                        on:mouseenter=move |_| {
+                                                            if is_selecting.get() && local_selection_start.get().is_some() {
+                                                                // Update selection range during drag
+                                                                // The highlighting will update reactively
+                                                            }
+                                                        }
+                                                        on:mouseup=move |_| {
+                                                            if let Some(start) = local_selection_start.get() {
+                                                                set_is_selecting.set(false);
+
+                                                                // Commit selection to global state
+                                                                if let Some(set_global_sel) = set_global_selection {
+                                                                    let range = SelectionRange::new(
+                                                                        start.min(byte_offset),
+                                                                        start.max(byte_offset) + 1,
+                                                                        0, // TODO: lookup timestamp from raw_log
+                                                                        0,
+                                                                        SelectionSource::HexView,
+                                                                    );
+                                                                    set_global_sel.set(Some(range));
+                                                                }
+                                                            }
+                                                        }
+                                                    >
+                                                        {hex_str}
+                                                    </span>
+                                                }
+                                            }).collect();
 
                                             view! {
                                                 <div style=format!("color: #ce9178; display: inline-flex; gap: 6px; min-width: 94px; justify-content: start; {}",
                                                     if is_sep { "padding-right: 8px; border-right: 1px solid rgba(255, 255, 255, 0.1);" } else { "" }
                                                 )>
-                                                    {padded.into_iter().map(|s| view! { <span style="flex: 1; text-align: center;">{s}</span> }).collect::<Vec<_>>()}
+                                                    {byte_views}
                                                 </div>
                                             }
                                         }).collect::<Vec<_>>();

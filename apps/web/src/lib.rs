@@ -1,5 +1,5 @@
 use crate::protocol::WorkerToUi;
-use core_types::{DecodedEvent, RawEvent};
+use core_types::{DecodedEvent, RawEvent, SelectionRange};
 use leptos::*;
 use wasm_bindgen::prelude::*;
 use wasm_bindgen::JsCast;
@@ -15,6 +15,7 @@ mod hex_view;
 pub mod protocol;
 pub mod worker_logic;
 mod xterm;
+mod terminal_metadata;
 
 pub mod mavlink_view;
 // use hex_view::HexView; // Conditionally used? No, actually used in view! down below?
@@ -92,6 +93,15 @@ pub fn App() -> impl IntoView {
     let (raw_log, set_raw_log) = create_signal::<Vec<RawEvent>>(Vec::new());
     let (hex_cursor, set_hex_cursor) = create_signal(0usize);
 
+    // ========== Cross-View Selection Sync ==========
+    // Global selection state for synchronizing selections across Terminal, Hex, and future views
+    let (global_selection, set_global_selection) =
+        create_signal::<Option<SelectionRange>>(None);
+
+    // Terminal metadata for mapping between Terminal text and raw_log byte positions
+    let (_terminal_metadata, set_terminal_metadata) =
+        create_signal(terminal_metadata::TerminalMetadata::new());
+
     // Legacy signals removed/replaced by manager:
     // status, connected, transport, active_port, is_reconfiguring
 
@@ -162,7 +172,11 @@ pub fn App() -> impl IntoView {
 
                                         if trimmed > 0 {
                                             log.drain(0..trimmed);
-                                            // TODO: Adjust view cursors when implemented
+
+                                            // Adjust terminal_metadata for the trimmed bytes
+                                            set_terminal_metadata.update(|meta| {
+                                                meta.adjust_for_log_trim(bytes_removed);
+                                            });
                                         }
                                     }
                                 });
@@ -171,7 +185,7 @@ pub fn App() -> impl IntoView {
                             // Terminal direct write (legacy, for backward compatibility)
                             if let Some(term) = term_handle.get_untracked() {
                                 if view_mode.get_untracked() == ViewMode::Terminal {
-                                    for f in frames {
+                                    for f in &frames {
                                         if !f.bytes.is_empty() {
                                             if let Ok(text) = decoder
                                                 .decode_with_u8_array_and_options(&f.bytes, &opts)
@@ -179,6 +193,15 @@ pub fn App() -> impl IntoView {
                                                 let text: String = text;
                                                 if !text.is_empty() {
                                                     term.write(&text);
+
+                                                    // Record metadata for cross-view selection sync
+                                                    set_terminal_metadata.update(|meta| {
+                                                        meta.record_write(
+                                                            f.bytes.len(),
+                                                            &text,
+                                                            f.timestamp_us,
+                                                        );
+                                                    });
                                                 }
                                             }
                                         }
@@ -622,7 +645,13 @@ pub fn App() -> impl IntoView {
                             if manager.decoder_id.get() == "mavlink" {
                                 view! { <mavlink_view::MavlinkView events_list=events_list /> }
                             } else {
-                                view! { <hex_view::HexView raw_log=raw_log cursor=hex_cursor set_cursor=set_hex_cursor /> }
+                                view! { <hex_view::HexView
+                                    raw_log=raw_log
+                                    cursor=hex_cursor
+                                    set_cursor=set_hex_cursor
+                                    global_selection=global_selection
+                                    set_global_selection=set_global_selection
+                                /> }
                             }
                         }}
                     </Show>

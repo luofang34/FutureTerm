@@ -25,6 +25,22 @@ extern "C" {
     #[wasm_bindgen(method, js_name = onData)]
     pub fn on_data(this: &Terminal, callback: js_sys::Function);
 
+    // Selection API
+    #[wasm_bindgen(method, js_name = onSelectionChange)]
+    pub fn on_selection_change(this: &Terminal, callback: js_sys::Function);
+
+    #[wasm_bindgen(method, js_name = getSelection)]
+    pub fn get_selection(this: &Terminal) -> String;
+
+    #[wasm_bindgen(method, js_name = getSelectionPosition)]
+    pub fn get_selection_position(this: &Terminal) -> JsValue;
+
+    #[wasm_bindgen(method, js_name = clearSelection)]
+    pub fn clear_selection(this: &Terminal);
+
+    #[wasm_bindgen(method, js_name = hasSelection)]
+    pub fn has_selection(this: &Terminal) -> bool;
+
     // CHANGED: Accept JsValue for addon to support manual instantiation
     #[wasm_bindgen(method, js_name = loadAddon)]
     pub fn load_addon(this: &Terminal, addon: &JsValue);
@@ -67,6 +83,32 @@ impl TerminalHandle {
     }
     pub fn on_data(&self, callback: js_sys::Function) {
         self.0.on_data(callback);
+    }
+
+    // Selection API wrappers (reserved for future cross-view selection sync)
+    #[allow(dead_code)]
+    pub fn on_selection_change(&self, callback: js_sys::Function) {
+        self.0.on_selection_change(callback);
+    }
+
+    #[allow(dead_code)]
+    pub fn get_selection(&self) -> String {
+        self.0.get_selection()
+    }
+
+    #[allow(dead_code)]
+    pub fn get_selection_position(&self) -> JsValue {
+        self.0.get_selection_position()
+    }
+
+    #[allow(dead_code)]
+    pub fn clear_selection(&self) {
+        self.0.clear_selection();
+    }
+
+    #[allow(dead_code)]
+    pub fn has_selection(&self) -> bool {
+        self.0.has_selection()
     }
 }
 
