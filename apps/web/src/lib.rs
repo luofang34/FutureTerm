@@ -48,8 +48,6 @@ pub fn App() -> impl IntoView {
     let status = manager.get_status();
     let connected = manager.get_connected();
 
-
-
     let detected_baud = manager.detected_baud;
     let detected_framing = manager.detected_framing;
 
@@ -71,8 +69,6 @@ pub fn App() -> impl IntoView {
 
     // Legacy signals removed/replaced by manager:
     // status, connected, transport, active_port, is_reconfiguring
-
-
 
     create_effect(move |_| {
         let nav = web_sys::window().unwrap().navigator();

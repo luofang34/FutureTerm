@@ -21,25 +21,41 @@ pub fn MavlinkView(events_list: ReadSignal<Vec<DecodedEvent>>) -> impl IntoView 
     let (state, set_state) = create_signal::<SystemState>(BTreeMap::new());
 
     // Effect: Sync events to state
-    // We scan the entire event buffer (max 2500) on update. 
+    // We scan the entire event buffer (max 2500) on update.
     // This is cheap (O(N) * log(M)) and much faster than rebuilding the map (O(N) allocs).
     // We iterate forward (Old -> New) to naturally let newer events overwrite older ones.
+    // Optimization: Track last processed timestamp to avoid re-scanning old events
+    let (processed_cursor, set_processed_cursor) = create_signal(0u64);
+
+    // Effect: Sync events to state
     create_effect(move |_| {
         events_list.with(|events| {
             if events.is_empty() {
+                // Reset cursor if buffer cleared
+                set_processed_cursor.set(0);
                 return;
             }
-            // debug log
-            // web_sys::console::log_1(&format!("View Processing {} events", events.len()).into());
-            
+
+            let last_ts = processed_cursor.get_untracked();
+            let mut max_ts = last_ts;
+
             set_state.update(|map| {
-                for e in events {
+                // Optimization: Skip events we've already processed
+                // We assume events are appended chronologically.
+                for e in events.iter().skip_while(|e| e.timestamp_us <= last_ts) {
+                    if e.timestamp_us > max_ts {
+                        max_ts = e.timestamp_us;
+                    }
+
                     if e.protocol != "MAVLink" {
                         continue;
                     }
 
+                    // Extract ID cheaply
                     let mut sys_id = 0;
                     let mut comp_id = 0;
+                    // Optimization: Early exit from field scan if both found?
+                    // Fields are few, so full scan is okay, but let's be cleaner.
                     for (k, v) in &e.fields {
                         if k == "sys_id" {
                             if let core_types::Value::I64(val) = v {
@@ -52,35 +68,28 @@ pub fn MavlinkView(events_list: ReadSignal<Vec<DecodedEvent>>) -> impl IntoView 
                         }
                     }
 
+                    // Security: DoS Protection. Cap tracked systems to 50.
+                    if map.len() >= 50 && !map.contains_key(&(sys_id, comp_id)) {
+                        // Drop new systems if we are full to prevent memory explosion
+                        continue;
+                    }
+
                     let entry = map
                         .entry((sys_id, comp_id))
                         .or_insert((None, BTreeMap::new()));
 
                     if e.summary == "HEARTBEAT" {
-                        // Forward iteration: Newer overwrites older automatically if we just set it.
-                        // But we verify timestamps just to be safe against buffer weirdness.
-                        if let Some(existing) = &entry.0 {
-                            if e.timestamp_us >= existing.timestamp_us {
-                                entry.0 = Some(e.clone());
-                            }
-                        } else {
-                            entry.0 = Some(e.clone());
-                        }
+                        entry.0 = Some(e.clone());
                     } else {
                         // Standard Message
-                        match entry.1.get(e.summary.as_ref()) {
-                            Some(existing) => {
-                                if e.timestamp_us >= existing.timestamp_us {
-                                    entry.1.insert(e.summary.to_string(), e.clone());
-                                }
-                            },
-                            None => {
-                                entry.1.insert(e.summary.to_string(), e.clone());
-                            }
-                        }
+                        entry.1.insert(e.summary.to_string(), e.clone());
                     }
                 }
             });
+
+            if max_ts > last_ts {
+                set_processed_cursor.set(max_ts);
+            }
         });
     });
 
@@ -213,11 +222,8 @@ pub fn MavlinkView(events_list: ReadSignal<Vec<DecodedEvent>>) -> impl IntoView 
                                     // Rows
                                     <For
                                         each=move || messages.get()
-                                        // Key MUST include seq to force re-render even if timestamp is identical (batching)
-                                        key=|item| {
-                                            let seq = item.fields.iter().find(|(k, _)| k == "seq").map(|(_, v)| v.to_string()).unwrap_or_default();
-                                            format!("{}-{}-{}", item.summary, item.timestamp_us, seq)
-                                        }
+                                        // Performance: Used Tuple Key (Timestamp, Summary) instead of expensive format!
+                                        key=|item| (item.timestamp_us, item.summary.clone())
                                         children=move |event| {
 
                                             // Extract Seq

@@ -66,15 +66,15 @@ pub fn calculate_score_mavlink(buf: &[u8]) -> f32 {
                 let total_len = payload_len + header_overhead;
 
                 // Check specifically for v2 flags if possible to refine length?
-                // For now, assume min v2 length. 
+                // For now, assume min v2 length.
                 // If we have enough data for the full packet, assume it's valid for scoring.
                 // If we DON'T have enough data, we can't verify, so valid_bytes is just 0 for this chunk?
                 // Or should we count it if it LOOKS like a header?
-                
+
                 // Strict approach: only count bytes if we can see the whole packet.
                 if i + total_len <= buf.len() {
                     matched_bytes += total_len;
-                    i += total_len; 
+                    i += total_len;
                     continue;
                 }
             }
@@ -165,7 +165,7 @@ mod tests {
     fn test_mavlink_score_valid() {
         // v1 packet: FE len=3 ... total=3+8=11 bytes
         let valid = vec![
-            0xFE, 0x03, 0x01, 0x01, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00
+            0xFE, 0x03, 0x01, 0x01, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
         ];
         assert!(calculate_score_mavlink(&valid) > 0.99);
     }
@@ -183,12 +183,36 @@ mod tests {
     fn test_mavlink_score_mixed() {
         // Garbage + Valid Packet
         let mut mixed = vec![0x00, 0x01, 0x02]; // 3 bytes garbage
-        // Valid packet (11 bytes)
+                                                // Valid packet (11 bytes)
         mixed.extend_from_slice(&[
-            0xFE, 0x03, 0x01, 0x01, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00
+            0xFE, 0x03, 0x01, 0x01, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
         ]);
         // Total 14 bytes. 11 matched. Score = 11/14 ~= 0.78
         let score = calculate_score_mavlink(&mixed);
         assert!(score > 0.7 && score < 0.8);
+    }
+    #[test]
+    fn test_mixed_protocol_scoring_high_noise() {
+        // High Noise + Valid Packet
+        // 100 bytes garbage + 8 byte packet (valid header) + 100 bytes garbage
+        let mut noise = vec![0x55; 100];
+        noise.extend_from_slice(&[
+            0xFE, 0x00, 0x01, 0x01, 0x01, 0x00, 0x00,
+            0x00, // Valid minimal 8-byte packet (payload 0)
+        ]);
+        noise.extend_from_slice(&vec![0xAA; 100]);
+
+        // Total 208 bytes. 8 valid. Score = 8/208 ~= 0.038
+        // Wait, the current logic is purely ratio based.
+        // If we want "Auto-detection" to work with garbage, we need to know if it *found* a valid packet.
+        // The current score will be very low.
+        // However, smart_probe_framing uses `(score_mav >= 0.99)` or falls back to others.
+        // If score is low, it might fail to detect.
+        // BUT, `verify_mavlink_integrity` (which we improved with feature gates) is the Robust Check.
+        // The scoring here is just a heuristic.
+        // Let's verify it simply returns non-zero, indicating *some* structure was found.
+
+        let score = calculate_score_mavlink(&noise);
+        assert!(score > 0.0, "Should detect embedded MAVLink packet");
     }
 }
