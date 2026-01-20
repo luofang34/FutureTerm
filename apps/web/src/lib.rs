@@ -1,5 +1,5 @@
 use crate::protocol::WorkerToUi;
-use core_types::DecodedEvent;
+use core_types::{DecodedEvent, RawEvent};
 use leptos::*;
 use wasm_bindgen::prelude::*;
 use wasm_bindgen::JsCast;
@@ -67,6 +67,9 @@ pub fn App() -> impl IntoView {
     // Track parsed events
     let (events_list, set_events_list) = create_signal::<Vec<DecodedEvent>>(Vec::new());
 
+    // Unified raw event log (append-only, survives view switches)
+    let (raw_log, set_raw_log) = create_signal::<Vec<RawEvent>>(Vec::new());
+
     // Legacy signals removed/replaced by manager:
     // status, connected, transport, active_port, is_reconfiguring
 
@@ -108,6 +111,42 @@ pub fn App() -> impl IntoView {
                             }
                         }
                         WorkerToUi::DataBatch { frames, events } => {
+                            // Update unified raw log with frames
+                            if !frames.is_empty() {
+                                set_raw_log.update(|log| {
+                                    // Append new raw events
+                                    for frame in &frames {
+                                        log.push(RawEvent::from_frame(frame));
+                                    }
+
+                                    // Byte-based capping to prevent unbounded memory growth
+                                    const MAX_LOG_BYTES: usize = 10 * 1024 * 1024; // 10 MB
+                                    const MAX_LOG_EVENTS: usize = 10000; // Safety fallback
+
+                                    let total_bytes: usize = log.iter().map(|e| e.byte_size()).sum();
+
+                                    if total_bytes > MAX_LOG_BYTES || log.len() > MAX_LOG_EVENTS {
+                                        // Trim oldest events until under limit
+                                        let mut trimmed = 0;
+                                        let mut bytes_removed = 0;
+
+                                        while (total_bytes - bytes_removed > MAX_LOG_BYTES
+                                            || log.len() - trimmed > MAX_LOG_EVENTS)
+                                            && trimmed < log.len()
+                                        {
+                                            bytes_removed += log[trimmed].byte_size();
+                                            trimmed += 1;
+                                        }
+
+                                        if trimmed > 0 {
+                                            log.drain(0..trimmed);
+                                            // TODO: Adjust view cursors when implemented
+                                        }
+                                    }
+                                });
+                            }
+
+                            // Terminal direct write (legacy, for backward compatibility)
                             if let Some(term) = term_handle.get_untracked() {
                                 if view_mode.get_untracked() == ViewMode::Terminal {
                                     for f in frames {
@@ -124,6 +163,7 @@ pub fn App() -> impl IntoView {
                                     }
                                 }
                             }
+
                             // Update events
                             if !events.is_empty() {
                                 set_events_list.update(|list| {
