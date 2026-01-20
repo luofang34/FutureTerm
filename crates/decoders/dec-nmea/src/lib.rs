@@ -11,25 +11,8 @@ impl NmeaDecoder {
             parser: Nmea::default(),
         }
     }
-}
 
-impl Default for NmeaDecoder {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-impl Decoder for NmeaDecoder {
-    fn ingest(&mut self, frame: &Frame) -> Option<DecodedEvent> {
-        let mut event = DecodedEvent::new(0, "", "");
-        if self.ingest_into(frame, &mut event) {
-            Some(event)
-        } else {
-            None
-        }
-    }
-
-    fn ingest_into(&mut self, frame: &Frame, output: &mut DecodedEvent) -> bool {
+    fn parse_into(&mut self, frame: &Frame, output: &mut DecodedEvent) -> bool {
         // 1. Convert frame bytes to string (NMEA is ASCII)
         let Ok(s) = std::str::from_utf8(&frame.bytes) else {
             return false;
@@ -86,6 +69,23 @@ impl Decoder for NmeaDecoder {
             Err(_e) => false,
         }
     }
+}
+
+impl Default for NmeaDecoder {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl Decoder for NmeaDecoder {
+    fn ingest(&mut self, frame: &Frame, results: &mut Vec<DecodedEvent>) {
+        let mut event = DecodedEvent::new(0, "", "");
+        if self.parse_into(frame, &mut event) {
+            results.push(event);
+        }
+    }
+
+
 
     fn id(&self) -> &'static str {
         "nmea"
@@ -107,7 +107,9 @@ mod tests {
         let raw = b"$GPGGA,092750.000,5321.6802,N,00630.3372,W,1,8,1.03,61.7,M,55.2,M,,*76\r\n";
         let frame = Frame::new_rx(raw.to_vec(), 1000);
 
-        let event = decoder.ingest(&frame).expect("Should parse GPGGA");
+        let mut results = Vec::new();
+        decoder.ingest(&frame, &mut results);
+        let event = results.get(0).expect("Should parse GPGGA");
 
         assert_eq!(event.protocol, "NMEA");
         // Check dynamic fields (simplified check, real usage would check lat/lon values)
@@ -119,7 +121,8 @@ mod tests {
     fn test_nmea_invalid() {
         let mut decoder = NmeaDecoder::new();
         let frame = Frame::new_rx(b"$GPGGA,BadChecksum*FF\r\n".to_vec(), 1000);
-        let event = decoder.ingest(&frame);
-        assert!(event.is_none());
+        let mut results = Vec::new();
+        decoder.ingest(&frame, &mut results);
+        assert!(results.is_empty());
     }
 }

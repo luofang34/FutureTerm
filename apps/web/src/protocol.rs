@@ -15,6 +15,8 @@ pub enum UiToWorker {
     Simulate { duration_ms: u32 },
     // Phase 3: Auto-Baud
     AnalyzeRequest { baud_rate: u32, data: Vec<u8> },
+    StartHeartbeat,
+    StopHeartbeat,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -27,6 +29,9 @@ pub enum WorkerToUi {
     AnalyzeResult {
         baud_rate: u32,
         score: f32,
+    },
+    TxData {
+        data: Vec<u8>,
     },
 }
 

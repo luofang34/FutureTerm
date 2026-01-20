@@ -17,11 +17,11 @@ impl Default for Utf8Decoder {
 }
 
 impl Decoder for Utf8Decoder {
-    fn ingest(&mut self, frame: &Frame) -> Option<DecodedEvent> {
+    fn ingest(&mut self, frame: &Frame, results: &mut Vec<DecodedEvent>) {
         // Simple passthrough: Bytes -> String (lossy)
         let text = String::from_utf8_lossy(&frame.bytes).to_string();
 
-        Some(DecodedEvent::new(frame.timestamp_us, "UTF-8", text))
+        results.push(DecodedEvent::new(frame.timestamp_us, "UTF-8", text));
     }
 
     fn id(&self) -> &'static str {
@@ -43,9 +43,9 @@ mod tests {
         let bytes = vec![0x48, 0x65, 0x6C, 0x6C, 0x6F]; // "Hello"
         let frame = Frame::new_rx(bytes, 1000);
 
-        let event = decoder
-            .ingest(&frame)
-            .expect("Utf8 decoder always succeeds");
+        let mut results = Vec::new();
+        decoder.ingest(&frame, &mut results);
+        let event = results.get(0).expect("Utf8 decoder always succeeds");
 
         assert_eq!(event.protocol, "UTF-8");
         assert_eq!(event.summary, "Hello");
@@ -58,7 +58,9 @@ mod tests {
         let bytes = vec![0x1B, 0x5B, 0x33, 0x31, 0x6D];
         let frame = Frame::new_rx(bytes, 2000);
 
-        let event = decoder.ingest(&frame).expect("Succeeds");
+        let mut results = Vec::new();
+        decoder.ingest(&frame, &mut results);
+        let event = results.get(0).expect("Succeeds");
         assert_eq!(event.summary, "\x1B[31m");
     }
 
@@ -67,9 +69,9 @@ mod tests {
         let mut decoder = Utf8Decoder::new();
         let frame = Frame::new_rx(vec![], 1000);
 
-        let event = decoder
-            .ingest(&frame)
-            .expect("Utf8 decoder always succeeds");
+        let mut results = Vec::new();
+        decoder.ingest(&frame, &mut results);
+        let event = results.get(0).expect("Utf8 decoder always succeeds");
 
         assert_eq!(event.summary, "");
     }
@@ -81,9 +83,9 @@ mod tests {
         let bytes = vec![0xFF, 0xFE, 0x80];
         let frame = Frame::new_rx(bytes, 1000);
 
-        let event = decoder
-            .ingest(&frame)
-            .expect("Utf8 decoder always succeeds (lossy)");
+        let mut results = Vec::new();
+        decoder.ingest(&frame, &mut results);
+        let event = results.get(0).expect("Utf8 decoder always succeeds (lossy)");
 
         // Should contain replacement characters
         assert!(event.summary.contains('\u{FFFD}'));
@@ -96,9 +98,9 @@ mod tests {
         let bytes = "日本語".as_bytes().to_vec();
         let frame = Frame::new_rx(bytes, 1000);
 
-        let event = decoder
-            .ingest(&frame)
-            .expect("Utf8 decoder always succeeds");
+        let mut results = Vec::new();
+        decoder.ingest(&frame, &mut results);
+        let event = results.get(0).expect("Utf8 decoder always succeeds");
 
         assert_eq!(event.summary, "日本語");
     }

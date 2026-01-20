@@ -93,6 +93,18 @@ impl From<usize> for Value {
     }
 }
 
+impl std::fmt::Display for Value {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Value::Null => write!(f, "null"),
+            Value::Bool(b) => write!(f, "{}", b),
+            Value::I64(n) => write!(f, "{}", n),
+            Value::F64(n) => write!(f, "{}", n),
+            Value::String(s) => write!(f, "{}", s),
+        }
+    }
+}
+
 /// A semantic interpretation of a Frame.
 /// Optimized for low allocation frequency.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -148,25 +160,12 @@ impl DecodedEvent {
 /// This is intended to be implemented by plugins (NMEA, MAVLink, etc.).
 pub trait Decoder: Send {
     /// Attempt to parse a frame.
-    /// Returns None if the frame does not match the protocol validation.
+    /// Appends generated events to the `results` vector.
     ///
     /// # Arguments
     /// * `frame` - The input frame (contains bytes, timestamp, channel).
-    fn ingest(&mut self, frame: &Frame) -> Option<DecodedEvent>;
-
-    /// Attempt to parse a frame into an existing DecodedEvent buffer.
-    /// Returns true if successful, false otherwise.
-    ///
-    /// Detailed Instructions:
-    /// Implementations should call `output.clear()` before populating.
-    fn ingest_into(&mut self, frame: &Frame, output: &mut DecodedEvent) -> bool {
-        if let Some(event) = self.ingest(frame) {
-            *output = event;
-            true
-        } else {
-            false
-        }
-    }
+    /// * `results` - Mutable vector to append decoded events to.
+    fn ingest(&mut self, frame: &Frame, results: &mut Vec<DecodedEvent>);
 
     /// Get the unique name of this decoder (e.g., "NMEA", "Hex").
     fn id(&self) -> &'static str;

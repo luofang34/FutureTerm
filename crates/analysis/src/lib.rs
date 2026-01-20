@@ -47,6 +47,26 @@ pub fn calculate_score_7e1(buf: &[u8]) -> f32 {
     }
 }
 
+/// Calculates the likelihood of MAVLink data (v1 0xFE or v2 0xFD).
+/// Returns 1.0 if magic bytes are found, 0.0 otherwise.
+pub fn calculate_score_mavlink(buf: &[u8]) -> f32 {
+    let mut magic_count = 0;
+    for &b in buf {
+        if b == 0xFE || b == 0xFD {
+            magic_count += 1;
+        }
+    }
+    // If > 5% of bytes are magic (unlikely in random noise unless stream is pure MAVLink),
+    // OR if we have at least 1 magic byte in a small buffer.
+    // Better: simply presence of valid magic byte at expected interval?
+    // For now, heuristic: finding *any* 0xFE/0xFD is a strong hint.
+    if magic_count > 0 {
+        1.0 
+    } else {
+        0.0
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
