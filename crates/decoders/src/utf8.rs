@@ -85,7 +85,9 @@ mod tests {
 
         let mut results = Vec::new();
         decoder.ingest(&frame, &mut results);
-        let event = results.get(0).expect("Utf8 decoder always succeeds (lossy)");
+        let event = results
+            .get(0)
+            .expect("Utf8 decoder always succeeds (lossy)");
 
         // Should contain replacement characters
         assert!(event.summary.contains('\u{FFFD}'));

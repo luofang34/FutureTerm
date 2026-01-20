@@ -1,12 +1,9 @@
-use leptos::*;
 use core_types::DecodedEvent;
+use leptos::*;
 use std::collections::BTreeMap;
 
 #[component]
-pub fn MavlinkView(
-    events_list: ReadSignal<Vec<DecodedEvent>>,
-) -> impl IntoView {
-    
+pub fn MavlinkView(events_list: ReadSignal<Vec<DecodedEvent>>) -> impl IntoView {
     // Data structures for the view
     #[derive(Clone, PartialEq, Debug)]
     struct SystemGroup {
@@ -22,20 +19,34 @@ pub fn MavlinkView(
         let events = events_list.get();
         // log::info!("Processing {} events", events.len());
 
-        let mut sys_map: BTreeMap<(i64, i64), (Option<DecodedEvent>, BTreeMap<String, DecodedEvent>)> = BTreeMap::new();
-        
+        let mut sys_map: BTreeMap<
+            (i64, i64),
+            (Option<DecodedEvent>, BTreeMap<String, DecodedEvent>),
+        > = BTreeMap::new();
+
         for e in &events {
-            if e.protocol != "MAVLink" { continue; }
-            
+            if e.protocol != "MAVLink" {
+                continue;
+            }
+
             let mut sys_id = 0;
             let mut comp_id = 0;
             for (k, v) in &e.fields {
-                if k == "sys_id" { if let core_types::Value::I64(val) = v { sys_id = *val; } }
-                else if k == "comp_id" { if let core_types::Value::I64(val) = v { comp_id = *val; } }
+                if k == "sys_id" {
+                    if let core_types::Value::I64(val) = v {
+                        sys_id = *val;
+                    }
+                } else if k == "comp_id" {
+                    if let core_types::Value::I64(val) = v {
+                        comp_id = *val;
+                    }
+                }
             }
-            
-            let entry = sys_map.entry((sys_id, comp_id)).or_insert((None, BTreeMap::new()));
-            
+
+            let entry = sys_map
+                .entry((sys_id, comp_id))
+                .or_insert((None, BTreeMap::new()));
+
             if e.summary == "HEARTBEAT" {
                 entry.0 = Some(e.clone());
             } else {
@@ -47,9 +58,8 @@ pub fn MavlinkView(
 
     // 2. Derive the list of Keys (stable identifiers)
     // This allows the <For> to only create rows when new systems appear, not on every update.
-    let system_keys = create_memo(move |_| {
-        systems_map.with(|m| m.keys().cloned().collect::<Vec<_>>())
-    });
+    let system_keys =
+        create_memo(move |_| systems_map.with(|m| m.keys().cloned().collect::<Vec<_>>()));
 
     // CSS
     let style = r#"
@@ -90,7 +100,7 @@ pub fn MavlinkView(
                         // Create a reactive slice for this specific system
                         let system_data = create_memo(move |_| {
                             systems_map.with(|m| {
-                                m.get(&key).map(|(hb, _)| hb.clone()).flatten()
+                                m.get(&key).and_then(|(hb, _)| hb.clone())
                             })
                         });
 
@@ -109,7 +119,7 @@ pub fn MavlinkView(
                                             .replace(",", "\n")
                                             .replace(" ", "\n")
                                      };
-                                     
+
                                      let render_val = move |k: &str| {
                                          let s = get_str(k);
                                          s.split('\n')
@@ -175,13 +185,13 @@ pub fn MavlinkView(
                                         // Key MUST include timestamp to force re-render/flash on update
                                         key=|item| format!("{}-{}", item.summary, item.timestamp_us)
                                         children=move |event| {
-                                            
+
                                             // Extract Seq
                                             let seq_str = event.fields.iter()
                                                 .find(|(k, _)| k == "seq")
                                                 .map(|(_, v)| v.to_string())
                                                 .unwrap_or_default();
-                                                
+
                                             // Summary without meta fields
                                             let summary = event.fields.iter()
                                                 .filter(|(k, _)| k != "sys_id" && k != "comp_id" && k != "seq" && k != "version")
@@ -189,9 +199,9 @@ pub fn MavlinkView(
                                                 .map(|(k, v)| format!("{}:{}", k, v))
                                                 .collect::<Vec<_>>()
                                                 .join("  ");
-                                                
+
                                             let ts = event.timestamp_us;
-                                            
+
                                             view! {
                                                 <tr class="msg-row">
                                                     <td class="msg-cell">

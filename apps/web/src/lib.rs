@@ -17,17 +17,16 @@ pub mod worker_logic;
 mod xterm;
 
 pub mod mavlink_view;
-// use hex_view::HexView; // Conditionally used? No, actually used in view! down below? 
+// use hex_view::HexView; // Conditionally used? No, actually used in view! down below?
 // Wait, warning said it was unused.
 // Let's check where it's used.
 // view! { ... <HexView ...> }
-// If it is used in view!, it shouldn't be unused. 
+// If it is used in view!, it shouldn't be unused.
 // Maybe because it's inside a `move ||` block or feature gated?
 // Actually, `MavlinkView` and `HexView` were flagged unused.
 // This implies the macro expansion might hide usage or they are genuinely not used because I replaced them?
 // I see `<MavlinkView .../>` in the code I edited earlier.
 // Let's suppress warning for now to be safe or just ignore it if build passes.
-
 
 #[derive(Clone, Copy, PartialEq)]
 enum ViewMode {
@@ -79,7 +78,6 @@ pub fn App() -> impl IntoView {
         }
     });
 
-
     // Worker Logic
     let manager_worker_init = manager.clone();
     create_effect(move |_| {
@@ -114,18 +112,18 @@ pub fn App() -> impl IntoView {
                                 if view_mode.get_untracked() == ViewMode::Terminal {
                                     for f in frames {
                                         if !f.bytes.is_empty() {
-                                        if let Ok(text) = decoder
-                                            .decode_with_u8_array_and_options(&f.bytes, &opts)
-                                        {
-                                            let text: String = text;
-                                            if !text.is_empty() {
-                                                term.write(&text);
+                                            if let Ok(text) = decoder
+                                                .decode_with_u8_array_and_options(&f.bytes, &opts)
+                                            {
+                                                let text: String = text;
+                                                if !text.is_empty() {
+                                                    term.write(&text);
+                                                }
                                             }
                                         }
                                     }
                                 }
                             }
-                        }
                             // Update events
                             // Update events
                             if !events.is_empty() {
@@ -337,6 +335,18 @@ pub fn App() -> impl IntoView {
                 // Pass `b` and `f` directly. If b=0, Manager detects. If f=Auto, Manager probes.
                 manager_r.reconfigure(b, &f).await;
             });
+        }
+    });
+
+    // Auto-Switch View to MAVLink Dashboard
+    create_effect(move |_| {
+        let dec = manager.decoder_id.get();
+        if dec == "mavlink" && view_mode.get_untracked() != ViewMode::Hex {
+            set_view_mode.set(ViewMode::Hex);
+            // Verify events list is clean or let it persist?
+            // Usually good to clear if we just switched context, but maybe we want history.
+            // Let's clear to be safe and avoid confusing Hex dump with MAVLink table initially
+            set_events_list.set(Vec::new());
         }
     });
 

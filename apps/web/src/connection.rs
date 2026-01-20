@@ -153,8 +153,9 @@ impl ConnectionManager {
         *self.is_connecting_internal.borrow_mut() = true;
 
         let result = if baud > 0 && framing == "Auto" {
-            let (detect_framing, initial_buf, proto) = self.smart_probe_framing(port.clone(), baud).await;
-            
+            let (detect_framing, initial_buf, proto) =
+                self.smart_probe_framing(port.clone(), baud).await;
+
             if let Some(p) = proto {
                 self.set_decoder(p);
             }
@@ -305,7 +306,7 @@ impl ConnectionManager {
             }
 
             if let Some(p) = proto {
-                 self.set_decoder(p);
+                self.set_decoder(p);
             }
 
             match self
@@ -448,34 +449,34 @@ impl ConnectionManager {
     }
     pub fn set_framer(&self, id: String) {
         if let Some(w) = self.worker.get_untracked() {
-             let msg = UiToWorker::SetFramer { id: id.clone() };
-             if let Ok(cmd_val) = serde_wasm_bindgen::to_value(&msg) {
-                 let _ = w.post_message(&cmd_val);
-             }
+            let msg = UiToWorker::SetFramer { id: id.clone() };
+            if let Ok(cmd_val) = serde_wasm_bindgen::to_value(&msg) {
+                let _ = w.post_message(&cmd_val);
+            }
         }
     }
 
     pub fn set_decoder(&self, id: String) {
         self.set_decoder_id.set(id.clone());
         if let Some(w) = self.worker.get_untracked() {
-             let msg = UiToWorker::SetDecoder { id: id.clone() };
-             if let Ok(cmd_val) = serde_wasm_bindgen::to_value(&msg) {
-                 let _ = w.post_message(&cmd_val);
-             }
+            let msg = UiToWorker::SetDecoder { id: id.clone() };
+            if let Ok(cmd_val) = serde_wasm_bindgen::to_value(&msg) {
+                let _ = w.post_message(&cmd_val);
+            }
 
-             // Auto-Start Heartbeat for MAVLink
-             if id == "mavlink" {
-                 let msg_hb = UiToWorker::StartHeartbeat;
-                 if let Ok(val) = serde_wasm_bindgen::to_value(&msg_hb) {
-                     let _ = w.post_message(&val);
-                 }
-                 web_sys::console::log_1(&"MAVLink Heartbeat Started".into());
-             } else {
-                 let msg_hb = UiToWorker::StopHeartbeat;
-                 if let Ok(val) = serde_wasm_bindgen::to_value(&msg_hb) {
-                     let _ = w.post_message(&val);
-                 }
-             }
+            // Auto-Start Heartbeat for MAVLink
+            if id == "mavlink" {
+                let msg_hb = UiToWorker::StartHeartbeat;
+                if let Ok(val) = serde_wasm_bindgen::to_value(&msg_hb) {
+                    let _ = w.post_message(&val);
+                }
+                web_sys::console::log_1(&"MAVLink Heartbeat Started".into());
+            } else {
+                let msg_hb = UiToWorker::StopHeartbeat;
+                if let Ok(val) = serde_wasm_bindgen::to_value(&msg_hb) {
+                    let _ = w.post_message(&val);
+                }
+            }
         }
     }
 
@@ -590,7 +591,7 @@ impl ConnectionManager {
         current_framing: &str,
     ) -> (u32, String, Vec<u8>, Option<String>) {
         let baud_candidates = vec![
-            115200, 57600, 921600, 460800, 230400, 38400, 19200, 9600, 1000000, 1500000, 2000000,
+            115200, 1500000, 1000000, 2000000, 921600, 57600, 460800, 230400, 38400, 19200, 9600,
         ];
         let mut best_score = 0.0;
         let mut best_rate = 115200;
@@ -633,19 +634,38 @@ impl ConnectionManager {
             web_sys::console::log_1(
                 &format!(
                     "AUTO: Rate {} => 8N1: {:.4}, 7E1: {:.4}, MAV: {:.4} (Size: {})",
-                    rate, score_8n1, score_7e1, score_mav, buffer.len()
+                    rate,
+                    score_8n1,
+                    score_7e1,
+                    score_mav,
+                    buffer.len()
                 )
                 .into(),
             );
 
-            // MAVLink Priority
+            // MAVLink Priority Check (Robust)
+            if self.verify_mavlink_integrity(&buffer) {
+                best_score = 1.0;
+                best_rate = rate;
+                best_framing = "8N1".to_string(); // MAVLink is 8N1
+                best_buffer = buffer.clone();
+                best_proto = Some("mavlink".to_string());
+                web_sys::console::log_1(
+                    &"AUTO: MAVLink Verified (Magic+Parse)! Stopping probe.".into(),
+                );
+                break 'outer;
+            }
+
+            // Fallback to statistical score if verification inconclusive but score high
             if score_mav >= 0.99 {
                 best_score = 1.0;
                 best_rate = rate;
                 best_framing = "8N1".to_string(); // MAVLink is 8N1
                 best_buffer = buffer.clone();
                 best_proto = Some("mavlink".to_string());
-                web_sys::console::log_1(&"AUTO: MAVLink Detected! Stopping probe.".into());
+                web_sys::console::log_1(
+                    &"AUTO: MAVLink Detected (Statistical). Stopping probe.".into(),
+                );
                 break 'outer;
             }
 
@@ -671,7 +691,18 @@ impl ConnectionManager {
                 break 'outer;
             }
 
-            if best_score > 0.95 {
+            // High-Speed Optimization: Accept lower confidence for >= 1M baud
+            // reasoning: High speed signals are sparse. If we see one, it's likely the right one.
+            let threshold = if best_rate >= 1000000 { 0.85 } else { 0.98 };
+
+            if best_score > threshold {
+                web_sys::console::log_1(
+                    &format!(
+                        "AUTO: Early Break at {} (Score: {:.2} > {})",
+                        best_rate, best_score, threshold
+                    )
+                    .into(),
+                );
                 *self.last_auto_baud.borrow_mut() = Some(best_rate); // SAVE CACHE
                 break 'outer;
             }
@@ -753,21 +784,36 @@ impl ConnectionManager {
         };
 
         if success {
-            if send_wakeup {
-                let _ = t.write(b"\r").await;
-            } else {
-                 // Pre-flush: Read any pending garbage for 20ms
-                 let start_flush = js_sys::Date::now();
-                 while js_sys::Date::now() - start_flush < 20.0 {
-                     if let Ok((_c, _)) = t.read_chunk().await {
-                         // drop
-                     } else { break; }
-                 }
+            // PASSIVE FIRST: Listen for 100ms
+            let start_passive = js_sys::Date::now();
+            let mut received_passive = false;
+            while js_sys::Date::now() - start_passive < 100.0 {
+                if let Ok((chunk, _)) = t.read_chunk().await {
+                    if !chunk.is_empty() {
+                        buffer.extend_from_slice(&chunk);
+                        received_passive = true;
+                    }
+                } else {
+                    break;
+                }
+                // Small breaks done by read_chunk internally usually
+                if received_passive {
+                    break;
+                }
             }
 
+            // IF NO DATA & WAKEUP REQUESTED -> Send Wakeup
+            if !received_passive && buffer.is_empty() && send_wakeup {
+                // web_sys::console::log_1(&"DEBUG: Passive found nothing. Sending Wakeup.".into());
+                let _ = t.write(b"\r").await;
+            } else if !buffer.is_empty() {
+                // web_sys::console::log_1(&format!("DEBUG: Passive found {} bytes!", buffer.len()).into());
+            }
+
+            // Continue Reading (Active Phase or Extended Passive)
             let start_loop = js_sys::Date::now();
             let mut max_time = 50.0;
-            
+
             // web_sys::console::log_1(&format!("DEBUG: Probe Start (Rate: {})", rate).into());
 
             while js_sys::Date::now() - start_loop < max_time {
@@ -785,8 +831,8 @@ impl ConnectionManager {
                         }
                     }
                 } else {
-                     // web_sys::console::log_1(&"DEBUG: Probe Read Failed".into());
-                     break;
+                    // web_sys::console::log_1(&"DEBUG: Probe Read Failed".into());
+                    break;
                 }
             }
             // web_sys::console::log_1(&format!("DEBUG: Probe Got {} bytes", buffer.len()).into());
@@ -804,6 +850,59 @@ impl ConnectionManager {
         buffer
     }
 
+    // Verify MAVLink Integrity (Magic Byte + Parse Test)
+    fn verify_mavlink_integrity(&self, buffer: &[u8]) -> bool {
+        // 1. Quick Magic Byte Scan
+        let mut reader = buffer;
+        loop {
+            let magic_idx = reader.iter().position(|&b| b == 0xFE || b == 0xFD);
+            if let Some(idx) = magic_idx {
+                // Advance reader to magic
+                if idx + 1 >= reader.len() {
+                    return false;
+                }
+                let magic = reader[idx];
+                // Make sure we have AT LEAST enough for a minimal valid header/payload
+                // v1 min: 8 + 0 = 8. v2 min: 12 + 0 = 12.
+                let min_packet_size = if magic == 0xFE { 8 } else { 12 };
+
+                if idx + min_packet_size > reader.len() {
+                    return false;
+                }
+
+                let sub_slice = &reader[idx..];
+
+                // Try Parse
+                let mut try_reader = sub_slice;
+                let res = if magic == 0xFE {
+                    mavlink::read_v1_msg::<mavlink::common::MavMessage, _>(&mut try_reader)
+                } else {
+                    mavlink::read_v2_msg::<mavlink::common::MavMessage, _>(&mut try_reader)
+                };
+
+                if res.is_ok() {
+                    web_sys::console::log_1(
+                        &format!("DEBUG: MAVLink VERIFIED. Magic: {:02X}", magic).into(),
+                    );
+                    return true; // Valid packet found!
+                } else {
+                    web_sys::console::log_1(
+                        &format!(
+                            "DEBUG: MAVLink Magic found but parse failed ({:?}).",
+                            res.err()
+                        )
+                        .into(),
+                    );
+                }
+
+                // Failed? Advance past this magic and retry
+                reader = &reader[idx + 1..];
+            } else {
+                return false;
+            }
+        }
+    }
+
     // New: Smart Probe for Single Baud
     pub async fn smart_probe_framing(
         &self,
@@ -819,9 +918,9 @@ impl ConnectionManager {
         if !buf_8n1.is_empty() {
             let score = analysis::calculate_score_8n1(&buf_8n1);
             let score_mav = analysis::calculate_score_mavlink(&buf_8n1);
-             
+
             if score_mav >= 0.99 {
-                 return ("8N1".to_string(), buf_8n1, Some("mavlink".to_string()));
+                return ("8N1".to_string(), buf_8n1, Some("mavlink".to_string()));
             }
 
             if score > 0.90 {
@@ -958,8 +1057,6 @@ impl ConnectionManager {
         // Guard cleared by caller
         result
     }
-
-
 
     // --- Auto-Reconnect Logic ---
     pub fn setup_auto_reconnect(

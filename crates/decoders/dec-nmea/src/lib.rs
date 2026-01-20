@@ -85,8 +85,6 @@ impl Decoder for NmeaDecoder {
         }
     }
 
-
-
     fn id(&self) -> &'static str {
         "nmea"
     }

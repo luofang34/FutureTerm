@@ -61,7 +61,7 @@ pub fn calculate_score_mavlink(buf: &[u8]) -> f32 {
     // Better: simply presence of valid magic byte at expected interval?
     // For now, heuristic: finding *any* 0xFE/0xFD is a strong hint.
     if magic_count > 0 {
-        1.0 
+        1.0
     } else {
         0.0
     }
