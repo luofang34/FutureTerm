@@ -64,13 +64,32 @@ pub fn App() -> impl IntoView {
     // Direct Terminal Handle
     let (term_handle, set_term_handle) = create_signal::<Option<xterm::TerminalHandle>>(None);
 
-    // Track parsed events
+    // ========== Data Architecture: Unified Raw Log + Per-Decoder Views ==========
+    //
+    // Architecture:
+    // 1. raw_log: Unified append-only log of all RawEvents (bytes + timestamp + channel)
+    //    - Populated from worker DataBatch frames
+    //    - Byte-based capping (10MB / 10k events)
+    //    - Survives decoder view switches
+    //    - Source of truth for Hex view
+    //
+    // 2. events_list: Worker-generated DecodedEvents (protocol-specific parsing)
+    //    - Populated from worker DataBatch events
+    //    - Used by MAVLink view (filters by protocol)
+    //    - No longer cleared on view switch (history persists)
+    //    - Future: Could be replaced by per-view decoding of raw_log
+    //
+    // 3. Per-decoder cursors: Track processing position for each view
+    //    - hex_cursor: HexView scroll/processing position
+    //    - MAVLink uses timestamp-based cursor internally
+    //
+    // Benefits:
+    // ✅ History persists when switching between decoder views
+    // ✅ Each view maintains independent state (scroll, processed events)
+    // ✅ Foundation for future features (replay, bookmarks, multi-view)
+
     let (events_list, set_events_list) = create_signal::<Vec<DecodedEvent>>(Vec::new());
-
-    // Unified raw event log (append-only, survives view switches)
     let (raw_log, set_raw_log) = create_signal::<Vec<RawEvent>>(Vec::new());
-
-    // Per-decoder view cursors (for persistent scroll position)
     let (hex_cursor, set_hex_cursor) = create_signal(0usize);
 
     // Legacy signals removed/replaced by manager:
