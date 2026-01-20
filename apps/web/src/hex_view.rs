@@ -47,7 +47,7 @@ pub fn HexView(events: ReadSignal<Vec<DecodedEvent>>) -> impl IntoView {
     let (scroll_top, set_scroll_top) = create_signal(0.0);
 
     // Row Height Constant (Estimate based on CSS)
-    const ROW_HEIGHT: f64 = 28.0; 
+    const ROW_HEIGHT: f64 = 28.0;
 
     // Setup ResizeObserver for container
     create_effect(move |_| {
@@ -74,14 +74,14 @@ pub fn HexView(events: ReadSignal<Vec<DecodedEvent>>) -> impl IntoView {
                         let rect = entry.content_rect();
                         let width = rect.width();
                         let height = rect.height();
-                        
+
                         set_h.set(height);
 
                         // Hysteresis to prevent flickering
                         if width >= 1150.0 {
-                             set_bpr.set(32);
+                            set_bpr.set(32);
                         } else if width < 1120.0 {
-                             set_bpr.set(16);
+                            set_bpr.set(16);
                         }
                     }
                 }
@@ -125,17 +125,21 @@ pub fn HexView(events: ReadSignal<Vec<DecodedEvent>>) -> impl IntoView {
 
         let viewport_h = container_height.get();
         let scroll_y = scroll_top.get();
-        
+
         let start_idx = (scroll_y / ROW_HEIGHT).floor() as usize;
         // Buffer rows to prevent white flashes
         let buffer = 5;
-        let start_idx = if start_idx > buffer { start_idx - buffer } else { 0 };
-        
+        let start_idx = if start_idx > buffer {
+            start_idx - buffer
+        } else {
+            0
+        };
+
         let visible_count = (viewport_h / ROW_HEIGHT).ceil() as usize + (buffer * 2);
         let end_idx = (start_idx + visible_count).min(total_count);
 
         let slice = rows[start_idx..end_idx].to_vec();
-        
+
         let padding_top = start_idx as f64 * ROW_HEIGHT;
         let padding_bottom = (total_count - end_idx) as f64 * ROW_HEIGHT;
 
@@ -145,10 +149,10 @@ pub fn HexView(events: ReadSignal<Vec<DecodedEvent>>) -> impl IntoView {
     // Auto-scroll logic: Only snap if we are already near bottom or explicitly requested?
     // User requested simpler logic before, but virtualization complicates "scroll to bottom".
     // If the valid data grows, we might want to auto-scroll.
-    // However, tracking scroll status is cleaner. For now, let's keep it simple: 
+    // However, tracking scroll status is cleaner. For now, let's keep it simple:
     // If we receive new events, we update the list. Sticky scroll is hard with virtualization without tracking "is_at_bottom".
     // Let's assume the user wants to see the latest data if they haven't scrolled up.
-    
+
     // Actually, simply setting scroll_top to scroll_height on new data is a valid strategy for "terminal like" behavior
     // BUT we need to check if user scrolled up manually.
     // For this refactor, let's focus on the rendering optimization requested.
@@ -156,17 +160,16 @@ pub fn HexView(events: ReadSignal<Vec<DecodedEvent>>) -> impl IntoView {
     create_effect(move |_| {
         // Trigger on dependency
         all_hex_rows.with(|_| {});
-        
+
         // Naive auto-scroll (can be improved later)
         if let Some(div) = container_ref.get() {
-             // Only auto-scroll if we were recently at the bottom? 
-             // Or always? The user didn't specify, but regular terminal rules apply.
-             // Let's scroll to bottom if we are adding data.
-             // We can check `div.scroll_top() + div.client_height() >= div.scroll_height() - 10.0`
-             div.set_scroll_top(div.scroll_height());
+            // Only auto-scroll if we were recently at the bottom?
+            // Or always? The user didn't specify, but regular terminal rules apply.
+            // Let's scroll to bottom if we are adding data.
+            // We can check `div.scroll_top() + div.client_height() >= div.scroll_height() - 10.0`
+            div.set_scroll_top(div.scroll_height());
         }
     });
-
 
     // Grid Template: Offset | Hex Data | Separator | ASCII
     let grid_template = create_memo(move |_| {
@@ -250,7 +253,7 @@ pub fn HexView(events: ReadSignal<Vec<DecodedEvent>>) -> impl IntoView {
             <div style="width: max-content; min-width: 100%;">
                 // Top Padding (Virtual Scroll)
                 <div style=move || format!("height: {}px;", visible_rows.get().0)></div>
-                
+
                 <For
                     each=move || visible_rows.get().2
                     key=|row| (row.offset, row.bytes.len())
@@ -285,7 +288,7 @@ pub fn HexView(events: ReadSignal<Vec<DecodedEvent>>) -> impl IntoView {
                                     {
                                         let total_groups = bpr / 4;
                                         let current_groups = groups.len();
-                                        
+
                                         // 1. Render actual data groups
                                         let mut views = groups.into_iter().enumerate().map(|(idx, group)| {
                                             let hex_bytes: Vec<String> = group.iter().map(|b| format!("{:02X}", b)).collect();
@@ -294,7 +297,7 @@ pub fn HexView(events: ReadSignal<Vec<DecodedEvent>>) -> impl IntoView {
                                             let is_sep = idx < total_groups - 1;
 
                                             view! {
-                                                <div style=format!("color: #ce9178; display: inline-flex; gap: 6px; min-width: 94px; justify-content: start; {}", 
+                                                <div style=format!("color: #ce9178; display: inline-flex; gap: 6px; min-width: 94px; justify-content: start; {}",
                                                     if is_sep { "padding-right: 8px; border-right: 1px solid rgba(255, 255, 255, 0.1);" } else { "" }
                                                 )>
                                                     {padded.into_iter().map(|s| view! { <span style="flex: 1; text-align: center;">{s}</span> }).collect::<Vec<_>>()}
@@ -307,7 +310,7 @@ pub fn HexView(events: ReadSignal<Vec<DecodedEvent>>) -> impl IntoView {
                                             for idx in current_groups..total_groups {
                                                  let is_sep = idx < total_groups - 1;
                                                  views.push(view! {
-                                                    <div style=format!("visibility: hidden; display: inline-flex; gap: 6px; min-width: 94px; {}", 
+                                                    <div style=format!("visibility: hidden; display: inline-flex; gap: 6px; min-width: 94px; {}",
                                                         if is_sep { "padding-right: 8px; border-right: 1px solid rgba(255, 255, 255, 0.1);" } else { "" }
                                                     )>
                                                         // 4 placeholders to maintain width
@@ -331,7 +334,7 @@ pub fn HexView(events: ReadSignal<Vec<DecodedEvent>>) -> impl IntoView {
                         }
                     }
                 />
-                
+
                 // Bottom Padding
                 <div style=move || format!("height: {}px;", visible_rows.get().1)></div>
             </div>
