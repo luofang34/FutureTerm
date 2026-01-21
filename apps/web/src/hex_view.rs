@@ -46,17 +46,26 @@ pub fn HexView(
     let (container_height, set_container_height) = create_signal(600.0); // Default height
     let (scroll_top, set_scroll_top) = create_signal(0.0);
 
-    // Local selection state (during drag operation)
-    let (selection_anchor, set_selection_anchor) = create_signal::<Option<usize>>(None);
-    let (selection_focus, set_selection_focus) = create_signal::<Option<usize>>(None);
-
-    // Track selection type for copy behavior
-    #[derive(Clone, Copy, PartialEq)]
-    enum SelectionType {
+    #[derive(Clone, Copy, PartialEq, Debug)]
+    enum SelectionOrigin {
         Hex,
         Ascii,
     }
-    let (_selection_type, set_selection_type) = create_signal::<Option<SelectionType>>(None);
+    let (active_origin, set_active_origin) = create_signal::<Option<SelectionOrigin>>(None);
+    // Lock signal for overflow protection: When one side is active, lock the other side.
+    let (selection_lock, set_selection_lock) = create_signal::<Option<SelectionOrigin>>(None);
+    
+    // Clear lock on global mouseup
+    create_effect(move |_| {
+        let callback = Closure::wrap(Box::new(move || {
+            set_selection_lock.set(None);
+        }) as Box<dyn FnMut()>);
+        let _ = web_sys::window().unwrap().add_event_listener_with_callback("mouseup", callback.as_ref().unchecked_ref());
+        on_cleanup(move || {
+           let _ = web_sys::window().unwrap().remove_event_listener_with_callback("mouseup", callback.as_ref().unchecked_ref());
+           callback.forget();
+        });
+    });
 
     // Row Height Constant (Estimate based on CSS)
     const ROW_HEIGHT: f64 = 28.0;
@@ -239,25 +248,30 @@ pub fn HexView(
         }
     });
 
-    // Handle Native Selection Changes
-    let (internal_selection_active, set_internal_selection_active) = create_signal(false);
+    // Handle Native Selection Changes (Throttled for performance)
+    let (last_selection_time, set_last_selection_time) = create_signal(0.0);
 
     create_effect(move |_| {
         let set_global = set_global_selection;
-        let set_active = set_internal_selection_active;
-        
+        let last_time = last_selection_time;
+        let set_last = set_last_selection_time;
+
         let callback = Closure::wrap(Box::new(move || {
+            // Throttle to 60fps (16.67ms) for performance
+            let now = js_sys::Date::now();
+            let last = last_time.get_untracked();
+            if now - last < 16.67 {
+                return;
+            }
+            set_last.set(now);
+
             if let Some(window) = web_sys::window() {
                 if let Some(selection) = window.get_selection().ok().flatten() {
-                    // If no valid selection, perform a soft reset check
+                    // If no valid selection, clear global selection
                     if selection.is_collapsed() {
-                        // If we previously had an active selection, clear it
-                        set_active.update(|active| {
-                            if *active {
-                                if let Some(set_g) = set_global { set_g.set(None); }
-                                *active = false;
-                            }
-                        });
+                        if let Some(set_g) = set_global {
+                            set_g.set(None);
+                        }
                         return;
                     }
 
@@ -267,38 +281,44 @@ pub fn HexView(
                     if let (Some(anchor), Some(focus)) = (anchor_node, focus_node) {
                         let get_info = |node: web_sys::Node| -> Option<(usize, bool)> {
                             let mut curr = Some(node);
-                             while let Some(n) = curr {
+                            // Cache element lookups for performance
+                            let mut offset_found = None;
+                            let mut is_ascii_found = None;
+
+                            while let Some(n) = curr {
                                 if let Some(el) = n.dyn_ref::<web_sys::HtmlElement>() {
-                                    if let Some(bg) = el.dataset().get("offset") {
-                                        if let Ok(offset) = bg.parse::<usize>() {
-                                            let is_ascii = el.class_list().contains("ascii-char");
-                                            return Some((offset, is_ascii));
+                                    if offset_found.is_none() {
+                                        if let Some(bg) = el.dataset().get("offset") {
+                                            if let Ok(offset) = bg.parse::<usize>() {
+                                                offset_found = Some(offset);
+                                            }
                                         }
+                                    }
+                                    if is_ascii_found.is_none() && el.class_list().contains("ascii-char") {
+                                        is_ascii_found = Some(true);
+                                    }
+                                    if offset_found.is_some() && is_ascii_found.is_some() {
+                                        break;
                                     }
                                 }
                                 curr = n.parent_element().map(|e| e.into());
                             }
-                            None
+                            offset_found.map(|off| (off, is_ascii_found.unwrap_or(false)))
                         };
 
                         let start_info = get_info(anchor);
                         let end_info = get_info(focus);
 
-                        if let (Some((start_off, _)), Some((end_off, _))) = (start_info, end_info) {
+                        if let (Some((start_off, start_is_ascii)), Some((end_off, _))) = (start_info, end_info) {
                             let (min, max) = if start_off < end_off { (start_off, end_off) } else { (end_off, start_off) };
-                            
+
                             // Valid HexView selection found
-                            set_active.set(true);
+                            set_active_origin.set(Some(if start_is_ascii { SelectionOrigin::Ascii } else { SelectionOrigin::Hex }));
+
                             if let Some(set_g) = set_global {
                                 set_g.set(Some(SelectionRange::new(
                                     min,
-                                    max + 1, // +1 because max is inclusive in our logic but EndOffset implies exclusive usually, let's consistency check.
-                                            // SelectionRange logic: [start, end). If min==max, len=0.
-                                            // byte_idx logic: "if byte_idx < group_len".
-                                            // If I select byte 0, start=0, end=0.
-                                            // Browser selection usually implies char ranges.
-                                            // Let's assume Inclusive for min/max derived here.
-                                            // So range is [min, max + 1).
+                                    max + 1,
                                     0,
                                     0,
                                     SelectionSource::HexView
@@ -311,18 +331,80 @@ pub fn HexView(
         }) as Box<dyn FnMut()>);
 
         let document = web_sys::window().unwrap().document().unwrap();
-        // Use "selectionchange" on document
         let _ = document.add_event_listener_with_callback("selectionchange", callback.as_ref().unchecked_ref());
 
         on_cleanup(move || {
             let _ = document.remove_event_listener_with_callback("selectionchange", callback.as_ref().unchecked_ref());
-            callback.forget(); // Memory leak risk if not careful, but on_cleanup handles the listener removal. The Closure needs to be kept alive?
-                               // Actually Closure needs to be stored or forgotten. If forgotten, it leaks.
-                               // Ideally we store it. But for this scope, let's just leak the minimal closure or handle it properly if we can store it.
-                               // Given `leptos` constructs, standard simple closures leak if forgotten.
-                               // Proper: store in a signal or just accept small leak for single component lifecycle.
+            callback.forget();
         });
     });
+
+    // Direct DOM manipulation for highlighting (maximum performance)
+    // This bypasses Leptos reactivity and updates classes directly
+    create_effect(move |_| {
+        let range_opt = global_selection.and_then(|g| g.get());
+        let origin = active_origin.get();
+
+        // Use requestAnimationFrame to batch DOM updates
+        let callback = Closure::once(Box::new(move || {
+            if let Some(window) = web_sys::window() {
+                if let Some(document) = window.document() {
+                    // Clear all previous highlights efficiently
+                    if let Ok(elements) = document.query_selector_all(".hex-byte") {
+                        for i in 0..elements.length() {
+                            if let Some(el) = elements.get(i) {
+                                if let Some(el) = el.dyn_ref::<web_sys::HtmlElement>() {
+                                    let _ = el.class_list().remove_2("bg-sync", "bg-term");
+                                }
+                            }
+                        }
+                    }
+
+                    // Apply new highlights if selection exists
+                    if let Some(range) = range_opt {
+                        let is_terminal = range.source_view == SelectionSource::Terminal;
+                        let is_hex_view = range.source_view == SelectionSource::HexView;
+
+                        // Query only elements in range for better performance
+                        if let Ok(elements) = document.query_selector_all(".hex-byte[data-offset]") {
+                            for i in 0..elements.length() {
+                                if let Some(el) = elements.get(i) {
+                                    if let Some(el) = el.dyn_ref::<web_sys::HtmlElement>() {
+                                        if let Some(offset_str) = el.dataset().get("offset") {
+                                            if let Ok(offset) = offset_str.parse::<usize>() {
+                                                if range.contains_offset(offset) {
+                                                    // Terminal selection: both hex and ASCII get bg-term
+                                                    if is_terminal {
+                                                        let _ = el.class_list().add_1("bg-term");
+                                                    }
+                                                    // HexView selection: sync highlighting logic
+                                                    else if is_hex_view {
+                                                        let is_ascii = el.class_list().contains("ascii-char");
+                                                        // If origin is ASCII and this is hex, or vice versa, apply sync color
+                                                        if (origin == Some(SelectionOrigin::Ascii) && !is_ascii) ||
+                                                           (origin == Some(SelectionOrigin::Hex) && is_ascii) {
+                                                            let _ = el.class_list().add_1("bg-sync");
+                                                        }
+                                                    }
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }) as Box<dyn FnOnce()>);
+
+        if let Some(window) = web_sys::window() {
+            let _ = window.request_animation_frame(callback.as_ref().unchecked_ref());
+            callback.forget();
+        }
+    });
+
+
 
     // Grid Template: Offset | Hex Data | Separator | ASCII
     // Calculate fixed width for hex column to prevent ASCII invasion
@@ -473,6 +555,36 @@ pub fn HexView(
                 position: relative;
             "
         >
+            // Performance Styles
+            <style>
+                ".hex-byte {
+                     cursor: text;
+                     display: inline-block;
+                     padding: 0 1px;
+                     box-sizing: border-box;
+                 }
+                 .ascii-char {
+                     cursor: text;
+                     display: inline-block;
+                     padding: 0;
+                 }
+                 .bg-sync {
+                     background-color: rgba(80, 150, 250, 0.4);
+                 }
+                 .bg-term {
+                     background-color: rgba(86, 156, 214, 0.3);
+                 }
+                 .hex-byte::selection, .ascii-char::selection {
+                     background-color: rgba(80, 150, 250, 0.4);
+                 }
+                 .selection-locked {
+                     user-select: none !important;
+                 }
+                 .selection-locked * {
+                     user-select: none !important;
+                 }"
+            </style>
+
             // Sticky Header
             <div
                 class="hex-header"
@@ -566,7 +678,12 @@ pub fn HexView(
                                 </div>
 
                                 // Hex Groups (Padded)
-                                <div class="hex-data-container" style="display: flex; gap: 16px; user-select: text;">
+                                <div 
+                                    class="hex-data-container" 
+                                    class:selection-locked=move || selection_lock.get() == Some(SelectionOrigin::Ascii)
+                                    on:mousedown=move |_| set_selection_lock.set(Some(SelectionOrigin::Hex))
+                                    style="display: flex; gap: 16px; user-select: text;"
+                                >
                                     {
                                         let total_groups = bpr / 4;
                                         let current_groups = groups.len();
@@ -577,7 +694,7 @@ pub fn HexView(
 
                                             // Render each byte with selection support
                                             let bytes_for_group = group.clone();
-                                            let group_len = bytes_for_group.len();
+                                            let _group_len = bytes_for_group.len();
                                             let byte_views = (0..4).map(|byte_idx| {
                                                 let byte_offset = offset + (group_idx * 4) + byte_idx;
                                                 let hex_str = bytes_for_group.get(byte_idx)
@@ -588,32 +705,6 @@ pub fn HexView(
                                                     <span
                                                         class="hex-byte"
                                                         data-offset={byte_offset.to_string()}
-                                                        style=move || {
-                                                            // Check if selected from Terminal→Hex sync OR Internal Hex Selection
-                                                            let selected = if byte_idx < group_len {
-                                                                if let Some(global_sel) = global_selection {
-                                                                    if let Some(range) = global_sel.get() {
-                                                                         // Highlight if range matches, regardless of source (Terminal OR HexView)
-                                                                         range.contains_offset(byte_offset)
-                                                                    } else {
-                                                                        false
-                                                                    }
-                                                                } else {
-                                                                    false
-                                                                }
-                                                            } else {
-                                                                false
-                                                            };
-
-                                                            format!(
-                                                                "width: 2ch; text-align: center; cursor: text; display: inline-block; {}",
-                                                                if selected {
-                                                                    "background-color: rgba(86, 156, 214, 0.3); border-radius: 2px;"
-                                                                } else {
-                                                                    ""
-                                                                }
-                                                            )
-                                                        }
                                                     >
                                                         {hex_str}
                                                     </span>
@@ -653,6 +744,8 @@ pub fn HexView(
                                 // ASCII
                                 <div
                                     class="ascii-container"
+                                    class:selection-locked=move || selection_lock.get() == Some(SelectionOrigin::Hex)
+                                    on:mousedown=move |_| set_selection_lock.set(Some(SelectionOrigin::Ascii)) // Lock Hex when clicking ASCII
                                     style="color: #b5cea8; white-space: pre; overflow: hidden; letter-spacing: 0; display: inline-flex; user-select: text;">
                                     {
                                         // Render each ASCII character separately for selection
@@ -668,27 +761,6 @@ pub fn HexView(
                                                 <span
                                                     class="hex-byte ascii-char"
                                                     data-offset={byte_offset.to_string()}
-                                                    style=move || {
-                                                         // Check if selected from Terminal→Hex sync OR Global
-                                                         let selected = if let Some(global_sel) = global_selection {
-                                                             if let Some(range) = global_sel.get() {
-                                                                 range.contains_offset(byte_offset)
-                                                             } else {
-                                                                 false
-                                                             }
-                                                         } else {
-                                                             false
-                                                         };
-
-                                                        format!(
-                                                            "cursor: text; {}",
-                                                            if selected {
-                                                                "background-color: rgba(86, 156, 214, 0.3);"
-                                                            } else {
-                                                                ""
-                                                            }
-                                                        )
-                                                    }
                                                 >
                                                     {ascii_char}
                                                 </span>
