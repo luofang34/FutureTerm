@@ -632,6 +632,99 @@ impl TerminalMetadata {
         }
     }
 
+    /// Maps raw_log byte range to Terminal selection position (row/col)
+    ///
+    /// # Arguments
+    /// * `start_byte` - Start byte offset in raw_log
+    /// * `end_byte` - End byte offset in raw_log (exclusive)
+    ///
+    /// # Returns
+    /// Option<(start_row, start_col, end_row, end_col)> if mapping is found
+    pub fn bytes_to_terminal_position(
+        &self,
+        start_byte: usize,
+        end_byte: usize,
+    ) -> Option<(usize, usize, usize, usize)> {
+        if self.spans.is_empty() {
+            return None;
+        }
+
+        let mut start_pos = None;
+        let mut end_pos = None;
+
+        for span in &self.spans {
+            // Check for overlap
+             if span.raw_log_byte_end > start_byte && span.raw_log_byte_start < end_byte {
+                // Find start position
+                if start_pos.is_none() {
+                    // If start_byte is before this span, clamp to span start
+                    if start_byte <= span.raw_log_byte_start {
+                         start_pos = Some((span.terminal_line, span.column_offset));
+                    } else {
+                        // Find specific char
+                        let local_offset = start_byte - span.raw_log_byte_start;
+                        // Find visible char containing this byte
+                        if let Some(map) = span.char_to_byte_map.iter().find(|m| {
+                            m.byte_offset_in_span <= local_offset 
+                            && (m.byte_offset_in_span + m.byte_length) > local_offset
+                        }) {
+                            start_pos = Some((
+                                span.terminal_line + map.line_in_span,
+                                map.terminal_column
+                            ));
+                        }
+                    }
+                }
+
+                // Update end position (keep processing spans until we cover range)
+                // If end_byte is beyond this span, we take the span end
+                if end_byte >= span.raw_log_byte_end {
+                    // Last char of span
+                    let lines = span.text.lines().count().max(1);
+                    // This is rough end approximation. Ideally we use the last char map
+                    if let Some(last) = span.char_to_byte_map.last() {
+                         end_pos = Some((
+                            span.terminal_line + last.line_in_span,
+                            last.terminal_column + 1 // Exclusive
+                         ));
+                    }
+                } else {
+                    // Find specific char inside span
+                     let local_offset = end_byte - span.raw_log_byte_start;
+                     // Find visible char ending at or after this byte
+                      if let Some(map) = span.char_to_byte_map.iter().find(|m| {
+                            m.byte_offset_in_span <= local_offset // Start of char is before end
+                            && (m.byte_offset_in_span + m.byte_length) >= local_offset // End of char is >= end
+                        }) {
+                             // Correct logic: If end_byte is 5, and char is 4-5, we want end of that char?
+                             // Selection is exclusive.
+                             end_pos = Some((
+                                span.terminal_line + map.line_in_span,
+                                map.terminal_column // xterm end is exclusive, so if map is col 5, and we end at start of col 5, it's 5.
+                                // If we end strictly AFTER start of col 5...
+                                // Simpler: Map byte to char index.
+                            ));
+                            
+                            // Adjust for partial overlap?
+                            // If local_offset == m.byte_offset_in_span, we end exactly at char start -> col
+                            // If local_offset > m, we end inside -> col + 1
+                             if local_offset > map.byte_offset_in_span {
+                                end_pos = Some((
+                                    span.terminal_line + map.line_in_span,
+                                    map.terminal_column + 1
+                                ));
+                             }
+                        }
+                }
+            }
+        }
+
+        match (start_pos, end_pos) {
+            (Some((sr, sc)), Some((er, ec))) => Some((sr, sc, er, ec)),
+            _ => None,
+        }
+    }
+
     /// Adjusts all byte offsets when raw_log is trimmed
     ///
     /// # Arguments

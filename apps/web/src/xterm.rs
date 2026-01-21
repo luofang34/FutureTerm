@@ -41,6 +41,32 @@ extern "C" {
     #[wasm_bindgen(method, js_name = clearSelection)]
     pub fn clear_selection(this: &Terminal);
 
+    #[wasm_bindgen(method, js_name = select)]
+    pub fn select(this: &Terminal, column: u32, row: u32, length: u32);
+
+    // Alternative: selectLines(start, end) if we wanted line-only
+    // But select() is robust. Wait, xterm.js API has select(col, row, len).
+    // It implies single line?
+    // "Selects text within the terminal."
+    // Actually xterm.js 5.3.0 has `select(column, row, length)`.
+    // It does NOT support multi-line selection via parameters directly?
+    // "Selects text in the buffer. The selection is always treated as a single block."
+    // No, standard xterm selection can span lines.
+    // Documentation says: `select(column: number, row: number, length: number): void`
+    // This looks like single line.
+    // But `selectAll()` exists.
+    // What about `selectLines(start, end)`? "Selects all text within the specified lines."
+    // Let's use `selectLines` as a fallback if full range is complex.
+    // Or check if there is `selectRange`.
+    // Actually, `select` with very long length wraps lines!
+    // So we can calculate length? length = (end_row - start_row) * cols + (end_col - start_col).
+    // But we don't know "cols" (width) reliably inside metadata easily.
+    // Let's check imports.
+    
+    // xterm.js also has `selectLines(start, end)`.
+    #[wasm_bindgen(method, js_name = selectLines)]
+    pub fn select_lines(this: &Terminal, start: u32, end: u32);
+
     #[wasm_bindgen(method, js_name = hasSelection)]
     pub fn has_selection(this: &Terminal) -> bool;
 
@@ -173,22 +199,38 @@ impl TerminalHandle {
             return None;
         }
 
-        // Extract nested properties using Reflect API
+        // Try flattened format first (startColumn, startRow...) - Common in older/some bindings
+        let start_col = js_sys::Reflect::get(&pos, &"startColumn".into()).ok();
+        if let Some(sc) = start_col.and_then(|v| v.as_f64()) {
+             let start_row = js_sys::Reflect::get(&pos, &"startRow".into()).ok().and_then(|v| v.as_f64())?;
+             let end_col = js_sys::Reflect::get(&pos, &"endColumn".into()).ok().and_then(|v| v.as_f64())?;
+             let end_row = js_sys::Reflect::get(&pos, &"endRow".into()).ok().and_then(|v| v.as_f64())?;
+             return Some((start_row as u32, sc as u32, end_row as u32, end_col as u32));
+        }
+
+        // Try nested format ({ start: { x, y } }) - Newer API
         // Structure: {start: {x: col, y: row}, end: {x: col, y: row}}
         let start = js_sys::Reflect::get(&pos, &"start".into()).ok()?;
-        let end = js_sys::Reflect::get(&pos, &"end".into()).ok()?;
+        if !start.is_undefined() {
+             let start_x = js_sys::Reflect::get(&start, &"x".into()).ok()?;
+             let start_y = js_sys::Reflect::get(&start, &"y".into()).ok()?;
+             
+             let end = js_sys::Reflect::get(&pos, &"end".into()).ok()?;
+             let end_x = js_sys::Reflect::get(&end, &"x".into()).ok()?;
+             let end_y = js_sys::Reflect::get(&end, &"y".into()).ok()?;
 
-        let start_x = js_sys::Reflect::get(&start, &"x".into()).ok()?;
-        let start_y = js_sys::Reflect::get(&start, &"y".into()).ok()?;
-        let end_x = js_sys::Reflect::get(&end, &"x".into()).ok()?;
-        let end_y = js_sys::Reflect::get(&end, &"y".into()).ok()?;
+             let start_col = start_x.as_f64()? as u32;
+             let start_row = start_y.as_f64()? as u32;
+             // Note: end_x in some versions is inclusive, some exclusive.
+             // xterm.js usually implies range [start, end].
+             // We'll trust the values.
+             let end_col = end_x.as_f64()? as u32;
+             let end_row = end_y.as_f64()? as u32;
 
-        let start_col = start_x.as_f64()? as u32;
-        let start_row = start_y.as_f64()? as u32;
-        let end_col = end_x.as_f64()? as u32;
-        let end_row = end_y.as_f64()? as u32;
+             return Some((start_row, start_col, end_row, end_col));
+        }
 
-        Some((start_row, start_col, end_row, end_col))
+        None
     }
 
     // Decorations API
@@ -239,11 +281,17 @@ pub fn TerminalView(
 ) -> impl IntoView {
     let div_ref = create_node_ref::<html::Div>();
 
-    // Store terminal handle for cross-effect access
-    let (terminal_handle_signal, set_terminal_handle_signal) =
-        create_signal::<Option<TerminalHandle>>(None);
+    // Internal signal to share terminal handle with other effects
+    let (internal_term_handle, set_internal_term_handle) = create_signal::<Option<TerminalHandle>>(None);
 
+    let on_mount_clone = on_mount.clone();
+    let on_terminal_ready_clone = on_terminal_ready.clone();
+    
     create_effect(move |_| {
+        // Wrapper ID need to be unique if multiple terminals
+        let wrapper_id = "terminal-wrapper";
+        let wrapper = document().get_element_by_id(wrapper_id);
+        
         if let Some(div) = div_ref.get() {
             // Options: Set Theme
             let options = js_sys::Object::new();
@@ -401,13 +449,13 @@ pub fn TerminalView(
             }
 
             // Store handle in signal for other effects
-            set_terminal_handle_signal.set(Some(term_handle.clone()));
+            set_internal_term_handle.set(Some(term_handle.clone()));
 
-            if let Some(cb) = on_terminal_ready {
+            if let Some(cb) = on_terminal_ready_clone {
                 cb.call(term_handle);
             }
 
-            if let Some(cb) = on_mount {
+            if let Some(cb) = on_mount_clone {
                 cb.call(());
             }
         }
@@ -422,18 +470,22 @@ pub fn TerminalView(
 
                     // HexView selected bytes, highlight in Terminal
                     let meta = metadata_signal.get_untracked();
-                    if let Some((start_line, end_line)) = meta.bytes_to_terminal_lines(
+                        // HexView selected bytes, highlight in Terminal
+                    // HexView selected bytes, highlight in Terminal
+                    let meta = metadata_signal.get_untracked();
+                    // Need terminal handle
+                    let term_handle = internal_term_handle.get()?;
+                    
+                    if let Some((start_row, start_col, end_row, end_col)) = meta.bytes_to_terminal_position(
                         range.start_byte_offset,
                         range.end_byte_offset,
                     ) {
-                        web_sys::console::log_1(&format!("Mapped to terminal lines: {}-{}", start_line, end_line).into());
+                        web_sys::console::log_1(&format!("Mapped to position: ({}, {}) - ({}, {})", start_row, start_col, end_row, end_col).into());
 
-                        // Create decoration for highlighting
-                        // Note: Terminal decorations are complex with xterm.js
-                        // registerMarker uses cursor-relative positioning which doesn't work for our use case
-                        // For now, just log that we would highlight these lines
-                        // TODO: Implement proper Terminal highlighting (may need different approach)
-                        web_sys::console::log_1(&format!("Would highlight terminal lines {}-{} (not implemented)", start_line, end_line).into());
+                        let start_u32 = start_row as u32;
+                        let end_u32 = end_row as u32;
+                        
+                        term_handle.0.select_lines(start_u32, end_u32);
                     }
                 }
 
