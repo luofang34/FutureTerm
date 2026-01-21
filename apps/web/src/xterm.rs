@@ -62,7 +62,7 @@ extern "C" {
     // So we can calculate length? length = (end_row - start_row) * cols + (end_col - start_col).
     // But we don't know "cols" (width) reliably inside metadata easily.
     // Let's check imports.
-    
+
     // xterm.js also has `selectLines(start, end)`.
     #[wasm_bindgen(method, js_name = selectLines)]
     pub fn select_lines(this: &Terminal, start: u32, end: u32);
@@ -202,32 +202,38 @@ impl TerminalHandle {
         // Try flattened format first (startColumn, startRow...) - Common in older/some bindings
         let start_col = js_sys::Reflect::get(&pos, &"startColumn".into()).ok();
         if let Some(sc) = start_col.and_then(|v| v.as_f64()) {
-             let start_row = js_sys::Reflect::get(&pos, &"startRow".into()).ok().and_then(|v| v.as_f64())?;
-             let end_col = js_sys::Reflect::get(&pos, &"endColumn".into()).ok().and_then(|v| v.as_f64())?;
-             let end_row = js_sys::Reflect::get(&pos, &"endRow".into()).ok().and_then(|v| v.as_f64())?;
-             return Some((start_row as u32, sc as u32, end_row as u32, end_col as u32));
+            let start_row = js_sys::Reflect::get(&pos, &"startRow".into())
+                .ok()
+                .and_then(|v| v.as_f64())?;
+            let end_col = js_sys::Reflect::get(&pos, &"endColumn".into())
+                .ok()
+                .and_then(|v| v.as_f64())?;
+            let end_row = js_sys::Reflect::get(&pos, &"endRow".into())
+                .ok()
+                .and_then(|v| v.as_f64())?;
+            return Some((start_row as u32, sc as u32, end_row as u32, end_col as u32));
         }
 
         // Try nested format ({ start: { x, y } }) - Newer API
         // Structure: {start: {x: col, y: row}, end: {x: col, y: row}}
         let start = js_sys::Reflect::get(&pos, &"start".into()).ok()?;
         if !start.is_undefined() {
-             let start_x = js_sys::Reflect::get(&start, &"x".into()).ok()?;
-             let start_y = js_sys::Reflect::get(&start, &"y".into()).ok()?;
-             
-             let end = js_sys::Reflect::get(&pos, &"end".into()).ok()?;
-             let end_x = js_sys::Reflect::get(&end, &"x".into()).ok()?;
-             let end_y = js_sys::Reflect::get(&end, &"y".into()).ok()?;
+            let start_x = js_sys::Reflect::get(&start, &"x".into()).ok()?;
+            let start_y = js_sys::Reflect::get(&start, &"y".into()).ok()?;
 
-             let start_col = start_x.as_f64()? as u32;
-             let start_row = start_y.as_f64()? as u32;
-             // Note: end_x in some versions is inclusive, some exclusive.
-             // xterm.js usually implies range [start, end].
-             // We'll trust the values.
-             let end_col = end_x.as_f64()? as u32;
-             let end_row = end_y.as_f64()? as u32;
+            let end = js_sys::Reflect::get(&pos, &"end".into()).ok()?;
+            let end_x = js_sys::Reflect::get(&end, &"x".into()).ok()?;
+            let end_y = js_sys::Reflect::get(&end, &"y".into()).ok()?;
 
-             return Some((start_row, start_col, end_row, end_col));
+            let start_col = start_x.as_f64()? as u32;
+            let start_row = start_y.as_f64()? as u32;
+            // Note: end_x in some versions is inclusive, some exclusive.
+            // xterm.js usually implies range [start, end].
+            // We'll trust the values.
+            let end_col = end_x.as_f64()? as u32;
+            let end_row = end_y.as_f64()? as u32;
+
+            return Some((start_row, start_col, end_row, end_col));
         }
 
         None
@@ -282,16 +288,13 @@ pub fn TerminalView(
     let div_ref = create_node_ref::<html::Div>();
 
     // Internal signal to share terminal handle with other effects
-    let (internal_term_handle, set_internal_term_handle) = create_signal::<Option<TerminalHandle>>(None);
+    let (internal_term_handle, set_internal_term_handle) =
+        create_signal::<Option<TerminalHandle>>(None);
 
-    let on_mount_clone = on_mount.clone();
-    let on_terminal_ready_clone = on_terminal_ready.clone();
-    
+    let on_mount_clone = on_mount;
+    let on_terminal_ready_clone = on_terminal_ready;
+
     create_effect(move |_| {
-        // Wrapper ID need to be unique if multiple terminals
-        let wrapper_id = "terminal-wrapper";
-        let wrapper = document().get_element_by_id(wrapper_id);
-        
         if let Some(div) = div_ref.get() {
             // Options: Set Theme
             let options = js_sys::Object::new();
@@ -394,11 +397,14 @@ pub fn TerminalView(
                     // Enhanced debug: Check if selection exists
                     let has_sel = handle.has_selection();
                     let sel_text = handle.get_selection();
-                    web_sys::console::log_1(&format!(
-                        "Terminal onSelectionChange fired: has_selection={}, text_length={}",
-                        has_sel,
-                        sel_text.len()
-                    ).into());
+                    web_sys::console::log_1(
+                        &format!(
+                            "Terminal onSelectionChange fired: has_selection={}, text_length={}",
+                            has_sel,
+                            sel_text.len()
+                        )
+                        .into(),
+                    );
 
                     // Get raw position value for debugging
                     let raw_pos = handle.get_selection_position();
@@ -409,14 +415,19 @@ pub fn TerminalView(
                         handle.get_selection_position_parsed()
                     {
                         // Debug logging with all coordinates and selected text
-                        web_sys::console::log_1(&format!(
-                            "Terminal selection: rows {}-{}, cols {}-{}, selected_text={:?}",
-                            start_row, end_row, start_col, end_col, sel_text
-                        ).into());
+                        web_sys::console::log_1(
+                            &format!(
+                                "Terminal selection: rows {}-{}, cols {}-{}, selected_text={:?}",
+                                start_row, end_row, start_col, end_col, sel_text
+                            )
+                            .into(),
+                        );
 
                         // Map Terminal position (row+col) to byte range via metadata
                         let meta = metadata_signal.get_untracked();
-                        web_sys::console::log_1(&format!("Metadata span count: {}", meta.span_count()).into());
+                        web_sys::console::log_1(
+                            &format!("Metadata span count: {}", meta.span_count()).into(),
+                        );
 
                         if let Some((byte_start, byte_end)) = meta.terminal_position_to_bytes(
                             start_row as usize,
@@ -424,7 +435,9 @@ pub fn TerminalView(
                             end_row as usize,
                             end_col as usize,
                         ) {
-                            web_sys::console::log_1(&format!("Mapped to bytes: {}-{}", byte_start, byte_end).into());
+                            web_sys::console::log_1(
+                                &format!("Mapped to bytes: {}-{}", byte_start, byte_end).into(),
+                            );
 
                             // Create selection range
                             let range = SelectionRange::new(
@@ -436,7 +449,9 @@ pub fn TerminalView(
                             );
                             set_global_sel.set(Some(range));
                         } else {
-                            web_sys::console::log_1(&"Failed to map terminal lines to bytes".into());
+                            web_sys::console::log_1(
+                                &"Failed to map terminal lines to bytes".into(),
+                            );
                         }
                     } else {
                         // Selection cleared
@@ -466,25 +481,32 @@ pub fn TerminalView(
         create_effect(move |prev_decoration: Option<Option<Decoration>>| {
             let current_decoration: Option<Decoration> = if let Some(range) = global_sel.get() {
                 if range.source_view == SelectionSource::HexView {
-                    web_sys::console::log_1(&format!("Hex selection: bytes {}-{}", range.start_byte_offset, range.end_byte_offset).into());
+                    web_sys::console::log_1(
+                        &format!(
+                            "Hex selection: bytes {}-{}",
+                            range.start_byte_offset, range.end_byte_offset
+                        )
+                        .into(),
+                    );
 
                     // HexView selected bytes, highlight in Terminal
                     let meta = metadata_signal.get_untracked();
-                        // HexView selected bytes, highlight in Terminal
-                    // HexView selected bytes, highlight in Terminal
-                    let meta = metadata_signal.get_untracked();
-                    // Need terminal handle
                     let term_handle = internal_term_handle.get()?;
-                    
-                    if let Some((start_row, start_col, end_row, end_col)) = meta.bytes_to_terminal_position(
-                        range.start_byte_offset,
-                        range.end_byte_offset,
-                    ) {
-                        web_sys::console::log_1(&format!("Mapped to position: ({}, {}) - ({}, {})", start_row, start_col, end_row, end_col).into());
+
+                    if let Some((start_row, start_col, end_row, end_col)) = meta
+                        .bytes_to_terminal_position(range.start_byte_offset, range.end_byte_offset)
+                    {
+                        web_sys::console::log_1(
+                            &format!(
+                                "Mapped to position: ({}, {}) - ({}, {})",
+                                start_row, start_col, end_row, end_col
+                            )
+                            .into(),
+                        );
 
                         let start_u32 = start_row as u32;
                         let end_u32 = end_row as u32;
-                        
+
                         term_handle.0.select_lines(start_u32, end_u32);
                     }
                 }

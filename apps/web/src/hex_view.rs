@@ -3,6 +3,23 @@ use leptos::*;
 use wasm_bindgen::closure::Closure;
 use wasm_bindgen::JsCast;
 
+// Display constants
+/// Height of each hex row in pixels
+const ROW_HEIGHT: f64 = 28.0;
+
+/// Auto-scroll threshold distance from bottom in pixels
+const AUTO_SCROLL_THRESHOLD: f64 = 100.0;
+
+/// Number of buffer rows to prevent white flashes during scroll
+const SCROLL_BUFFER_ROWS: usize = 5;
+
+// Responsive layout breakpoints
+/// Minimum width in pixels for 32-byte row layout
+const WIDE_LAYOUT_MIN_WIDTH: f64 = 1150.0;
+
+/// Width hysteresis threshold to prevent flickering
+const WIDE_LAYOUT_HYSTERESIS: f64 = 1120.0;
+
 /// Represents a single hex dump row (16 or 32 bytes)
 #[derive(Clone, Debug, PartialEq)]
 struct HexRow {
@@ -54,27 +71,49 @@ pub fn HexView(
     let (active_origin, set_active_origin) = create_signal::<Option<SelectionOrigin>>(None);
     // Lock signal for overflow protection: When one side is active, lock the other side.
     let (selection_lock, set_selection_lock) = create_signal::<Option<SelectionOrigin>>(None);
-    
-    // Clear lock on global mouseup
+
+    // Clear lock on global mouseup and mouseleave (handles edge case of mouse leaving window)
     create_effect(move |_| {
-        let callback = Closure::wrap(Box::new(move || {
+        let window = web_sys::window().unwrap();
+
+        let mouseup_callback = Closure::wrap(Box::new(move || {
             set_selection_lock.set(None);
         }) as Box<dyn FnMut()>);
-        let _ = web_sys::window().unwrap().add_event_listener_with_callback("mouseup", callback.as_ref().unchecked_ref());
+
+        let mouseleave_callback = Closure::wrap(Box::new(move || {
+            set_selection_lock.set(None);
+        }) as Box<dyn FnMut()>);
+
+        let _ = window
+            .add_event_listener_with_callback("mouseup", mouseup_callback.as_ref().unchecked_ref());
+        let _ = window.add_event_listener_with_callback(
+            "mouseleave",
+            mouseleave_callback.as_ref().unchecked_ref(),
+        );
+
         on_cleanup(move || {
-           let _ = web_sys::window().unwrap().remove_event_listener_with_callback("mouseup", callback.as_ref().unchecked_ref());
-           callback.forget();
+            if let Some(w) = web_sys::window() {
+                let _ = w.remove_event_listener_with_callback(
+                    "mouseup",
+                    mouseup_callback.as_ref().unchecked_ref(),
+                );
+                let _ = w.remove_event_listener_with_callback(
+                    "mouseleave",
+                    mouseleave_callback.as_ref().unchecked_ref(),
+                );
+            }
+            mouseup_callback.forget();
+            mouseleave_callback.forget();
         });
     });
 
-    // Row Height Constant (Estimate based on CSS)
-    const ROW_HEIGHT: f64 = 28.0;
+    // Row height is defined as a module-level constant
 
     // Setup ResizeObserver for container
     create_effect(move |_| {
         if let Some(container) = container_ref.get() {
-            let set_bpr = set_bytes_per_row.clone();
-            let set_h = set_container_height.clone();
+            let set_bpr = set_bytes_per_row;
+            let set_h = set_container_height;
 
             // Initial check
             let initial_width = container.client_width() as f64;
@@ -82,7 +121,7 @@ pub fn HexView(
             set_h.set(initial_height);
 
             // 32 bytes needs ~1150px. 16 bytes needs ~700px.
-            if initial_width >= 1150.0 {
+            if initial_width >= WIDE_LAYOUT_MIN_WIDTH {
                 set_bytes_per_row.set(32);
             } else {
                 set_bytes_per_row.set(16);
@@ -100,9 +139,9 @@ pub fn HexView(
                         let _ = set_h.try_set(height);
 
                         // Hysteresis to prevent flickering
-                        if width >= 1150.0 {
+                        if width >= WIDE_LAYOUT_MIN_WIDTH {
                             let _ = set_bpr.try_set(32);
-                        } else if width < 1120.0 {
+                        } else if width < WIDE_LAYOUT_HYSTERESIS {
                             let _ = set_bpr.try_set(16);
                         }
                     }
@@ -175,14 +214,9 @@ pub fn HexView(
 
         let start_idx = (scroll_y / ROW_HEIGHT).floor() as usize;
         // Buffer rows to prevent white flashes
-        let buffer = 5;
-        let start_idx = if start_idx > buffer {
-            start_idx - buffer
-        } else {
-            0
-        };
+        let start_idx = start_idx.saturating_sub(SCROLL_BUFFER_ROWS);
 
-        let visible_count = (viewport_h / ROW_HEIGHT).ceil() as usize + (buffer * 2);
+        let visible_count = (viewport_h / ROW_HEIGHT).ceil() as usize + (SCROLL_BUFFER_ROWS * 2);
         let end_idx = (start_idx + visible_count).min(total_count);
 
         let slice = rows[start_idx..end_idx].to_vec();
@@ -193,28 +227,24 @@ pub fn HexView(
         (padding_top, padding_bottom, slice)
     });
 
-    // Auto-scroll logic: Only snap if we are already near bottom or explicitly requested?
-    // User requested simpler logic before, but virtualization complicates "scroll to bottom".
-    // If the valid data grows, we might want to auto-scroll.
-    // However, tracking scroll status is cleaner. For now, let's keep it simple:
-    // If we receive new events, we update the list. Sticky scroll is hard with virtualization without tracking "is_at_bottom".
-    // Let's assume the user wants to see the latest data if they haven't scrolled up.
-
-    // Actually, simply setting scroll_top to scroll_height on new data is a valid strategy for "terminal like" behavior
-    // BUT we need to check if user scrolled up manually.
-    // For this refactor, let's focus on the rendering optimization requested.
-    // The previous implementation used `div.set_scroll_top(div.scroll_height())`.
+    // Auto-scroll: Only scroll to bottom if user is already near bottom (tail-follow mode)
+    // This prevents auto-scroll from disrupting manual scrolling
     create_effect(move |_| {
-        // Trigger on dependency
+        // Trigger on new data
         all_hex_rows.with(|_| {});
 
-        // Naive auto-scroll (can be improved later)
         if let Some(div) = container_ref.get() {
-            // Only auto-scroll if we were recently at the bottom?
-            // Or always? The user didn't specify, but regular terminal rules apply.
-            // Let's scroll to bottom if we are adding data.
-            // We can check `div.scroll_top() + div.client_height() >= div.scroll_height() - 10.0`
-            div.set_scroll_top(div.scroll_height());
+            let scroll_top = div.scroll_top() as f64;
+            let client_height = div.client_height() as f64;
+            let scroll_height = div.scroll_height() as f64;
+
+            // Only auto-scroll if user is near bottom (tail-follow mode)
+            let is_near_bottom =
+                scroll_top + client_height >= scroll_height - AUTO_SCROLL_THRESHOLD;
+
+            if is_near_bottom {
+                div.set_scroll_top(div.scroll_height());
+            }
         }
     });
 
@@ -232,7 +262,7 @@ pub fn HexView(
                     let target_row = range.start_byte_offset / bpr;
                     let target_scroll = (target_row as f64) * ROW_HEIGHT;
                     let byte_count = range.end_byte_offset - range.start_byte_offset;
-                    let expected_rows = (byte_count + bpr - 1) / bpr; // Ceiling division
+                    let expected_rows = byte_count.div_ceil(bpr); // Ceiling division
 
                     web_sys::console::log_1(&format!(
                         "HexView received selection from {:?}: bytes {}-{} (count: {}), scrolling to row {} ({}px), should highlight ~{} rows",
@@ -294,7 +324,9 @@ pub fn HexView(
                                             }
                                         }
                                     }
-                                    if is_ascii_found.is_none() && el.class_list().contains("ascii-char") {
+                                    if is_ascii_found.is_none()
+                                        && el.class_list().contains("ascii-char")
+                                    {
                                         is_ascii_found = Some(true);
                                     }
                                     if offset_found.is_some() && is_ascii_found.is_some() {
@@ -309,11 +341,21 @@ pub fn HexView(
                         let start_info = get_info(anchor);
                         let end_info = get_info(focus);
 
-                        if let (Some((start_off, start_is_ascii)), Some((end_off, _))) = (start_info, end_info) {
-                            let (min, max) = if start_off < end_off { (start_off, end_off) } else { (end_off, start_off) };
+                        if let (Some((start_off, start_is_ascii)), Some((end_off, _))) =
+                            (start_info, end_info)
+                        {
+                            let (min, max) = if start_off < end_off {
+                                (start_off, end_off)
+                            } else {
+                                (end_off, start_off)
+                            };
 
                             // Valid HexView selection found
-                            set_active_origin.set(Some(if start_is_ascii { SelectionOrigin::Ascii } else { SelectionOrigin::Hex }));
+                            set_active_origin.set(Some(if start_is_ascii {
+                                SelectionOrigin::Ascii
+                            } else {
+                                SelectionOrigin::Hex
+                            }));
 
                             if let Some(set_g) = set_global {
                                 set_g.set(Some(SelectionRange::new(
@@ -321,7 +363,7 @@ pub fn HexView(
                                     max + 1,
                                     0,
                                     0,
-                                    SelectionSource::HexView
+                                    SelectionSource::HexView,
                                 )));
                             }
                         }
@@ -331,10 +373,14 @@ pub fn HexView(
         }) as Box<dyn FnMut()>);
 
         let document = web_sys::window().unwrap().document().unwrap();
-        let _ = document.add_event_listener_with_callback("selectionchange", callback.as_ref().unchecked_ref());
+        let _ = document
+            .add_event_listener_with_callback("selectionchange", callback.as_ref().unchecked_ref());
 
         on_cleanup(move || {
-            let _ = document.remove_event_listener_with_callback("selectionchange", callback.as_ref().unchecked_ref());
+            let _ = document.remove_event_listener_with_callback(
+                "selectionchange",
+                callback.as_ref().unchecked_ref(),
+            );
             callback.forget();
         });
     });
@@ -366,7 +412,8 @@ pub fn HexView(
                         let is_hex_view = range.source_view == SelectionSource::HexView;
 
                         // Query only elements in range for better performance
-                        if let Ok(elements) = document.query_selector_all(".hex-byte[data-offset]") {
+                        if let Ok(elements) = document.query_selector_all(".hex-byte[data-offset]")
+                        {
                             for i in 0..elements.length() {
                                 if let Some(el) = elements.get(i) {
                                     if let Some(el) = el.dyn_ref::<web_sys::HtmlElement>() {
@@ -379,11 +426,17 @@ pub fn HexView(
                                                     }
                                                     // HexView selection: sync highlighting logic
                                                     else if is_hex_view {
-                                                        let is_ascii = el.class_list().contains("ascii-char");
+                                                        let is_ascii =
+                                                            el.class_list().contains("ascii-char");
                                                         // If origin is ASCII and this is hex, or vice versa, apply sync color
-                                                        if (origin == Some(SelectionOrigin::Ascii) && !is_ascii) ||
-                                                           (origin == Some(SelectionOrigin::Hex) && is_ascii) {
-                                                            let _ = el.class_list().add_1("bg-sync");
+                                                        if (origin == Some(SelectionOrigin::Ascii)
+                                                            && !is_ascii)
+                                                            || (origin
+                                                                == Some(SelectionOrigin::Hex)
+                                                                && is_ascii)
+                                                        {
+                                                            let _ =
+                                                                el.class_list().add_1("bg-sync");
                                                         }
                                                     }
                                                 }
@@ -403,8 +456,6 @@ pub fn HexView(
             callback.forget();
         }
     });
-
-
 
     // Grid Template: Offset | Hex Data | Separator | ASCII
     // Calculate fixed width for hex column to prevent ASCII invasion
@@ -486,14 +537,14 @@ pub fn HexView(
 
                             if let (Some((start_off, start_ascii)), Some((end_off, _))) = (start_info, end_info) {
                                 let (min, max) = if start_off < end_off { (start_off, end_off) } else { (end_off, start_off) };
-                                
+
                                 let mut content = String::new();
                                 let rows = all_hex_rows.get();
-                                
+
                                 for row in rows {
                                     if row.offset + row.bytes.len() <= min { continue; }
                                     if row.offset > max { break; }
-                                    
+
                                     for (i, &b) in row.bytes.iter().enumerate() {
                                         let abs_off = row.offset + i;
                                         if abs_off >= min && abs_off <= max {
@@ -507,13 +558,13 @@ pub fn HexView(
                                                 if !content.is_empty() && content.len() % 3 == 2 { content.push(' '); }
                                                 else if !content.is_empty() && content.ends_with('\n') { /* Newline, no space needed */ }
                                                 else if !content.is_empty() { content.push(' '); }
-                                                
+
                                                 content.push_str(&format!("{:02X}", b));
                                             }
                                         }
                                     }
                                     // Add newlines? Browser copy usually adds newlines for block elements.
-                                    // But here we are constructing a string. 
+                                    // But here we are constructing a string.
                                     // If the selection spans multiple rows, we might want newlines?
                                     // The user "multi line selection" implies block copy.
                                     // Logic: If we finished a row and there are more bytes in range, add newline?
@@ -678,8 +729,8 @@ pub fn HexView(
                                 </div>
 
                                 // Hex Groups (Padded)
-                                <div 
-                                    class="hex-data-container" 
+                                <div
+                                    class="hex-data-container"
                                     class:selection-locked=move || selection_lock.get() == Some(SelectionOrigin::Ascii)
                                     on:mousedown=move |_| set_selection_lock.set(Some(SelectionOrigin::Hex))
                                     style="display: flex; gap: 16px; user-select: text;"

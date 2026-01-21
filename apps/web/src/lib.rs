@@ -13,21 +13,21 @@ use connection::ConnectionManager;
 mod hex_view;
 // mod mavlink_view; // Removed duplicate
 pub mod protocol;
+mod terminal_metadata;
 pub mod worker_logic;
 mod xterm;
-mod terminal_metadata;
 
 pub mod mavlink_view;
-// use hex_view::HexView; // Conditionally used? No, actually used in view! down below?
-// Wait, warning said it was unused.
-// Let's check where it's used.
-// view! { ... <HexView ...> }
-// If it is used in view!, it shouldn't be unused.
-// Maybe because it's inside a `move ||` block or feature gated?
-// Actually, `MavlinkView` and `HexView` were flagged unused.
-// This implies the macro expansion might hide usage or they are genuinely not used because I replaced them?
-// I see `<MavlinkView .../>` in the code I edited earlier.
-// Let's suppress warning for now to be safe or just ignore it if build passes.
+
+// Data retention limits for the unified raw log
+/// Maximum raw log size in bytes (10 MB)
+const MAX_LOG_BYTES: usize = 10 * 1024 * 1024;
+
+/// Maximum number of raw log events (safety fallback)
+const MAX_LOG_EVENTS: usize = 10000;
+
+/// Maximum number of decoded events to retain
+const MAX_DECODED_EVENTS: usize = 2500;
 
 #[derive(Clone, Copy, PartialEq)]
 enum ViewMode {
@@ -95,8 +95,7 @@ pub fn App() -> impl IntoView {
 
     // ========== Cross-View Selection Sync ==========
     // Global selection state for synchronizing selections across Terminal, Hex, and future views
-    let (global_selection, set_global_selection) =
-        create_signal::<Option<SelectionRange>>(None);
+    let (global_selection, set_global_selection) = create_signal::<Option<SelectionRange>>(None);
 
     // Terminal metadata for mapping between Terminal text and raw_log byte positions
     let (terminal_metadata, set_terminal_metadata) =
@@ -152,10 +151,8 @@ pub fn App() -> impl IntoView {
                                     }
 
                                     // Byte-based capping to prevent unbounded memory growth
-                                    const MAX_LOG_BYTES: usize = 10 * 1024 * 1024; // 10 MB
-                                    const MAX_LOG_EVENTS: usize = 10000; // Safety fallback
-
-                                    let total_bytes: usize = log.iter().map(|e| e.byte_size()).sum();
+                                    let total_bytes: usize =
+                                        log.iter().map(|e| e.byte_size()).sum();
 
                                     if total_bytes > MAX_LOG_BYTES || log.len() > MAX_LOG_EVENTS {
                                         // Trim oldest events until under limit
@@ -214,11 +211,11 @@ pub fn App() -> impl IntoView {
                             if !events.is_empty() {
                                 set_events_list.update(|list| {
                                     list.extend(events);
-                                    // Cap at 2500 events to ensure we don't drop high-freq MAVLink packets
+                                    // Cap at MAX_DECODED_EVENTS to ensure we don't drop high-freq MAVLink packets
                                     // before the View effect can process them.
                                     // 500 was too aggressive for 50Hz streams.
-                                    if list.len() > 2500 {
-                                        let split = list.len() - 2500;
+                                    if list.len() > MAX_DECODED_EVENTS {
+                                        let split = list.len() - MAX_DECODED_EVENTS;
                                         list.drain(0..split);
                                     }
                                 });
@@ -342,9 +339,6 @@ pub fn App() -> impl IntoView {
                     .map(|v| v as u16);
 
                 // Store for reconnect
-                set_last_vid.set(vid);
-                set_last_pid.set(pid);
-
                 set_last_vid.set(vid);
                 set_last_pid.set(pid);
 

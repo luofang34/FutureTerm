@@ -24,7 +24,8 @@ fn count_visible_chars(s: &str) -> usize {
                     if bytes[idx] == 0x07 {
                         idx += 1;
                         break;
-                    } else if idx + 1 < bytes.len() && bytes[idx] == 0x1B && bytes[idx + 1] == b'\\' {
+                    } else if idx + 1 < bytes.len() && bytes[idx] == 0x1B && bytes[idx + 1] == b'\\'
+                    {
                         idx += 2;
                         break;
                     }
@@ -102,8 +103,8 @@ pub struct TerminalSpan {
 #[derive(Clone)]
 pub struct TerminalMetadata {
     spans: VecDeque<TerminalSpan>,
-    current_raw_log_offset: usize, // Cumulative byte offset
-    current_terminal_line: usize,  // Current Terminal line number
+    current_raw_log_offset: usize,  // Cumulative byte offset
+    current_terminal_line: usize,   // Current Terminal line number
     current_terminal_column: usize, // Current column position on current line
     max_spans: usize,               // Maximum number of spans to retain
 }
@@ -127,7 +128,7 @@ impl TerminalMetadata {
     /// Vector of CharByteMapping entries for each visible character
     fn build_char_map(
         raw_bytes: &[u8],
-        decoded_text: &str,
+        _decoded_text: &str,
         column_offset: usize,
     ) -> Vec<CharByteMapping> {
         let mut map = Vec::new();
@@ -135,14 +136,13 @@ impl TerminalMetadata {
         let mut col_idx = column_offset; // Start from the column offset
         let mut line_idx = 0;
 
-        // Debug: Show what we're parsing
-        #[cfg(target_arch = "wasm32")]
+        // Debug logging disabled in release builds for performance
+        #[cfg(all(debug_assertions, target_arch = "wasm32"))]
         {
             web_sys::console::log_1(
                 &format!(
-                    "build_char_map: {} bytes, decoded: {:?}, column_offset: {}",
+                    "build_char_map: {} bytes, column_offset: {}",
                     raw_bytes.len(),
-                    decoded_text,
                     column_offset
                 )
                 .into(),
@@ -205,7 +205,7 @@ impl TerminalMetadata {
 
                 byte_idx += 1;
                 line_idx += 1; // Move to next line
-                col_idx = 0;   // Reset column counter (new lines start at 0, not column_offset)
+                col_idx = 0; // Reset column counter (new lines start at 0, not column_offset)
                 continue;
             }
 
@@ -234,22 +234,10 @@ impl TerminalMetadata {
             col_idx += 1; // Each character counts as 1 column
         }
 
-        // Debug: Show resulting map (first 50 chars only to avoid spam)
-        #[cfg(target_arch = "wasm32")]
+        // Debug logging disabled in release builds for performance
+        #[cfg(all(debug_assertions, target_arch = "wasm32"))]
         {
-            let map_summary: Vec<String> = map
-                .iter()
-                .take(50)
-                .map(|m| {
-                    format!(
-                        "L{}:C{}@{}+{}",
-                        m.line_in_span, m.terminal_column, m.byte_offset_in_span, m.byte_length
-                    )
-                })
-                .collect();
-            web_sys::console::log_1(
-                &format!("char_map ({} entries): {:?}", map.len(), map_summary).into(),
-            );
+            web_sys::console::log_1(&format!("char_map: {} entries", map.len()).into());
         }
 
         map
@@ -381,7 +369,7 @@ impl TerminalMetadata {
         end_row: usize,
         end_col: usize,
     ) -> Option<(usize, usize)> {
-        #[cfg(target_arch = "wasm32")]
+        #[cfg(all(debug_assertions, target_arch = "wasm32"))]
         web_sys::console::log_1(
             &format!(
                 "terminal_position_to_bytes: start=({}, {}) end=({}, {})",
@@ -409,12 +397,12 @@ impl TerminalMetadata {
 
             // Check if span contains the column (on line 0 of the span)
             let line_in_span = start_row.saturating_sub(s.terminal_line);
-            s.char_to_byte_map.iter().any(|m| {
-                m.line_in_span == line_in_span && m.terminal_column == start_col
-            })
+            s.char_to_byte_map
+                .iter()
+                .any(|m| m.line_in_span == line_in_span && m.terminal_column == start_col)
         })?;
 
-        #[cfg(target_arch = "wasm32")]
+        #[cfg(all(debug_assertions, target_arch = "wasm32"))]
         web_sys::console::log_1(
             &format!(
                 "Found start_span: terminal_line={}, column_offset={}, byte_range={}-{}, text_len={}, char_map_entries={}",
@@ -433,7 +421,7 @@ impl TerminalMetadata {
         // So we adjust BEFORE finding the span
         let actual_end_col = end_col.saturating_sub(1);
 
-        #[cfg(target_arch = "wasm32")]
+        #[cfg(all(debug_assertions, target_arch = "wasm32"))]
         web_sys::console::log_1(
             &format!(
                 "Adjusted end column: {} -> {} (xterm end is exclusive)",
@@ -454,12 +442,12 @@ impl TerminalMetadata {
 
             // Check if span contains the ADJUSTED column
             let line_in_span = end_row.saturating_sub(s.terminal_line);
-            s.char_to_byte_map.iter().any(|m| {
-                m.line_in_span == line_in_span && m.terminal_column == actual_end_col
-            })
+            s.char_to_byte_map
+                .iter()
+                .any(|m| m.line_in_span == line_in_span && m.terminal_column == actual_end_col)
         })?;
 
-        #[cfg(target_arch = "wasm32")]
+        #[cfg(all(debug_assertions, target_arch = "wasm32"))]
         web_sys::console::log_1(
             &format!(
                 "Found end_span: terminal_line={}, column_offset={}, byte_range={}-{}, text_len={}, char_map_entries={}",
@@ -476,7 +464,7 @@ impl TerminalMetadata {
         // Calculate line index within start span
         let start_line_in_span = start_row.saturating_sub(start_span.terminal_line);
 
-        #[cfg(target_arch = "wasm32")]
+        #[cfg(all(debug_assertions, target_arch = "wasm32"))]
         web_sys::console::log_1(
             &format!(
                 "Looking for start char: line_in_span={}, col={}",
@@ -497,13 +485,13 @@ impl TerminalMetadata {
                 start_span
                     .char_to_byte_map
                     .iter()
-                    .filter(|m| m.line_in_span == start_line_in_span)
-                    .last()
+                    .rev()
+                    .find(|m| m.line_in_span == start_line_in_span)
             })?;
 
         let start_byte = start_span.raw_log_byte_start + start_char_map.byte_offset_in_span;
 
-        #[cfg(target_arch = "wasm32")]
+        #[cfg(all(debug_assertions, target_arch = "wasm32"))]
         web_sys::console::log_1(
             &format!(
                 "Found start char: line={}, col={}, byte_offset={}, len={} -> global_byte={}",
@@ -519,7 +507,7 @@ impl TerminalMetadata {
         // Calculate line index within end span
         let end_line_in_span = end_row.saturating_sub(end_span.terminal_line);
 
-        #[cfg(target_arch = "wasm32")]
+        #[cfg(all(debug_assertions, target_arch = "wasm32"))]
         web_sys::console::log_1(
             &format!(
                 "Looking for end char: line_in_span={}, col={} (already adjusted from {} since xterm end is exclusive)",
@@ -540,8 +528,8 @@ impl TerminalMetadata {
                 end_span
                     .char_to_byte_map
                     .iter()
-                    .filter(|m| m.line_in_span == end_line_in_span)
-                    .last()
+                    .rev()
+                    .find(|m| m.line_in_span == end_line_in_span)
             })?;
 
         // Include the full character at end position
@@ -549,7 +537,7 @@ impl TerminalMetadata {
             + end_char_map.byte_offset_in_span
             + end_char_map.byte_length;
 
-        #[cfg(target_arch = "wasm32")]
+        #[cfg(all(debug_assertions, target_arch = "wasm32"))]
         web_sys::console::log_1(
             &format!(
                 "Found end char: line={}, col={}, byte_offset={}, len={} -> global_byte={} (inclusive)",
@@ -562,30 +550,8 @@ impl TerminalMetadata {
             .into(),
         );
 
-        #[cfg(target_arch = "wasm32")]
-        {
-            web_sys::console::log_1(&format!("Final byte range: {}-{}", start_byte, end_byte).into());
-
-            // Debug: Show actual byte values in the selection
-            let mut byte_preview = Vec::new();
-            for span in &self.spans {
-                for (idx, &byte) in span.raw_bytes.iter().enumerate() {
-                    let global_byte = span.raw_log_byte_start + idx;
-                    if global_byte >= start_byte && global_byte < end_byte {
-                        byte_preview.push(format!("{:02X}", byte));
-                        if byte_preview.len() >= 20 {
-                            break; // Limit preview
-                        }
-                    }
-                }
-                if byte_preview.len() >= 20 {
-                    break;
-                }
-            }
-            web_sys::console::log_1(
-                &format!("Selected bytes (hex): {}", byte_preview.join(" ")).into(),
-            );
-        }
+        #[cfg(all(debug_assertions, target_arch = "wasm32"))]
+        web_sys::console::log_1(&format!("Mapped to bytes: {}-{}", start_byte, end_byte).into());
 
         Some((start_byte, end_byte))
     }
@@ -654,24 +620,22 @@ impl TerminalMetadata {
 
         for span in &self.spans {
             // Check for overlap
-             if span.raw_log_byte_end > start_byte && span.raw_log_byte_start < end_byte {
+            if span.raw_log_byte_end > start_byte && span.raw_log_byte_start < end_byte {
                 // Find start position
                 if start_pos.is_none() {
                     // If start_byte is before this span, clamp to span start
                     if start_byte <= span.raw_log_byte_start {
-                         start_pos = Some((span.terminal_line, span.column_offset));
+                        start_pos = Some((span.terminal_line, span.column_offset));
                     } else {
                         // Find specific char
                         let local_offset = start_byte - span.raw_log_byte_start;
                         // Find visible char containing this byte
                         if let Some(map) = span.char_to_byte_map.iter().find(|m| {
-                            m.byte_offset_in_span <= local_offset 
-                            && (m.byte_offset_in_span + m.byte_length) > local_offset
+                            m.byte_offset_in_span <= local_offset
+                                && (m.byte_offset_in_span + m.byte_length) > local_offset
                         }) {
-                            start_pos = Some((
-                                span.terminal_line + map.line_in_span,
-                                map.terminal_column
-                            ));
+                            start_pos =
+                                Some((span.terminal_line + map.line_in_span, map.terminal_column));
                         }
                     }
                 }
@@ -679,42 +643,41 @@ impl TerminalMetadata {
                 // Update end position (keep processing spans until we cover range)
                 // If end_byte is beyond this span, we take the span end
                 if end_byte >= span.raw_log_byte_end {
-                    // Last char of span
-                    let lines = span.text.lines().count().max(1);
-                    // This is rough end approximation. Ideally we use the last char map
+                    // Use the last character in the char map for precise positioning
                     if let Some(last) = span.char_to_byte_map.last() {
-                         end_pos = Some((
+                        end_pos = Some((
                             span.terminal_line + last.line_in_span,
-                            last.terminal_column + 1 // Exclusive
-                         ));
+                            last.terminal_column + 1, // Exclusive
+                        ));
                     }
                 } else {
                     // Find specific char inside span
-                     let local_offset = end_byte - span.raw_log_byte_start;
-                     // Find visible char ending at or after this byte
-                      if let Some(map) = span.char_to_byte_map.iter().find(|m| {
-                            m.byte_offset_in_span <= local_offset // Start of char is before end
-                            && (m.byte_offset_in_span + m.byte_length) >= local_offset // End of char is >= end
-                        }) {
-                             // Correct logic: If end_byte is 5, and char is 4-5, we want end of that char?
-                             // Selection is exclusive.
-                             end_pos = Some((
+                    let local_offset = end_byte - span.raw_log_byte_start;
+                    // Find visible char ending at or after this byte
+                    if let Some(map) = span.char_to_byte_map.iter().find(|m| {
+                        m.byte_offset_in_span <= local_offset // Start of char is before end
+                            && (m.byte_offset_in_span + m.byte_length) >= local_offset
+                        // End of char is >= end
+                    }) {
+                        // Correct logic: If end_byte is 5, and char is 4-5, we want end of that char?
+                        // Selection is exclusive.
+                        end_pos = Some((
+                            span.terminal_line + map.line_in_span,
+                            map.terminal_column, // xterm end is exclusive, so if map is col 5, and we end at start of col 5, it's 5.
+                                                 // If we end strictly AFTER start of col 5...
+                                                 // Simpler: Map byte to char index.
+                        ));
+
+                        // Adjust for partial overlap?
+                        // If local_offset == m.byte_offset_in_span, we end exactly at char start -> col
+                        // If local_offset > m, we end inside -> col + 1
+                        if local_offset > map.byte_offset_in_span {
+                            end_pos = Some((
                                 span.terminal_line + map.line_in_span,
-                                map.terminal_column // xterm end is exclusive, so if map is col 5, and we end at start of col 5, it's 5.
-                                // If we end strictly AFTER start of col 5...
-                                // Simpler: Map byte to char index.
+                                map.terminal_column + 1,
                             ));
-                            
-                            // Adjust for partial overlap?
-                            // If local_offset == m.byte_offset_in_span, we end exactly at char start -> col
-                            // If local_offset > m, we end inside -> col + 1
-                             if local_offset > map.byte_offset_in_span {
-                                end_pos = Some((
-                                    span.terminal_line + map.line_in_span,
-                                    map.terminal_column + 1
-                                ));
-                             }
                         }
+                    }
                 }
             }
         }
