@@ -99,7 +99,7 @@ pub fn App() -> impl IntoView {
         create_signal::<Option<SelectionRange>>(None);
 
     // Terminal metadata for mapping between Terminal text and raw_log byte positions
-    let (_terminal_metadata, set_terminal_metadata) =
+    let (terminal_metadata, set_terminal_metadata) =
         create_signal(terminal_metadata::TerminalMetadata::new());
 
     // Legacy signals removed/replaced by manager:
@@ -182,27 +182,28 @@ pub fn App() -> impl IntoView {
                                 });
                             }
 
-                            // Terminal direct write (legacy, for backward compatibility)
+                            // Terminal direct write - always write to maintain metadata mapping
+                            // Terminal exists even when view is hidden, and we need complete metadata
+                            // for cross-view selection sync to work
                             if let Some(term) = term_handle.get_untracked() {
-                                if view_mode.get_untracked() == ViewMode::Terminal {
-                                    for f in &frames {
-                                        if !f.bytes.is_empty() {
-                                            if let Ok(text) = decoder
-                                                .decode_with_u8_array_and_options(&f.bytes, &opts)
-                                            {
-                                                let text: String = text;
-                                                if !text.is_empty() {
-                                                    term.write(&text);
+                                for f in &frames {
+                                    if !f.bytes.is_empty() {
+                                        if let Ok(text) = decoder
+                                            .decode_with_u8_array_and_options(&f.bytes, &opts)
+                                        {
+                                            let text: String = text;
+                                            if !text.is_empty() {
+                                                term.write(&text);
 
-                                                    // Record metadata for cross-view selection sync
-                                                    set_terminal_metadata.update(|meta| {
-                                                        meta.record_write(
-                                                            f.bytes.len(),
-                                                            &text,
-                                                            f.timestamp_us,
-                                                        );
-                                                    });
-                                                }
+                                                // Record metadata for cross-view selection sync
+                                                // This must happen for ALL data, not just when Terminal is visible
+                                                set_terminal_metadata.update(|meta| {
+                                                    meta.record_write(
+                                                        &f.bytes,
+                                                        &text,
+                                                        f.timestamp_us,
+                                                    );
+                                                });
                                             }
                                         }
                                     }
@@ -636,6 +637,9 @@ pub fn App() -> impl IntoView {
                          <xterm::TerminalView
                              on_mount=on_terminal_mount
                              on_terminal_ready=on_term_ready
+                             terminal_metadata=terminal_metadata
+                             global_selection=global_selection
+                             set_global_selection=set_global_selection
                          />
                     </div>
 

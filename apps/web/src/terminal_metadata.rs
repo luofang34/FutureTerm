@@ -1,5 +1,70 @@
 use std::collections::VecDeque;
 
+/// Count visible characters in a string (skipping ANSI escape sequences)
+fn count_visible_chars(s: &str) -> usize {
+    let bytes = s.as_bytes();
+    let mut count = 0;
+    let mut idx = 0;
+
+    while idx < bytes.len() {
+        // Skip ANSI escape sequences
+        if bytes[idx] == 0x1B && idx + 1 < bytes.len() {
+            if bytes[idx + 1] == b'[' {
+                // CSI sequence
+                idx += 2;
+                while idx < bytes.len() && !bytes[idx].is_ascii_alphabetic() {
+                    idx += 1;
+                }
+                idx += 1; // Skip the terminating letter
+                continue;
+            } else if bytes[idx + 1] == b']' {
+                // OSC sequence
+                idx += 2;
+                while idx < bytes.len() {
+                    if bytes[idx] == 0x07 {
+                        idx += 1;
+                        break;
+                    } else if idx + 1 < bytes.len() && bytes[idx] == 0x1B && bytes[idx + 1] == b'\\' {
+                        idx += 2;
+                        break;
+                    }
+                    idx += 1;
+                }
+                continue;
+            }
+        }
+
+        // Skip carriage return and newline (they're not visible column positions)
+        if bytes[idx] == b'\r' || bytes[idx] == b'\n' {
+            idx += 1;
+            continue;
+        }
+
+        // Count visible character
+        count += 1;
+        idx += 1;
+    }
+
+    count
+}
+
+/// Maps terminal column positions to byte positions within a span.
+/// Accounts for ANSI escape sequences and multi-byte UTF-8 characters.
+#[derive(Clone, Debug)]
+pub struct CharByteMapping {
+    /// Line number within this span (0-indexed, resets per span)
+    pub line_in_span: usize,
+
+    /// Terminal column position (visible character index within the line)
+    pub terminal_column: usize,
+
+    /// Byte offset within this span's raw_bytes
+    pub byte_offset_in_span: usize,
+
+    /// Byte length (1 for ASCII, 2-4 for UTF-8)
+    pub byte_length: usize,
+}
+
 /// Terminal text span mapped to raw_log byte positions.
 /// This allows mapping between Terminal buffer positions and raw byte offsets.
 #[derive(Clone, Debug)]
@@ -14,20 +79,32 @@ pub struct TerminalSpan {
     /// Decoded text content
     pub text: String,
 
+    /// Original raw bytes for this span (includes ANSI codes)
+    pub raw_bytes: Vec<u8>,
+
     /// Line number in Terminal buffer (dynamic, invalidated on scroll/clear)
     pub terminal_line: usize,
 
+    /// Starting column offset for this span on its first line
+    /// (used when multiple spans exist on the same terminal line)
+    pub column_offset: usize,
+
     /// Timestamp in microseconds
     pub timestamp_us: u64,
+
+    /// Character to byte mapping (for column-level precision)
+    pub char_to_byte_map: Vec<CharByteMapping>,
 }
 
 /// Tracks metadata for Terminal text to enable byte-level selection mapping.
 /// Maintains a sliding window of recent spans to correlate Terminal positions
 /// with raw_log byte offsets.
+#[derive(Clone)]
 pub struct TerminalMetadata {
     spans: VecDeque<TerminalSpan>,
     current_raw_log_offset: usize, // Cumulative byte offset
     current_terminal_line: usize,  // Current Terminal line number
+    current_terminal_column: usize, // Current column position on current line
     max_spans: usize,               // Maximum number of spans to retain
 }
 
@@ -37,12 +114,154 @@ impl TerminalMetadata {
         Self::with_capacity(1000)
     }
 
+    /// Parse raw bytes and build character-to-byte mapping.
+    /// Accounts for ANSI escape sequences (invisible) and multi-byte UTF-8 characters.
+    /// Tracks line numbers and resets column counter on newlines.
+    ///
+    /// # Arguments
+    /// * `raw_bytes` - Raw bytes including ANSI codes
+    /// * `decoded_text` - Decoded text (for validation and debugging)
+    /// * `column_offset` - Starting column for first line (for continuing spans on same line)
+    ///
+    /// # Returns
+    /// Vector of CharByteMapping entries for each visible character
+    fn build_char_map(
+        raw_bytes: &[u8],
+        decoded_text: &str,
+        column_offset: usize,
+    ) -> Vec<CharByteMapping> {
+        let mut map = Vec::new();
+        let mut byte_idx = 0;
+        let mut col_idx = column_offset; // Start from the column offset
+        let mut line_idx = 0;
+
+        // Debug: Show what we're parsing
+        #[cfg(target_arch = "wasm32")]
+        {
+            web_sys::console::log_1(
+                &format!(
+                    "build_char_map: {} bytes, decoded: {:?}, column_offset: {}",
+                    raw_bytes.len(),
+                    decoded_text,
+                    column_offset
+                )
+                .into(),
+            );
+        }
+
+        while byte_idx < raw_bytes.len() {
+            // Check for ANSI escape sequence: ESC [ ... (letter)
+            if raw_bytes[byte_idx] == 0x1B && byte_idx + 1 < raw_bytes.len() {
+                if raw_bytes[byte_idx + 1] == b'[' {
+                    // ANSI CSI sequence: ESC [ ... (letter)
+                    byte_idx += 2;
+                    while byte_idx < raw_bytes.len() {
+                        let c = raw_bytes[byte_idx];
+                        byte_idx += 1;
+                        // CSI sequences end with a letter (0x40-0x7E range)
+                        if (0x40..=0x7E).contains(&c) {
+                            break;
+                        }
+                    }
+                    // Skip ANSI sequences (don't add to map, don't increment column)
+                    continue;
+                } else if raw_bytes[byte_idx + 1] == b']' {
+                    // OSC sequence: ESC ] ... ST (ESC \ or BEL)
+                    byte_idx += 2;
+                    while byte_idx < raw_bytes.len() {
+                        if raw_bytes[byte_idx] == 0x07 {
+                            // BEL terminator
+                            byte_idx += 1;
+                            break;
+                        } else if byte_idx + 1 < raw_bytes.len()
+                            && raw_bytes[byte_idx] == 0x1B
+                            && raw_bytes[byte_idx + 1] == b'\\'
+                        {
+                            // ESC \ terminator
+                            byte_idx += 2;
+                            break;
+                        }
+                        byte_idx += 1;
+                    }
+                    continue;
+                }
+            }
+
+            // Check for carriage return (skip, it's not a visible character)
+            if raw_bytes[byte_idx] == b'\r' {
+                byte_idx += 1;
+                continue;
+            }
+
+            // Check for newline character
+            if raw_bytes[byte_idx] == b'\n' {
+                // Add newline to map (it's a visible character in terms of layout)
+                map.push(CharByteMapping {
+                    line_in_span: line_idx,
+                    terminal_column: col_idx,
+                    byte_offset_in_span: byte_idx,
+                    byte_length: 1,
+                });
+
+                byte_idx += 1;
+                line_idx += 1; // Move to next line
+                col_idx = 0;   // Reset column counter (new lines start at 0, not column_offset)
+                continue;
+            }
+
+            // Regular character (UTF-8)
+            let char_start = byte_idx;
+            let char_len = if raw_bytes[byte_idx] & 0x80 == 0 {
+                1 // ASCII (0xxxxxxx)
+            } else if raw_bytes[byte_idx] & 0xE0 == 0xC0 {
+                2 // 2-byte UTF-8 (110xxxxx)
+            } else if raw_bytes[byte_idx] & 0xF0 == 0xE0 {
+                3 // 3-byte UTF-8 (1110xxxx)
+            } else if raw_bytes[byte_idx] & 0xF8 == 0xF0 {
+                4 // 4-byte UTF-8 (11110xxx)
+            } else {
+                1 // Invalid, treat as single byte
+            };
+
+            map.push(CharByteMapping {
+                line_in_span: line_idx,
+                terminal_column: col_idx,
+                byte_offset_in_span: char_start,
+                byte_length: char_len,
+            });
+
+            byte_idx += char_len;
+            col_idx += 1; // Each character counts as 1 column
+        }
+
+        // Debug: Show resulting map (first 50 chars only to avoid spam)
+        #[cfg(target_arch = "wasm32")]
+        {
+            let map_summary: Vec<String> = map
+                .iter()
+                .take(50)
+                .map(|m| {
+                    format!(
+                        "L{}:C{}@{}+{}",
+                        m.line_in_span, m.terminal_column, m.byte_offset_in_span, m.byte_length
+                    )
+                })
+                .collect();
+            web_sys::console::log_1(
+                &format!("char_map ({} entries): {:?}", map.len(), map_summary).into(),
+            );
+        }
+
+        map
+    }
+
     /// Creates a new metadata tracker with specified capacity
     pub fn with_capacity(max_spans: usize) -> Self {
         Self {
             spans: VecDeque::with_capacity(max_spans),
             current_raw_log_offset: 0,
             current_terminal_line: 0,
+            current_terminal_column: 0,
             max_spans,
         }
     }
@@ -50,22 +269,49 @@ impl TerminalMetadata {
     /// Records a new write operation to the Terminal
     ///
     /// # Arguments
-    /// * `frame_bytes_len` - Number of raw bytes in this frame
+    /// * `raw_bytes` - Raw bytes in this frame (includes ANSI codes)
     /// * `text` - Decoded text written to Terminal
     /// * `timestamp_us` - Timestamp of this write
-    pub fn record_write(&mut self, frame_bytes_len: usize, text: &str, timestamp_us: u64) {
-        let line_count = text.lines().count().max(1); // At least 1 line
+    pub fn record_write(&mut self, raw_bytes: &[u8], text: &str, timestamp_us: u64) {
+        let frame_bytes_len = raw_bytes.len();
+
+        // Count lines (including partial lines)
+        let newline_count = text.matches('\n').count();
+        let has_trailing_text = !text.ends_with('\n');
+
+        // Build character-to-byte mapping for column-level precision
+        // Pass the current column offset so this span knows where it starts on the line
+        let char_map = Self::build_char_map(raw_bytes, text, self.current_terminal_column);
 
         let span = TerminalSpan {
             raw_log_byte_start: self.current_raw_log_offset,
             raw_log_byte_end: self.current_raw_log_offset + frame_bytes_len,
             text: text.to_string(),
+            raw_bytes: raw_bytes.to_vec(),
             terminal_line: self.current_terminal_line,
+            column_offset: self.current_terminal_column,
             timestamp_us,
+            char_to_byte_map: char_map,
         };
 
         self.current_raw_log_offset += frame_bytes_len;
-        self.current_terminal_line += line_count;
+
+        // Update line and column position
+        if newline_count > 0 {
+            self.current_terminal_line += newline_count;
+            // After newlines, column resets to 0, then advances by any trailing text
+            if has_trailing_text {
+                // Count visible characters in the last line (after last \n)
+                let last_line = text.rsplit('\n').next().unwrap_or("");
+                self.current_terminal_column = count_visible_chars(last_line);
+            } else {
+                self.current_terminal_column = 0;
+            }
+        } else {
+            // No newlines - we're continuing on the same line
+            // Advance column by the number of visible characters
+            self.current_terminal_column += count_visible_chars(text);
+        }
 
         self.spans.push_back(span);
 
@@ -115,6 +361,233 @@ impl TerminalMetadata {
             (Some(start), Some(end)) => Some((start, end)),
             _ => None,
         }
+    }
+
+    /// Maps terminal selection (row+column precision) to byte range.
+    /// Uses character-to-byte mapping to handle ANSI codes and UTF-8.
+    ///
+    /// # Arguments
+    /// * `start_row` - Start row in Terminal buffer
+    /// * `start_col` - Start column in Terminal buffer
+    /// * `end_row` - End row in Terminal buffer
+    /// * `end_col` - End column in Terminal buffer (EXCLUSIVE, as per xterm.js convention)
+    ///
+    /// # Returns
+    /// Option<(start_byte_offset, end_byte_offset)> if mapping is found
+    pub fn terminal_position_to_bytes(
+        &self,
+        start_row: usize,
+        start_col: usize,
+        end_row: usize,
+        end_col: usize,
+    ) -> Option<(usize, usize)> {
+        #[cfg(target_arch = "wasm32")]
+        web_sys::console::log_1(
+            &format!(
+                "terminal_position_to_bytes: start=({}, {}) end=({}, {})",
+                start_row, start_col, end_row, end_col
+            )
+            .into(),
+        );
+
+        if self.spans.is_empty() {
+            #[cfg(target_arch = "wasm32")]
+            web_sys::console::log_1(&"No spans available".into());
+            return None;
+        }
+
+        // Find span that CONTAINS (start_row, start_col)
+        // Multiple spans can be on the same line, so check column ranges too
+        let start_span = self.spans.iter().find(|s| {
+            let span_line_count = s.text.lines().count().max(1);
+            let span_end_line = s.terminal_line + span_line_count;
+
+            // Check if span contains the row
+            if !(s.terminal_line <= start_row && start_row < span_end_line) {
+                return false;
+            }
+
+            // Check if span contains the column (on line 0 of the span)
+            let line_in_span = start_row.saturating_sub(s.terminal_line);
+            s.char_to_byte_map.iter().any(|m| {
+                m.line_in_span == line_in_span && m.terminal_column == start_col
+            })
+        })?;
+
+        #[cfg(target_arch = "wasm32")]
+        web_sys::console::log_1(
+            &format!(
+                "Found start_span: terminal_line={}, column_offset={}, byte_range={}-{}, text_len={}, char_map_entries={}",
+                start_span.terminal_line,
+                start_span.column_offset,
+                start_span.raw_log_byte_start,
+                start_span.raw_log_byte_end,
+                start_span.text.len(),
+                start_span.char_to_byte_map.len()
+            )
+            .into(),
+        );
+
+        // IMPORTANT: xterm's end column is EXCLUSIVE (like a range)
+        // When xterm says cols 31-33, it means include 31 and 32, but NOT 33
+        // So we adjust BEFORE finding the span
+        let actual_end_col = end_col.saturating_sub(1);
+
+        #[cfg(target_arch = "wasm32")]
+        web_sys::console::log_1(
+            &format!(
+                "Adjusted end column: {} -> {} (xterm end is exclusive)",
+                end_col, actual_end_col
+            )
+            .into(),
+        );
+
+        // Find span that CONTAINS (end_row, actual_end_col)
+        let end_span = self.spans.iter().find(|s| {
+            let span_line_count = s.text.lines().count().max(1);
+            let span_end_line = s.terminal_line + span_line_count;
+
+            // Check if span contains the row
+            if !(s.terminal_line <= end_row && end_row < span_end_line) {
+                return false;
+            }
+
+            // Check if span contains the ADJUSTED column
+            let line_in_span = end_row.saturating_sub(s.terminal_line);
+            s.char_to_byte_map.iter().any(|m| {
+                m.line_in_span == line_in_span && m.terminal_column == actual_end_col
+            })
+        })?;
+
+        #[cfg(target_arch = "wasm32")]
+        web_sys::console::log_1(
+            &format!(
+                "Found end_span: terminal_line={}, column_offset={}, byte_range={}-{}, text_len={}, char_map_entries={}",
+                end_span.terminal_line,
+                end_span.column_offset,
+                end_span.raw_log_byte_start,
+                end_span.raw_log_byte_end,
+                end_span.text.len(),
+                end_span.char_to_byte_map.len()
+            )
+            .into(),
+        );
+
+        // Calculate line index within start span
+        let start_line_in_span = start_row.saturating_sub(start_span.terminal_line);
+
+        #[cfg(target_arch = "wasm32")]
+        web_sys::console::log_1(
+            &format!(
+                "Looking for start char: line_in_span={}, col={}",
+                start_line_in_span, start_col
+            )
+            .into(),
+        );
+
+        // Find character at (line_in_span, column) in start span
+        let start_char_map = start_span
+            .char_to_byte_map
+            .iter()
+            .find(|m| m.line_in_span == start_line_in_span && m.terminal_column == start_col)
+            .or_else(|| {
+                #[cfg(target_arch = "wasm32")]
+                web_sys::console::log_1(&"Using fallback: last char on line".into());
+                // Fallback: find last character on this line
+                start_span
+                    .char_to_byte_map
+                    .iter()
+                    .filter(|m| m.line_in_span == start_line_in_span)
+                    .last()
+            })?;
+
+        let start_byte = start_span.raw_log_byte_start + start_char_map.byte_offset_in_span;
+
+        #[cfg(target_arch = "wasm32")]
+        web_sys::console::log_1(
+            &format!(
+                "Found start char: line={}, col={}, byte_offset={}, len={} -> global_byte={}",
+                start_char_map.line_in_span,
+                start_char_map.terminal_column,
+                start_char_map.byte_offset_in_span,
+                start_char_map.byte_length,
+                start_byte
+            )
+            .into(),
+        );
+
+        // Calculate line index within end span
+        let end_line_in_span = end_row.saturating_sub(end_span.terminal_line);
+
+        #[cfg(target_arch = "wasm32")]
+        web_sys::console::log_1(
+            &format!(
+                "Looking for end char: line_in_span={}, col={} (already adjusted from {} since xterm end is exclusive)",
+                end_line_in_span, actual_end_col, end_col
+            )
+            .into(),
+        );
+
+        // Find character at (line_in_span, column) in end span
+        let end_char_map = end_span
+            .char_to_byte_map
+            .iter()
+            .find(|m| m.line_in_span == end_line_in_span && m.terminal_column == actual_end_col)
+            .or_else(|| {
+                #[cfg(target_arch = "wasm32")]
+                web_sys::console::log_1(&"Using fallback: last char on line".into());
+                // Fallback: find last character on this line
+                end_span
+                    .char_to_byte_map
+                    .iter()
+                    .filter(|m| m.line_in_span == end_line_in_span)
+                    .last()
+            })?;
+
+        // Include the full character at end position
+        let end_byte = end_span.raw_log_byte_start
+            + end_char_map.byte_offset_in_span
+            + end_char_map.byte_length;
+
+        #[cfg(target_arch = "wasm32")]
+        web_sys::console::log_1(
+            &format!(
+                "Found end char: line={}, col={}, byte_offset={}, len={} -> global_byte={} (inclusive)",
+                end_char_map.line_in_span,
+                end_char_map.terminal_column,
+                end_char_map.byte_offset_in_span,
+                end_char_map.byte_length,
+                end_byte
+            )
+            .into(),
+        );
+
+        #[cfg(target_arch = "wasm32")]
+        {
+            web_sys::console::log_1(&format!("Final byte range: {}-{}", start_byte, end_byte).into());
+
+            // Debug: Show actual byte values in the selection
+            let mut byte_preview = Vec::new();
+            for span in &self.spans {
+                for (idx, &byte) in span.raw_bytes.iter().enumerate() {
+                    let global_byte = span.raw_log_byte_start + idx;
+                    if global_byte >= start_byte && global_byte < end_byte {
+                        byte_preview.push(format!("{:02X}", byte));
+                        if byte_preview.len() >= 20 {
+                            break; // Limit preview
+                        }
+                    }
+                }
+                if byte_preview.len() >= 20 {
+                    break;
+                }
+            }
+            web_sys::console::log_1(
+                &format!("Selected bytes (hex): {}", byte_preview.join(" ")).into(),
+            );
+        }
+
+        Some((start_byte, end_byte))
     }
 
     /// Maps raw_log byte range to Terminal line range
@@ -181,6 +654,7 @@ impl TerminalMetadata {
         self.spans.clear();
         self.current_raw_log_offset = 0;
         self.current_terminal_line = 0;
+        self.current_terminal_column = 0;
     }
 
     /// Returns the current number of tracked spans
@@ -211,12 +685,14 @@ mod tests {
         let mut meta = TerminalMetadata::new();
 
         // Write first frame
-        meta.record_write(10, "Hello\nWorld", 1000);
-        assert_eq!(meta.current_byte_offset(), 10);
+        let bytes1 = b"Hello\nWorld";
+        meta.record_write(bytes1, "Hello\nWorld", 1000);
+        assert_eq!(meta.current_byte_offset(), 11);
         assert_eq!(meta.span_count(), 1);
 
         // Write second frame
-        meta.record_write(5, "Test", 2000);
+        let bytes2 = b"Test";
+        meta.record_write(bytes2, "Test", 2000);
         assert_eq!(meta.current_byte_offset(), 15);
         assert_eq!(meta.span_count(), 2);
     }
@@ -225,39 +701,43 @@ mod tests {
     fn test_terminal_lines_to_bytes() {
         let mut meta = TerminalMetadata::new();
 
-        meta.record_write(10, "Line1\nLine2", 1000); // Lines 0-1
-        meta.record_write(5, "Line3", 2000); // Line 2
+        let bytes1 = b"Line1\nLine2";
+        let bytes2 = b"Line3";
+        meta.record_write(bytes1, "Line1\nLine2", 1000); // Lines 0-1
+        meta.record_write(bytes2, "Line3", 2000); // Line 2
 
         // Query lines 0-1 (first span)
         let result = meta.terminal_lines_to_bytes(0, 2);
-        assert_eq!(result, Some((0, 10)));
+        assert_eq!(result, Some((0, 11)));
 
         // Query line 2 (second span)
         let result = meta.terminal_lines_to_bytes(2, 3);
-        assert_eq!(result, Some((10, 15)));
+        assert_eq!(result, Some((11, 16)));
 
         // Query all lines
         let result = meta.terminal_lines_to_bytes(0, 3);
-        assert_eq!(result, Some((0, 15)));
+        assert_eq!(result, Some((0, 16)));
     }
 
     #[test]
     fn test_bytes_to_terminal_lines() {
         let mut meta = TerminalMetadata::new();
 
-        meta.record_write(10, "Line1\nLine2", 1000); // Lines 0-1, bytes 0-10
-        meta.record_write(5, "Line3", 2000); // Line 2, bytes 10-15
+        let bytes1 = b"Line1\nLine2";
+        let bytes2 = b"Line3";
+        meta.record_write(bytes1, "Line1\nLine2", 1000); // Lines 0-1, bytes 0-11
+        meta.record_write(bytes2, "Line3", 2000); // Line 2, bytes 11-16
 
-        // Query bytes 0-10 (first span)
-        let result = meta.bytes_to_terminal_lines(0, 10);
+        // Query bytes 0-11 (first span)
+        let result = meta.bytes_to_terminal_lines(0, 11);
         assert_eq!(result, Some((0, 2)));
 
-        // Query bytes 10-15 (second span)
-        let result = meta.bytes_to_terminal_lines(10, 15);
+        // Query bytes 11-16 (second span)
+        let result = meta.bytes_to_terminal_lines(11, 16);
         assert_eq!(result, Some((2, 3)));
 
         // Query all bytes
-        let result = meta.bytes_to_terminal_lines(0, 15);
+        let result = meta.bytes_to_terminal_lines(0, 16);
         assert_eq!(result, Some((0, 3)));
     }
 
@@ -265,14 +745,16 @@ mod tests {
     fn test_log_trim_adjustment() {
         let mut meta = TerminalMetadata::new();
 
-        meta.record_write(10, "Test1", 1000);
-        meta.record_write(10, "Test2", 2000);
+        let bytes1 = b"Test1";
+        let bytes2 = b"Test2";
+        meta.record_write(bytes1, "Test1", 1000);
+        meta.record_write(bytes2, "Test2", 2000);
 
         // Trim first 5 bytes
         meta.adjust_for_log_trim(5);
 
-        assert_eq!(meta.current_byte_offset(), 15);
-        assert_eq!(meta.span_count(), 2); // Both spans still valid
+        assert_eq!(meta.current_byte_offset(), 5);
+        assert_eq!(meta.span_count(), 1); // First span trimmed away
 
         // Verify offsets adjusted correctly
         let result = meta.bytes_to_terminal_lines(0, 5);
@@ -283,10 +765,10 @@ mod tests {
     fn test_max_capacity() {
         let mut meta = TerminalMetadata::with_capacity(3);
 
-        meta.record_write(1, "A", 1000);
-        meta.record_write(1, "B", 2000);
-        meta.record_write(1, "C", 3000);
-        meta.record_write(1, "D", 4000); // Should evict oldest
+        meta.record_write(b"A", "A", 1000);
+        meta.record_write(b"B", "B", 2000);
+        meta.record_write(b"C", "C", 3000);
+        meta.record_write(b"D", "D", 4000); // Should evict oldest
 
         assert_eq!(meta.span_count(), 3);
     }
