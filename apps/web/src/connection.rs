@@ -362,7 +362,9 @@ impl ConnectionManager {
         let nav = window.navigator();
         let serial = nav.serial();
 
-        web_sys::console::log_1(&"DEBUG: Polling for device re-enumeration (max 3.5 seconds)".into());
+        web_sys::console::log_1(
+            &"DEBUG: Polling for device re-enumeration (max 3.5 seconds)".into(),
+        );
 
         // OPTIMIZATION: Adaptive polling intervals
         // Devices typically re-enumerate within 500-1000ms, so use faster polling initially
@@ -389,9 +391,7 @@ impl ConnectionManager {
                     }
                 }
                 Err(e) => {
-                    web_sys::console::log_1(
-                        &format!("DEBUG: Failed to get ports: {:?}", e).into(),
-                    );
+                    web_sys::console::log_1(&format!("DEBUG: Failed to get ports: {:?}", e).into());
                     return Err("Cannot access ports".to_string());
                 }
             }
@@ -409,7 +409,8 @@ impl ConnectionManager {
 
             let _ = wasm_bindgen_futures::JsFuture::from(js_sys::Promise::new(&mut |r, _| {
                 if let Some(window) = web_sys::window() {
-                    let _ = window.set_timeout_with_callback_and_timeout_and_arguments_0(&r, wait_ms);
+                    let _ =
+                        window.set_timeout_with_callback_and_timeout_and_arguments_0(&r, wait_ms);
                 }
             }))
             .await;
@@ -505,8 +506,7 @@ impl ConnectionManager {
                         match self.poll_for_device_reenumeration().await {
                             Ok(port) => (port, b, f, Some(buf), proto),
                             Err(e) => {
-                                self.set_status
-                                    .set(format!("Connection Failed: {}", e));
+                                self.set_status.set(format!("Connection Failed: {}", e));
                                 return Err(e);
                             }
                         }
@@ -541,8 +541,7 @@ impl ConnectionManager {
                             match self.poll_for_device_reenumeration().await {
                                 Ok(port_fresh) => (port_fresh, b, f, Some(buf), proto),
                                 Err(e) => {
-                                    self.set_status
-                                        .set(format!("Connection Failed: {}", e));
+                                    self.set_status.set(format!("Connection Failed: {}", e));
                                     return Err(e);
                                 }
                             }
@@ -562,9 +561,12 @@ impl ConnectionManager {
 
             // CRITICAL: Transition to Connecting before connect_impl()
             // - If we were Probing (baud == 0 path), transition: Probing → Connecting
-            // - If we're still Disconnected (direct connection path), transition: Disconnected → Connecting
+            // - If we're still Disconnected (direct connection path), transition: Disconnected →
+            //   Connecting
             let current_state = self.state.get_untracked();
-            if current_state == ConnectionState::Probing || current_state == ConnectionState::Disconnected {
+            if current_state == ConnectionState::Probing
+                || current_state == ConnectionState::Disconnected
+            {
                 self.transition_to(ConnectionState::Connecting);
             }
 
