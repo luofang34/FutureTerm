@@ -1867,16 +1867,22 @@ impl ConnectionManager {
                             // reconnecting This happens when a new
                             // serial.onconnect event finds device while retry loop is still running
                             if manager_conn.is_connecting.load(Ordering::SeqCst) {
+                                let current_state = manager_conn.state.get_untracked();
                                 web_sys::console::log_1(
                                     &format!(
                                         "[{}ms] Retry loop - exiting early, reconnection already \
-                                         started by another path",
-                                        (js_sys::Date::now() - t0) as u64
+                                         started by another path (state={:?})",
+                                        (js_sys::Date::now() - t0) as u64,
+                                        current_state
                                     )
                                     .into(),
                                 );
-                                // Transition back to DeviceLost (will be updated by other path)
-                                manager_conn.transition_to(ConnectionState::DeviceLost);
+                                // Only transition if still in AutoReconnecting state
+                                // If already Connected, don't overwrite with DeviceLost (prevents
+                                // UI flicker)
+                                if current_state == ConnectionState::AutoReconnecting {
+                                    manager_conn.transition_to(ConnectionState::DeviceLost);
+                                }
                                 return;
                             }
 
@@ -2159,6 +2165,19 @@ impl ConnectionManager {
                         .into(),
                 );
                 *manager_disc.probing_interrupted.borrow_mut() = true;
+                return;
+            }
+
+            // DEBOUNCE: If already Disconnected, this is a duplicate ondisconnect event
+            // disconnect() has already handled cleanup, so ignore this event
+            // This prevents flag from being reset prematurely by first event,
+            // causing second event to be treated as device loss
+            if current_state == ConnectionState::Disconnected {
+                web_sys::console::log_1(
+                    &"DEBUG: ondisconnect fired but already Disconnected - ignoring duplicate \
+                      event"
+                        .into(),
+                );
                 return;
             }
 
