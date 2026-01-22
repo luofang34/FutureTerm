@@ -1,0 +1,23 @@
+# Clippy configuration for strict code quality enforcement
+# All panic-inducing patterns are DENIED
+
+# DENY all panic-inducing operations
+unwrap-used = "deny"
+expect-used = "deny"
+indexing-slicing = "deny"
+panic = "deny"
+unimplemented = "deny"
+unreachable = "deny"
+todo = "deny"
+
+# DENY unsafe code
+unsafe-code = "deny"
+
+# DENY safety issues
+cast-ptr-alignment = "deny"
+
+# Additional strict checks
+unwrap-or-default = "deny"
+large-types-passed-by-value = "warn"
+missing-errors-doc = "warn"
+missing-panics-doc = "warn"
