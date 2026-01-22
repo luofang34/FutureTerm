@@ -1434,6 +1434,15 @@ impl ConnectionManager {
                                 return;
                             }
 
+                            // Exit if user canceled via disconnect button
+                            if *manager_conn.user_initiated_disconnect.borrow() {
+                                web_sys::console::log_1(
+                                    &"[Auto-reconnect] Aborted by user disconnect".into(),
+                                );
+                                manager_conn.set_is_auto_reconnecting.set(false);
+                                return;
+                            }
+
                             // Wait 50ms before retry
                             let _ = wasm_bindgen_futures::JsFuture::from(js_sys::Promise::new(
                                 &mut |r, _| {

@@ -274,8 +274,10 @@ pub fn App() -> impl IntoView {
     let on_connect = move |force_picker: bool| {
         let shift_held = force_picker;
         // Toggle Logic
-        if connected.get() && !force_picker {
-            // Disconnect Logic
+        // Treat auto-reconnecting state as "connected" for button behavior
+        // This allows clicking "Disconnect" to cancel auto-reconnect
+        if (connected.get() || manager_disc.is_auto_reconnecting.get()) && !force_picker {
+            // Disconnect Logic - cancels auto-reconnect OR disconnects active connection
             let manager_d = manager_disc.clone();
             spawn_local(async move {
                 manager_d.disconnect().await;
