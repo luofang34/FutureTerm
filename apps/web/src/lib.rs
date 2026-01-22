@@ -278,15 +278,20 @@ pub fn App() -> impl IntoView {
         // This allows clicking "Disconnect" to cancel auto-reconnect
         let is_connected = connected.get();
         let is_auto_reconnecting = manager_disc.is_auto_reconnecting.get();
+        let current_status = status.get();
+        let is_device_lost = current_status.contains("Device Lost");
+
         web_sys::console::log_1(
             &format!(
-                "DEBUG: Button clicked - connected={}, is_auto_reconnecting={}, force_picker={}",
-                is_connected, is_auto_reconnecting, force_picker
+                "DEBUG: Button clicked - connected={}, is_auto_reconnecting={}, \
+                 is_device_lost={}, force_picker={}",
+                is_connected, is_auto_reconnecting, is_device_lost, force_picker
             )
             .into(),
         );
 
-        if (is_connected || is_auto_reconnecting) && !force_picker {
+        // Allow disconnect if: connected OR auto-reconnecting OR device lost (waiting to reconnect)
+        if (is_connected || is_auto_reconnecting || is_device_lost) && !force_picker {
             // Disconnect Logic - cancels auto-reconnect OR disconnects active connection
             web_sys::console::log_1(&"DEBUG: Executing disconnect logic".into());
             let manager_d = manager_disc.clone();
@@ -610,13 +615,14 @@ pub fn App() -> impl IntoView {
                     let s = status.get();
                     let is_busy = s.to_lowercase().contains("connecting") || s.to_lowercase().contains("scanning") || s.to_lowercase().contains("reconfiguring");
                     let is_auto_reconnecting = manager.is_auto_reconnecting.get();
+                    let is_device_lost = s.contains("Device Lost");
 
                     let (color, animation) = if is_conn && !is_busy {
                         ("rgb(95, 200, 85)", "") // Connected (Green)
                     } else if is_auto_reconnecting {
-                        ("rgb(245, 190, 80)", "animation: pulse 0.3s ease-in-out infinite;") // Auto-reconnecting (Fast Blinking Orange)
-                    } else if is_busy {
-                        ("rgb(245, 190, 80)", "") // Connecting/Busy (Orange)
+                        ("rgb(245, 190, 80)", "animation: pulse 0.3s ease-in-out infinite;") // Auto-reconnecting (Fast Pulsing Orange)
+                    } else if is_device_lost || is_busy {
+                        ("rgb(245, 190, 80)", "") // Device Lost / Connecting/Busy (Steady Orange)
                     } else {
                         ("rgb(240, 105, 95)", "") // Disconnected (Red)
                     };

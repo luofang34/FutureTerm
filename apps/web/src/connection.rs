@@ -288,6 +288,10 @@ impl ConnectionManager {
         self.set_connected.set(false);
         self.set_status.set("Ready to connect".into());
 
+        // Clear auto-reconnecting flag if it was set
+        // This is important when user cancels auto-reconnect by clicking disconnect
+        self.set_is_auto_reconnecting.set(false);
+
         // Release disconnect guard
         self.is_disconnecting.store(false, Ordering::SeqCst);
 
@@ -1729,11 +1733,10 @@ impl ConnectionManager {
                 // Keep last_vid/last_pid to enable auto-reconnect
                 manager_disc
                     .set_status
-                    .set("Device Lost (Auto-reconnecting...)".into());
-                // Set auto-reconnecting flag immediately for UI consistency
-                // This ensures button logic works correctly during the window between
-                // ondisconnect and retry loop starting
-                manager_disc.set_is_auto_reconnecting.set(true);
+                    .set("Device Lost (waiting for device...)".into());
+                // Don't set is_auto_reconnecting yet - wait for retry loop to start
+                // This creates steady orange light while waiting for device insertion
+                // Once device is inserted and retry loop starts, it will pulse
             }
 
             manager_disc.set_connected.set(false);
