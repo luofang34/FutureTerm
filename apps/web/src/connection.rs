@@ -33,13 +33,12 @@ struct ConnectionHandle {
     cmd_tx: mpsc::UnboundedSender<ConnectionCommand>,
 }
 
-// Snapshot for transaction safety
+// Snapshot for UI state consistency (not true transaction rollback)
+// WebSerial API doesn't support true rollback since port can't be opened twice
 #[derive(Clone)]
 struct ConnectionSnapshot {
     baud: u32,
     framing: String,
-    port: Option<web_sys::SerialPort>,
-    handle: Option<ConnectionHandle>,
 }
 
 #[derive(Clone)]
@@ -291,31 +290,24 @@ impl ConnectionManager {
         ConnectionSnapshot {
             baud: self.detected_baud.get_untracked(),
             framing: self.detected_framing.get_untracked(),
-            port: self.active_port.borrow().clone(),
-            handle: self.connection_handle.borrow().clone(),
         }
     }
 
     async fn rollback_state(&self, snapshot: ConnectionSnapshot) {
         web_sys::console::log_1(&"Rolling back connection state".into());
 
-        // Check if we had a connection before moving
-        let had_connection = snapshot.handle.is_some();
+        // NOTE: True transaction rollback is not possible with WebSerial API
+        // because we cannot open the same port twice simultaneously.
+        // Once disconnect() is called, the read loop is stopped and cannot be restored.
+        // This rollback only restores UI state (detected config) for consistency.
 
-        // Restore port and handle
-        *self.active_port.borrow_mut() = snapshot.port.clone();
-        *self.connection_handle.borrow_mut() = snapshot.handle;
-
-        // Restore detected config
+        // Restore detected config for UI consistency
         self.set_detected_baud.set(snapshot.baud);
         self.set_detected_framing.set(snapshot.framing);
 
-        // Restart read loop if we had a connection
-        if had_connection {
-            self.set_connected.set(true);
-            self.set_status
-                .set("Connection restored (reconfigure failed)".into());
-        }
+        // Do NOT restore connection_handle or set connected=true
+        // The old connection is dead and cannot be revived
+        // User must manually reconnect
     }
 
     // Reconfigure = Disconnect + Connect with Transaction Safety
@@ -327,15 +319,17 @@ impl ConnectionManager {
         self.set_is_reconfiguring.set(true);
         self.set_status.set("Reconfiguring...".into());
 
+        // Capture state before disconnect for potential rollback
         let snapshot = self.capture_state();
+
+        // Save port reference before disconnect
+        let port_opt = self.active_port.borrow().clone();
 
         // Try disconnect
         if !self.disconnect().await {
             self.set_is_reconfiguring.set(false);
             return;
         }
-
-        let port_opt = snapshot.port.clone();
 
         if let Some(port) = port_opt {
             // Wait for port release
@@ -385,11 +379,13 @@ impl ConnectionManager {
                     self.set_status.set("Reconfigured".into());
                 }
                 Err(e) => {
-                    // ROLLBACK on failure
+                    // Restore UI state (actual connection cannot be restored)
                     web_sys::console::error_1(&format!("Reconfigure failed: {}", e).into());
                     self.rollback_state(snapshot).await;
-                    self.set_status
-                        .set(format!("Reconfigure failed: {} (restored)", e));
+                    self.set_status.set(format!(
+                        "Reconfigure failed: {}. Please reconnect manually.",
+                        e
+                    ));
                 }
             }
         }
