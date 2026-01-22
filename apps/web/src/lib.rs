@@ -1,5 +1,5 @@
 use crate::protocol::WorkerToUi;
-use core_types::DecodedEvent;
+use core_types::{DecodedEvent, RawEvent, SelectionRange};
 use leptos::*;
 use wasm_bindgen::prelude::*;
 use wasm_bindgen::JsCast;
@@ -13,20 +13,21 @@ use connection::ConnectionManager;
 mod hex_view;
 // mod mavlink_view; // Removed duplicate
 pub mod protocol;
+mod terminal_metadata;
 pub mod worker_logic;
 mod xterm;
 
 pub mod mavlink_view;
-// use hex_view::HexView; // Conditionally used? No, actually used in view! down below?
-// Wait, warning said it was unused.
-// Let's check where it's used.
-// view! { ... <HexView ...> }
-// If it is used in view!, it shouldn't be unused.
-// Maybe because it's inside a `move ||` block or feature gated?
-// Actually, `MavlinkView` and `HexView` were flagged unused.
-// This implies the macro expansion might hide usage or they are genuinely not used because I replaced them?
-// I see `<MavlinkView .../>` in the code I edited earlier.
-// Let's suppress warning for now to be safe or just ignore it if build passes.
+
+// Data retention limits for the unified raw log
+/// Maximum raw log size in bytes (10 MB)
+const MAX_LOG_BYTES: usize = 10 * 1024 * 1024;
+
+/// Maximum number of raw log events (safety fallback)
+const MAX_LOG_EVENTS: usize = 10000;
+
+/// Maximum number of decoded events to retain
+const MAX_DECODED_EVENTS: usize = 2500;
 
 #[derive(Clone, Copy, PartialEq)]
 enum ViewMode {
@@ -64,8 +65,41 @@ pub fn App() -> impl IntoView {
     // Direct Terminal Handle
     let (term_handle, set_term_handle) = create_signal::<Option<xterm::TerminalHandle>>(None);
 
-    // Track parsed events
+    // ========== Data Architecture: Unified Raw Log + Per-Decoder Views ==========
+    //
+    // Architecture:
+    // 1. raw_log: Unified append-only log of all RawEvents (bytes + timestamp + channel)
+    //    - Populated from worker DataBatch frames
+    //    - Byte-based capping (10MB / 10k events)
+    //    - Survives decoder view switches
+    //    - Source of truth for Hex view
+    //
+    // 2. events_list: Worker-generated DecodedEvents (protocol-specific parsing)
+    //    - Populated from worker DataBatch events
+    //    - Used by MAVLink view (filters by protocol)
+    //    - No longer cleared on view switch (history persists)
+    //    - Future: Could be replaced by per-view decoding of raw_log
+    //
+    // 3. Per-decoder cursors: Track processing position for each view
+    //    - hex_cursor: HexView scroll/processing position
+    //    - MAVLink uses timestamp-based cursor internally
+    //
+    // Benefits:
+    // ✅ History persists when switching between decoder views
+    // ✅ Each view maintains independent state (scroll, processed events)
+    // ✅ Foundation for future features (replay, bookmarks, multi-view)
+
     let (events_list, set_events_list) = create_signal::<Vec<DecodedEvent>>(Vec::new());
+    let (raw_log, set_raw_log) = create_signal::<Vec<RawEvent>>(Vec::new());
+    let (hex_cursor, set_hex_cursor) = create_signal(0usize);
+
+    // ========== Cross-View Selection Sync ==========
+    // Global selection state for synchronizing selections across Terminal, Hex, and future views
+    let (global_selection, set_global_selection) = create_signal::<Option<SelectionRange>>(None);
+
+    // Terminal metadata for mapping between Terminal text and raw_log byte positions
+    let (terminal_metadata, set_terminal_metadata) =
+        create_signal(terminal_metadata::TerminalMetadata::new());
 
     // Legacy signals removed/replaced by manager:
     // status, connected, transport, active_port, is_reconfiguring
@@ -108,31 +142,80 @@ pub fn App() -> impl IntoView {
                             }
                         }
                         WorkerToUi::DataBatch { frames, events } => {
+                            // Update unified raw log with frames
+                            if !frames.is_empty() {
+                                set_raw_log.update(|log| {
+                                    // Append new raw events
+                                    for frame in &frames {
+                                        log.push(RawEvent::from_frame(frame));
+                                    }
+
+                                    // Byte-based capping to prevent unbounded memory growth
+                                    let total_bytes: usize =
+                                        log.iter().map(|e| e.byte_size()).sum();
+
+                                    if total_bytes > MAX_LOG_BYTES || log.len() > MAX_LOG_EVENTS {
+                                        // Trim oldest events until under limit
+                                        let mut trimmed = 0;
+                                        let mut bytes_removed = 0;
+
+                                        while (total_bytes - bytes_removed > MAX_LOG_BYTES
+                                            || log.len() - trimmed > MAX_LOG_EVENTS)
+                                            && trimmed < log.len()
+                                        {
+                                            bytes_removed += log[trimmed].byte_size();
+                                            trimmed += 1;
+                                        }
+
+                                        if trimmed > 0 {
+                                            log.drain(0..trimmed);
+
+                                            // Adjust terminal_metadata for the trimmed bytes
+                                            set_terminal_metadata.update(|meta| {
+                                                meta.adjust_for_log_trim(bytes_removed);
+                                            });
+                                        }
+                                    }
+                                });
+                            }
+
+                            // Terminal direct write - always write to maintain metadata mapping
+                            // Terminal exists even when view is hidden, and we need complete metadata
+                            // for cross-view selection sync to work
                             if let Some(term) = term_handle.get_untracked() {
-                                if view_mode.get_untracked() == ViewMode::Terminal {
-                                    for f in frames {
-                                        if !f.bytes.is_empty() {
-                                            if let Ok(text) = decoder
-                                                .decode_with_u8_array_and_options(&f.bytes, &opts)
-                                            {
-                                                let text: String = text;
-                                                if !text.is_empty() {
-                                                    term.write(&text);
-                                                }
+                                for f in &frames {
+                                    if !f.bytes.is_empty() {
+                                        if let Ok(text) = decoder
+                                            .decode_with_u8_array_and_options(&f.bytes, &opts)
+                                        {
+                                            let text: String = text;
+                                            if !text.is_empty() {
+                                                term.write(&text);
+
+                                                // Record metadata for cross-view selection sync
+                                                // This must happen for ALL data, not just when Terminal is visible
+                                                set_terminal_metadata.update(|meta| {
+                                                    meta.record_write(
+                                                        &f.bytes,
+                                                        &text,
+                                                        f.timestamp_us,
+                                                    );
+                                                });
                                             }
                                         }
                                     }
                                 }
                             }
+
                             // Update events
                             if !events.is_empty() {
                                 set_events_list.update(|list| {
                                     list.extend(events);
-                                    // Cap at 2500 events to ensure we don't drop high-freq MAVLink packets
+                                    // Cap at MAX_DECODED_EVENTS to ensure we don't drop high-freq MAVLink packets
                                     // before the View effect can process them.
                                     // 500 was too aggressive for 50Hz streams.
-                                    if list.len() > 2500 {
-                                        let split = list.len() - 2500;
+                                    if list.len() > MAX_DECODED_EVENTS {
+                                        let split = list.len() - MAX_DECODED_EVENTS;
                                         list.drain(0..split);
                                     }
                                 });
@@ -259,9 +342,6 @@ pub fn App() -> impl IntoView {
                 set_last_vid.set(vid);
                 set_last_pid.set(pid);
 
-                set_last_vid.set(vid);
-                set_last_pid.set(pid);
-
                 let current_framing = framing.get_untracked();
 
                 let final_baud = current_baud;
@@ -344,10 +424,7 @@ pub fn App() -> impl IntoView {
         let dec = manager.decoder_id.get();
         if dec == "mavlink" && view_mode.get_untracked() != ViewMode::Hex {
             set_view_mode.set(ViewMode::Hex);
-            // Verify events list is clean or let it persist?
-            // Usually good to clear if we just switched context, but maybe we want history.
-            // Let's clear to be safe and avoid confusing Hex dump with MAVLink table initially
-            set_events_list.set(Vec::new());
+            // History now persists across decoder switches
         }
     });
 
@@ -554,6 +631,9 @@ pub fn App() -> impl IntoView {
                          <xterm::TerminalView
                              on_mount=on_terminal_mount
                              on_terminal_ready=on_term_ready
+                             terminal_metadata=terminal_metadata
+                             global_selection=global_selection
+                             set_global_selection=set_global_selection
                          />
                     </div>
 
@@ -563,7 +643,13 @@ pub fn App() -> impl IntoView {
                             if manager.decoder_id.get() == "mavlink" {
                                 view! { <mavlink_view::MavlinkView events_list=events_list /> }
                             } else {
-                                view! { <hex_view::HexView events=events_list /> }
+                                view! { <hex_view::HexView
+                                    raw_log=raw_log
+                                    cursor=hex_cursor
+                                    set_cursor=set_hex_cursor
+                                    global_selection=global_selection
+                                    set_global_selection=set_global_selection
+                                /> }
                             }
                         }}
                     </Show>
@@ -582,7 +668,6 @@ pub fn App() -> impl IntoView {
                             let m = manager.clone();
                             move |_| {
                                 set_view_mode.set(ViewMode::Terminal);
-                                set_events_list.set(Vec::new()); // Clear history on switch
                                 m.set_decoder("utf8".to_string());
                             }
                         }
@@ -601,7 +686,6 @@ pub fn App() -> impl IntoView {
                             let m = manager.clone();
                             move |_| {
                                 set_view_mode.set(ViewMode::Hex);
-                                set_events_list.set(Vec::new()); // Clear history on switch
                                 m.set_decoder("hex".to_string());
                             }
                         }
@@ -620,7 +704,6 @@ pub fn App() -> impl IntoView {
                             let m = manager.clone();
                             move |_| {
                                 set_view_mode.set(ViewMode::Hex);
-                                set_events_list.set(Vec::new());
                                 m.set_decoder("mavlink".to_string());
                             }
                         }

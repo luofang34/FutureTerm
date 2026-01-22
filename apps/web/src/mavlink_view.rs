@@ -2,6 +2,12 @@ use core_types::DecodedEvent;
 use leptos::*;
 use std::collections::BTreeMap;
 
+// Note: MavlinkView currently uses events_list (worker-generated DecodedEvents)
+// rather than processing raw_log directly. This is acceptable because:
+// 1. Events are filtered by protocol, so mixed hex/mavlink events are handled
+// 2. Timestamp-based cursor provides incremental processing
+// 3. History persists via BTreeMap state (events_list no longer cleared)
+// Future: Could migrate to raw_log + embedded decoder for full isolation
 #[component]
 pub fn MavlinkView(events_list: ReadSignal<Vec<DecodedEvent>>) -> impl IntoView {
     // Data structures for the view

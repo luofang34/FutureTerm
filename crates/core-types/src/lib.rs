@@ -39,6 +39,95 @@ impl Frame {
     }
 }
 
+/// A raw event stored in the unified append-only log.
+/// This is the persistent storage format for all received/sent data,
+/// from which each decoder view derives its own interpretation.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct RawEvent {
+    /// Timestamp in microseconds (relative to session start or epoch).
+    pub timestamp_us: u64,
+    /// Direction of data flow (RX from device, TX to device).
+    pub channel: Channel,
+    /// The raw bytes.
+    pub bytes: Vec<u8>,
+}
+
+impl RawEvent {
+    pub fn new(timestamp_us: u64, channel: Channel, bytes: Vec<u8>) -> Self {
+        Self {
+            timestamp_us,
+            channel,
+            bytes,
+        }
+    }
+
+    pub fn from_frame(frame: &Frame) -> Self {
+        Self {
+            timestamp_us: frame.timestamp_us,
+            channel: frame.channel,
+            bytes: frame.bytes.clone(),
+        }
+    }
+
+    pub fn byte_size(&self) -> usize {
+        self.bytes.len()
+    }
+}
+
+/// Represents the source of a selection operation (which view initiated it).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum SelectionSource {
+    Terminal,
+    HexView,
+    // MAVLinkView,  // Reserved for future implementation
+}
+
+/// Represents a selection range across views, based on byte offsets in raw_log.
+/// This enables cross-view selection synchronization (e.g., Terminal ↔ Hex).
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct SelectionRange {
+    /// Start byte offset (relative to raw_log's cumulative position)
+    pub start_byte_offset: usize,
+
+    /// End byte offset (exclusive)
+    pub end_byte_offset: usize,
+
+    /// Timestamp range for synchronization and validation
+    pub timestamp_start_us: u64,
+    pub timestamp_end_us: u64,
+
+    /// Source view identifier
+    pub source_view: SelectionSource,
+}
+
+impl SelectionRange {
+    pub fn new(
+        start_byte_offset: usize,
+        end_byte_offset: usize,
+        timestamp_start_us: u64,
+        timestamp_end_us: u64,
+        source_view: SelectionSource,
+    ) -> Self {
+        Self {
+            start_byte_offset,
+            end_byte_offset,
+            timestamp_start_us,
+            timestamp_end_us,
+            source_view,
+        }
+    }
+
+    /// Returns the number of bytes in this selection
+    pub fn byte_len(&self) -> usize {
+        self.end_byte_offset.saturating_sub(self.start_byte_offset)
+    }
+
+    /// Check if a byte offset is within this selection range
+    pub fn contains_offset(&self, offset: usize) -> bool {
+        offset >= self.start_byte_offset && offset < self.end_byte_offset
+    }
+}
+
 use std::borrow::Cow;
 
 /// Lightweight value wrapper to avoid serde_json allocations for common types.
