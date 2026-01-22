@@ -19,6 +19,38 @@ use futures_channel::{mpsc, oneshot};
 // We need to move the protocol module usage here or make it public
 use crate::protocol::UiToWorker;
 
+// ============ Logging Macros ============
+
+/// Debug logging - can be disabled in release builds for performance
+/// In debug builds, logs to console. In release, compiles to no-op.
+#[cfg(debug_assertions)]
+macro_rules! debug_log {
+    ($($arg:tt)*) => {
+        web_sys::console::log_1(&format!($($arg)*).into())
+    };
+}
+
+#[cfg(not(debug_assertions))]
+macro_rules! debug_log {
+    ($($arg:tt)*) => {
+        // No-op in release builds
+    };
+}
+
+/// Warning logging - always enabled
+macro_rules! warn_log {
+    ($($arg:tt)*) => {
+        web_sys::console::warn_1(&format!($($arg)*).into())
+    };
+}
+
+/// Error logging - always enabled
+macro_rules! error_log {
+    ($($arg:tt)*) => {
+        web_sys::console::error_1(&format!($($arg)*).into())
+    };
+}
+
 // ============ Timing Constants ============
 
 /// Adaptive polling intervals for device re-enumeration
@@ -386,6 +418,130 @@ impl ConnectionManager {
         web_sys::console::log_1(&"DEBUG: Cleared VID/PID to prevent auto-reconnect".into());
     }
 
+    /// Handle probing interruption and port re-enumeration
+    /// Returns (port, baud, framing, buffer, proto) tuple for connection
+    async fn handle_probing_with_interrupt_recovery(
+        &self,
+        port: web_sys::SerialPort,
+        baud: u32,
+        framing: String,
+        buffer: Vec<u8>,
+        proto: Option<String>,
+    ) -> Result<
+        (
+            web_sys::SerialPort,
+            u32,
+            String,
+            Option<Vec<u8>>,
+            Option<String>,
+        ),
+        String,
+    > {
+        // Check if probing was interrupted by ondisconnect events
+        let was_interrupted = *self.probing_interrupted.borrow();
+        if was_interrupted {
+            warn_log!("Probing was interrupted by ondisconnect event - port reference is stale");
+            *self.probing_interrupted.borrow_mut() = false; // Clear flag
+
+            // When ondisconnect fires during probing, port reference becomes invalid
+            // Wait for browser to re-enumerate device and get fresh port reference
+            match self.poll_for_device_reenumeration().await {
+                Ok(fresh_port) => Ok((fresh_port, baud, framing, Some(buffer), proto)),
+                Err(e) => {
+                    self.set_status.set(format!("Connection Failed: {}", e));
+                    Err(e)
+                }
+            }
+        } else {
+            // Wait for OS to fully release port after probing
+            debug_log!(
+                "Probing complete, waiting {}ms for port cleanup",
+                PROBING_CLEANUP_WAIT_MS
+            );
+            let _ = wasm_bindgen_futures::JsFuture::from(js_sys::Promise::new(&mut |r, _| {
+                if let Some(window) = web_sys::window() {
+                    let _ = window.set_timeout_with_callback_and_timeout_and_arguments_0(
+                        &r,
+                        PROBING_CLEANUP_WAIT_MS,
+                    );
+                }
+            }))
+            .await;
+
+            // Check interrupt flag AGAIN after cleanup wait
+            // ondisconnect event may fire DURING the cleanup wait
+            if *self.probing_interrupted.borrow() {
+                warn_log!("Disconnect occurred during cleanup wait - port is stale");
+                *self.probing_interrupted.borrow_mut() = false;
+
+                // Use helper method to poll for fresh port
+                match self.poll_for_device_reenumeration().await {
+                    Ok(fresh_port) => Ok((fresh_port, baud, framing, Some(buffer), proto)),
+                    Err(e) => {
+                        self.set_status.set(format!("Connection Failed: {}", e));
+                        Err(e)
+                    }
+                }
+            } else {
+                // No interrupt - use original port
+                Ok((port, baud, framing, Some(buffer), proto))
+            }
+        }
+    }
+
+    /// Connect with smart framing detection (baud specified, framing auto)
+    async fn connect_with_smart_framing(
+        &self,
+        port: web_sys::SerialPort,
+        baud: u32,
+    ) -> Result<(), String> {
+        debug_log!("Connecting with smart framing detection: baud={}", baud);
+        self.transition_to(ConnectionState::Connecting);
+
+        let (detect_framing, initial_buf, proto) =
+            self.smart_probe_framing(port.clone(), baud).await;
+
+        if let Some(p) = proto {
+            self.set_decoder(p);
+        }
+
+        self.connect_impl(port, baud, &detect_framing, Some(initial_buf))
+            .await
+    }
+
+    /// Connect with full auto-detection (baud rate + framing)
+    async fn connect_with_auto_detect(
+        &self,
+        port: web_sys::SerialPort,
+        framing: &str,
+    ) -> Result<(), String> {
+        debug_log!("Connecting with auto-detection: framing={}", framing);
+        self.transition_to(ConnectionState::Probing);
+
+        let (baud, framing_str, buffer, proto) = self.detect_config(port.clone(), framing).await;
+
+        // Handle potential interruption during probing
+        let (final_port, final_baud, final_framing, initial_buffer, detected_proto) = self
+            .handle_probing_with_interrupt_recovery(port, baud, framing_str, buffer, proto)
+            .await?;
+
+        // Switch decoder if detected
+        if let Some(p) = detected_proto {
+            self.set_decoder(p);
+        }
+
+        // Transition to Connecting before connect_impl()
+        let current_state = self.state.get_untracked();
+        if current_state == ConnectionState::Probing
+            || current_state == ConnectionState::Disconnected
+        {
+            self.transition_to(ConnectionState::Connecting);
+        }
+
+        self.connect_impl(final_port, final_baud, &final_framing, initial_buffer)
+            .await
+    }
+
     /// Helper: Poll for device re-enumeration after disconnect events
     /// Uses adaptive polling intervals for optimal performance
     async fn poll_for_device_reenumeration(&self) -> Result<web_sys::SerialPort, String> {
@@ -474,7 +630,11 @@ impl ConnectionManager {
         }
     }
 
-    // Async Connect
+    /// Main connection entry point
+    /// Handles three connection modes:
+    /// 1. baud > 0, framing == "Auto" -> Smart framing detection
+    /// 2. baud == 0 -> Full auto-detection (baud + framing)
+    /// 3. baud > 0, framing != "Auto" -> Direct connection
     pub async fn connect(
         &self,
         port: web_sys::SerialPort,
@@ -487,8 +647,7 @@ impl ConnectionManager {
             .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
             .is_err()
         {
-            // OPTIMIZATION: Log as info instead of warn (expected during auto-reconnect races)
-            web_sys::console::log_1(&"Connection attempt blocked: Already connecting.".into());
+            debug_log!("Connection attempt blocked: Already connecting");
             return Err("Already connecting".to_string());
         }
 
@@ -499,7 +658,7 @@ impl ConnectionManager {
 
         // Stale UI Guard
         if self.active_port.borrow().is_some() {
-            web_sys::console::warn_1(&"Connection attempt blocked: Port already active.".into());
+            warn_log!("Connection attempt blocked: Port already active");
             return Err("Already connected".to_string());
         }
 
@@ -508,121 +667,23 @@ impl ConnectionManager {
             *self.probing_interrupted.borrow_mut() = false;
         }
 
-        let result = if baud > 0 && framing == "Auto" {
-            // Smart framing detection with specific baud rate
-            // State transition: Disconnected → Connecting
-            self.transition_to(ConnectionState::Connecting);
-
-            let (detect_framing, initial_buf, proto) =
-                self.smart_probe_framing(port.clone(), baud).await;
-
-            if let Some(p) = proto {
-                self.set_decoder(p);
-            }
-
-            self.connect_impl(port, baud, &detect_framing, Some(initial_buf))
-                .await
+        // Route to appropriate connection method
+        if baud > 0 && framing == "Auto" {
+            // Mode 1: Smart framing detection with fixed baud
+            self.connect_with_smart_framing(port, baud).await
+        } else if baud == 0 {
+            // Mode 2: Full auto-detection (baud + framing)
+            self.connect_with_auto_detect(port, framing).await
         } else {
-            // Auto-Detect if Baud is 0, or direct connection with specific baud
-            let (final_port, final_baud, final_framing_str, initial_buffer, detected_proto) =
-                if baud == 0 {
-                    // Auto-detect baud rate and framing
-                    // State transition: Disconnected → Probing
-                    self.transition_to(ConnectionState::Probing);
-
-                    let (b, f, buf, proto) = self.detect_config(port.clone(), framing).await;
-
-                    // Check if probing was interrupted by ondisconnect events
-                    let was_interrupted = *self.probing_interrupted.borrow();
-                    if was_interrupted {
-                        web_sys::console::warn_1(
-                            &"DEBUG: Probing was interrupted by ondisconnect event - port \
-                              reference is stale"
-                                .into(),
-                        );
-                        *self.probing_interrupted.borrow_mut() = false; // Clear flag
-
-                        // CRITICAL FIX: When ondisconnect fires during probing, the port reference
-                        // becomes invalid. We need to wait for the browser to re-enumerate the
-                        // device and get a fresh port reference.
-                        match self.poll_for_device_reenumeration().await {
-                            Ok(port) => (port, b, f, Some(buf), proto),
-                            Err(e) => {
-                                self.set_status.set(format!("Connection Failed: {}", e));
-                                return Err(e);
-                            }
-                        }
-                    } else {
-                        // CRITICAL FIX: Wait for OS to fully release port after probing
-                        // Probing opens/closes port multiple times - OS needs time to clean up
-                        web_sys::console::log_1(
-                            &format!(
-                                "DEBUG: Probing complete, waiting {}ms for port cleanup",
-                                PROBING_CLEANUP_WAIT_MS
-                            )
-                            .into(),
-                        );
-                        let _ = wasm_bindgen_futures::JsFuture::from(js_sys::Promise::new(
-                            &mut |r, _| {
-                                if let Some(window) = web_sys::window() {
-                                    let _ = window
-                                        .set_timeout_with_callback_and_timeout_and_arguments_0(
-                                            &r,
-                                            PROBING_CLEANUP_WAIT_MS,
-                                        );
-                                }
-                            },
-                        ))
-                        .await;
-
-                        // CRITICAL FIX: Check interrupt flag AGAIN after cleanup wait
-                        // ondisconnect event may fire DURING the cleanup wait, invalidating the
-                        // port
-                        if *self.probing_interrupted.borrow() {
-                            web_sys::console::warn_1(
-                                &"DEBUG: Disconnect occurred during cleanup wait - port is stale"
-                                    .into(),
-                            );
-                            *self.probing_interrupted.borrow_mut() = false; // Clear flag
-
-                            // Use helper method to poll for fresh port
-                            match self.poll_for_device_reenumeration().await {
-                                Ok(port_fresh) => (port_fresh, b, f, Some(buf), proto),
-                                Err(e) => {
-                                    self.set_status.set(format!("Connection Failed: {}", e));
-                                    return Err(e);
-                                }
-                            }
-                        } else {
-                            // No interrupt - use original port
-                            (port, b, f, Some(buf), proto)
-                        }
-                    }
-                } else {
-                    (port, baud, framing.to_string(), None, None)
-                };
-
-            // Switch Decoder if detected
-            if let Some(p) = detected_proto {
-                self.set_decoder(p);
-            }
-
-            // CRITICAL: Transition to Connecting before connect_impl()
-            // - If we were Probing (baud == 0 path), transition: Probing → Connecting
-            // - If we're still Disconnected (direct connection path), transition: Disconnected →
-            //   Connecting
-            let current_state = self.state.get_untracked();
-            if current_state == ConnectionState::Probing
-                || current_state == ConnectionState::Disconnected
-            {
-                self.transition_to(ConnectionState::Connecting);
-            }
-
-            self.connect_impl(final_port, final_baud, &final_framing_str, initial_buffer)
-                .await
-        };
-
-        result
+            // Mode 3: Direct connection with specified parameters
+            debug_log!(
+                "Connecting with fixed parameters: baud={}, framing={}",
+                baud,
+                framing
+            );
+            self.transition_to(ConnectionState::Connecting);
+            self.connect_impl(port, baud, framing, None).await
+        }
     }
 
     pub async fn disconnect(&self) -> bool {
