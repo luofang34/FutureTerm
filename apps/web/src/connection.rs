@@ -1440,6 +1440,19 @@ impl ConnectionManager {
                                     &"[Auto-reconnect] Aborted by user disconnect".into(),
                                 );
                                 manager_conn.set_is_auto_reconnecting.set(false);
+                                // Clear last_vid/last_pid to prevent auto-reconnect on next
+                                // insertion This mimics the
+                                // behavior of ondisconnect handler for user-initiated disconnects
+                                set_last_vid.set(None);
+                                set_last_pid.set(None);
+                                // Reset the flag since we're cleaning up the auto-reconnect state
+                                // This is important because ondisconnect won't fire again
+                                // (device already disconnected), so we must reset it here
+                                *manager_conn.user_initiated_disconnect.borrow_mut() = false;
+                                web_sys::console::log_1(
+                                    &"[Auto-reconnect] Cleared VID/PID to prevent re-triggering"
+                                        .into(),
+                                );
                                 return;
                             }
 
