@@ -76,7 +76,7 @@ Runs unit tests for all non-WASM crates:
 ./dev.sh
 ```
 
-Starts Trunk dev server at **http://127.0.0.1:8081**
+Starts Trunk dev server at **http://127.0.0.1:8080**
 
 **Features**:
 - Hot reload on file changes

@@ -153,15 +153,23 @@ run_dev_server() {
     echo -e "${BLUE}================================================${NC}"
     echo ""
 
-    echo -e "${GREEN}Starting Trunk dev server...${NC}"
-    echo -e "${CYAN}App will be available at http://127.0.0.1:8081${NC}"
+    # Kill any process occupying port 8080
+    echo -e "${YELLOW}Checking port 8080...${NC}"
+    if lsof -ti :8080 >/dev/null 2>&1; then
+        echo -e "${YELLOW}Killing process on port 8080...${NC}"
+        lsof -ti :8080 | xargs kill -9 2>/dev/null
+        sleep 1
+    fi
+
+    echo -e "${GREEN}Starting Trunk dev server on port 8080...${NC}"
+    echo -e "${CYAN}App will be available at http://127.0.0.1:8080${NC}"
     echo ""
     echo -e "${YELLOW}Connect to a real serial device through the browser.${NC}"
     echo -e "${YELLOW}Or use socat to create virtual ports for testing.${NC}"
     echo ""
 
     cd apps/web
-    RUSTFLAGS="--cfg=web_sys_unstable_apis" trunk serve --port 8081
+    RUSTFLAGS="--cfg=web_sys_unstable_apis" trunk serve --port 8080
 
     wait
 }
