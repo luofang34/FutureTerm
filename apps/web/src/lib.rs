@@ -276,8 +276,19 @@ pub fn App() -> impl IntoView {
         // Toggle Logic
         // Treat auto-reconnecting state as "connected" for button behavior
         // This allows clicking "Disconnect" to cancel auto-reconnect
-        if (connected.get() || manager_disc.is_auto_reconnecting.get()) && !force_picker {
+        let is_connected = connected.get();
+        let is_auto_reconnecting = manager_disc.is_auto_reconnecting.get();
+        web_sys::console::log_1(
+            &format!(
+                "DEBUG: Button clicked - connected={}, is_auto_reconnecting={}, force_picker={}",
+                is_connected, is_auto_reconnecting, force_picker
+            )
+            .into(),
+        );
+
+        if (is_connected || is_auto_reconnecting) && !force_picker {
             // Disconnect Logic - cancels auto-reconnect OR disconnects active connection
+            web_sys::console::log_1(&"DEBUG: Executing disconnect logic".into());
             let manager_d = manager_disc.clone();
             spawn_local(async move {
                 manager_d.disconnect().await;
@@ -285,6 +296,8 @@ pub fn App() -> impl IntoView {
             });
             return;
         }
+
+        web_sys::console::log_1(&"DEBUG: Executing connect logic".into());
 
         // Reset detected info
         manager.set_detected_baud.set(0);

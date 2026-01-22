@@ -1384,6 +1384,9 @@ impl ConnectionManager {
                                         );
                                         // Manual status update for "Restored" vs just "Connected"
                                         manager_conn.set_status.set("Restored Connection".into());
+                                        // Clear auto-reconnecting flag since we successfully
+                                        // reconnected
+                                        manager_conn.set_is_auto_reconnecting.set(false);
                                     }
                                 });
                                 return; // Stop checking
@@ -1659,6 +1662,11 @@ impl ConnectionManager {
                                                 manager_conn_clone
                                                     .set_status
                                                     .set("Restored Connection".into());
+                                                // Clear auto-reconnecting flag since we
+                                                // successfully reconnected
+                                                manager_conn_clone
+                                                    .set_is_auto_reconnecting
+                                                    .set(false);
                                             }
                                         });
                                         return;
@@ -1722,6 +1730,10 @@ impl ConnectionManager {
                 manager_disc
                     .set_status
                     .set("Device Lost (Auto-reconnecting...)".into());
+                // Set auto-reconnecting flag immediately for UI consistency
+                // This ensures button logic works correctly during the window between
+                // ondisconnect and retry loop starting
+                manager_disc.set_is_auto_reconnecting.set(true);
             }
 
             manager_disc.set_connected.set(false);
