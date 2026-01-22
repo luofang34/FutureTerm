@@ -36,14 +36,33 @@ pub fn MavlinkView(
     // Optimization: Track last processed timestamp to avoid re-scanning old events
     let (processed_cursor, set_processed_cursor) = create_signal(0u64);
 
-    // Reset cursor when connection changes (for device reconnection with new timestamps)
+    // Reset state on connection changes (for device reconnection with new timestamps)
     create_effect(move |prev_connected: Option<bool>| {
         let is_connected = connected.get();
 
-        // Detect reconnection: was disconnected, now connected
-        if prev_connected == Some(false) && is_connected {
+        // Clear state on ANY connection state change to ensure clean slate
+        // This handles: initial connection, reconnection, and disconnection
+        if prev_connected.is_some() && prev_connected != Some(is_connected) {
+            set_state.set(BTreeMap::new());
+
+            // CRITICAL FIX: Reset cursor to 0 on connection state changes
+            // This prevents constant rollover detection spam after reconnect.
+            // Previous approach (cursor = max_ts) caused issues because:
+            //   1. events_list still contains old events with large timestamps
+            //   2. After reconnect, device timestamps reset to 0 (device uptime)
+            //   3. Every new event triggered rollover: new_ts < old_cursor/2
+            // With cursor=0, we process new events cleanly without rollover spam.
             set_processed_cursor.set(0);
-            web_sys::console::log_1(&"MAVLink: Reset cursor on reconnection".into());
+
+            if is_connected {
+                web_sys::console::log_1(
+                    &"MAVLink: Cleared state and reset cursor to 0 on (re)connection".into(),
+                );
+            } else {
+                web_sys::console::log_1(
+                    &"MAVLink: Cleared state and reset cursor to 0 on disconnection".into(),
+                );
+            }
         }
 
         is_connected
@@ -61,10 +80,50 @@ pub fn MavlinkView(
             let last_ts = processed_cursor.get_untracked();
             let mut max_ts = last_ts;
 
+            // CRITICAL FIX: Detect timestamp rollover (device reboot/reconnect)
+            // If latest event timestamp is significantly less than cursor, device rebooted
+            // Example: cursor=138648500, new event=5000 -> rollover detected
+            let latest_event_ts = events.last().map(|e| e.timestamp_us).unwrap_or(0);
+            let timestamp_rollover = last_ts > 0 && latest_event_ts < last_ts / 2;
+
+            if timestamp_rollover {
+                web_sys::console::log_1(
+                    &format!(
+                        "MAVLink: Timestamp rollover detected (cursor={}, latest={}). Resetting \
+                         cursor.",
+                        last_ts, latest_event_ts
+                    )
+                    .into(),
+                );
+                set_processed_cursor.set(0);
+                // Process all events with the new cursor
+                max_ts = 0;
+            }
+
             set_state.update(|map| {
                 // Optimization: Skip events we've already processed
                 // We assume events are appended chronologically.
-                for e in events.iter().skip_while(|e| e.timestamp_us <= last_ts) {
+                let cursor_to_use = if timestamp_rollover { 0 } else { last_ts };
+
+                // CRITICAL FIX: Always skip Unix-timestamp events from ring buffer
+                // events_list ring buffer may contain old events with Unix timestamps
+                // (e.g., 1769060258568000) alongside new device uptime timestamps (e.g., 14328300).
+                // We use a threshold to distinguish: device uptime timestamps are typically
+                // < 1 trillion microseconds (~11.5 days), while Unix timestamps are much larger.
+                // This prevents old events from updating cursor back to huge values.
+                // We ALWAYS skip these, not just when cursor==0, because worker might send
+                // mixed old/new events at any time.
+                const DEVICE_UPTIME_THRESHOLD: u64 = 1_000_000_000_000; // 1 trillion μs (~11.5 days)
+
+                for e in events
+                    .iter()
+                    .skip_while(|e| e.timestamp_us <= cursor_to_use)
+                {
+                    // ALWAYS skip Unix-timestamp events (likely stale events from ring buffer)
+                    if e.timestamp_us > DEVICE_UPTIME_THRESHOLD {
+                        continue;
+                    }
+
                     if e.timestamp_us > max_ts {
                         max_ts = e.timestamp_us;
                     }
@@ -109,7 +168,9 @@ pub fn MavlinkView(
                 }
             });
 
-            if max_ts > last_ts {
+            // Update cursor if we processed new events or detected rollover
+            let cursor_to_compare = if timestamp_rollover { 0 } else { last_ts };
+            if max_ts > cursor_to_compare {
                 set_processed_cursor.set(max_ts);
             }
         });

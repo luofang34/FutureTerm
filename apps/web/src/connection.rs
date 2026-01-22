@@ -21,6 +21,8 @@ pub struct ConnectionManager {
     pub set_status: WriteSignal<String>,
     pub is_reconfiguring: Signal<bool>,
     pub set_is_reconfiguring: WriteSignal<bool>,
+    pub is_probing: Signal<bool>,
+    pub set_is_probing: WriteSignal<bool>,
 
     // Detected Config (for UI feedback)
     pub detected_baud: Signal<u32>,
@@ -37,6 +39,8 @@ pub struct ConnectionManager {
     read_loop_should_stop: Rc<RefCell<bool>>,
     // Guard against double-connect race conditions
     is_connecting_internal: Rc<RefCell<bool>>,
+    // Guard against duplicate disconnect calls during auto-reconnect
+    is_disconnecting: Rc<RefCell<bool>>,
 
     // Hooks for external UI updates (optional, or we just expose signals)
 
@@ -49,6 +53,9 @@ pub struct ConnectionManager {
     // Decoder State
     pub decoder_id: Signal<String>,
     pub set_decoder_id: WriteSignal<String>,
+
+    // User-initiated disconnect flag (to distinguish from device loss)
+    user_initiated_disconnect: Rc<RefCell<bool>>,
 }
 
 impl ConnectionManager {
@@ -56,6 +63,7 @@ impl ConnectionManager {
         let (connected, set_connected) = create_signal(false);
         let (status, set_status) = create_signal("Ready to connect".to_string());
         let (is_reconfiguring, set_is_reconfiguring) = create_signal(false);
+        let (is_probing, set_is_probing) = create_signal(false);
         let (detected_baud, set_detected_baud) = create_signal(0);
         let (detected_framing, set_detected_framing) = create_signal("".to_string());
 
@@ -70,6 +78,8 @@ impl ConnectionManager {
             set_status,
             is_reconfiguring: is_reconfiguring.into(),
             set_is_reconfiguring,
+            is_probing: is_probing.into(),
+            set_is_probing,
             detected_baud: detected_baud.into(),
             set_detected_baud,
             detected_framing: detected_framing.into(),
@@ -80,6 +90,7 @@ impl ConnectionManager {
             last_auto_baud: Rc::new(RefCell::new(None)),
             read_loop_should_stop: Rc::new(RefCell::new(false)),
             is_connecting_internal: Rc::new(RefCell::new(false)),
+            is_disconnecting: Rc::new(RefCell::new(false)),
 
             rx_active: rx_active.into(),
             set_rx_active,
@@ -87,6 +98,7 @@ impl ConnectionManager {
             set_tx_active,
             decoder_id: decoder_id.into(),
             set_decoder_id,
+            user_initiated_disconnect: Rc::new(RefCell::new(false)),
         }
     }
 
@@ -142,7 +154,8 @@ impl ConnectionManager {
         framing: &str,
     ) -> Result<(), String> {
         if *self.is_connecting_internal.borrow() {
-            web_sys::console::warn_1(&"Connection attempt blocked: Already connecting.".into());
+            // OPTIMIZATION: Log as info instead of warn (expected during auto-reconnect races)
+            web_sys::console::log_1(&"Connection attempt blocked: Already connecting.".into());
             return Err("Already connecting".to_string());
         }
 
@@ -168,6 +181,20 @@ impl ConnectionManager {
             // Auto-Detect if Baud is 0
             let (final_baud, final_framing_str, initial_buffer, detected_proto) = if baud == 0 {
                 let (b, f, buf, proto) = self.detect_config(port.clone(), framing).await;
+
+                // CRITICAL FIX: Wait for OS to fully release port after probing
+                // Probing opens/closes port multiple times - OS needs time to clean up
+                web_sys::console::log_1(
+                    &"DEBUG: Probing complete, waiting 150ms for port cleanup".into(),
+                );
+                let _ = wasm_bindgen_futures::JsFuture::from(js_sys::Promise::new(&mut |r, _| {
+                    if let Some(window) = web_sys::window() {
+                        let _ =
+                            window.set_timeout_with_callback_and_timeout_and_arguments_0(&r, 150);
+                    }
+                }))
+                .await;
+
                 (b, f, Some(buf), proto)
             } else {
                 (baud, framing.to_string(), None, None)
@@ -186,35 +213,193 @@ impl ConnectionManager {
         result
     }
 
-    pub async fn disconnect(&self) {
+    pub async fn disconnect(&self) -> bool {
+        // CRITICAL FIX: Prevent duplicate disconnect() calls during auto-reconnect races
+        // When multiple auto-reconnect tasks spawn, they may both call disconnect() simultaneously
+        // This guard ensures only ONE disconnect runs, preventing transport lock conflicts
+        {
+            let mut flag = self.is_disconnecting.borrow_mut();
+            if *flag {
+                web_sys::console::log_1(
+                    &"DEBUG: disconnect() - already in progress, skipping".into(),
+                );
+                return false; // Another disconnect() is already running, caller should exit
+            }
+            *flag = true; // Claim the disconnect slot
+        }
+
+        let t0 = js_sys::Date::now();
+        web_sys::console::log_1(&format!("[{}ms] disconnect() - START", t0 as u64).into());
+
+        // Mark this as user-initiated disconnect
+        *self.user_initiated_disconnect.borrow_mut() = true;
+
         self.set_status.set("Disconnecting...".into());
 
-        // 1. Signal Read Loop to Stop
-        *self.read_loop_should_stop.borrow_mut() = true;
-
-        // 2. Wait for it to exit (e.g. 200ms)
-        // This gives the read loop a chance to see the flag and break, dropping its borrow of
-        // transport.
-        let _ = wasm_bindgen_futures::JsFuture::from(js_sys::Promise::new(&mut |r, _| {
-            if let Some(window) = web_sys::window() {
-                let _ = window.set_timeout_with_callback_and_timeout_and_arguments_0(&r, 200);
-            }
-        }))
-        .await;
-
-        // 3. Close Transport
-        // Try to take lock. If still locked, we warn but don't panic.
-        let mut t_opt = None;
-        if let Ok(mut borrow) = self.transport.try_borrow_mut() {
-            t_opt = borrow.take();
-        } else {
-            web_sys::console::warn_1(
-                &"Disconnect: Could not acquire transport lock even after wait.".into(),
+        // OPTIMIZATION: Detect if device is already physically disconnected
+        // If so, we can skip close() and save ~150ms
+        let already_disconnected = !self.connected.get_untracked();
+        if already_disconnected {
+            web_sys::console::log_1(
+                &format!(
+                    "[{}ms] disconnect() - device already disconnected, skipping close()",
+                    (js_sys::Date::now() - t0) as u64
+                )
+                .into(),
             );
         }
 
-        if let Some(mut t) = t_opt {
-            let _ = t.close().await;
+        // 1. Signal Read Loop to Stop
+        *self.read_loop_should_stop.borrow_mut() = true;
+        web_sys::console::log_1(&"DEBUG: disconnect() - signaled read loop to stop".into());
+
+        // 2. Wait for read loop to exit (with retry logic)
+        // CRITICAL FIX: Wait longer (300ms) to ensure read loop completes async read_chunk()
+        // Read loop may be blocked in t.read_chunk().await which holds immutable borrow
+        // If we don't wait long enough, auto-reconnect's connect() will fail to acquire lock
+        let _ = wasm_bindgen_futures::JsFuture::from(js_sys::Promise::new(&mut |r, _| {
+            if let Some(window) = web_sys::window() {
+                let _ = window.set_timeout_with_callback_and_timeout_and_arguments_0(&r, 300);
+            }
+        }))
+        .await;
+        web_sys::console::log_1(&"DEBUG: disconnect() - waited 300ms for read loop".into());
+
+        // 3. Close Transport with retry logic
+        // OPTIMIZATION: Skip close() if device already disconnected (saves ~150ms)
+        if already_disconnected {
+            // Device physically disconnected - just clear the transport reference
+            // CRITICAL: Retry to ensure read loop has released borrow
+            let mut cleared = false;
+            for attempt in 1..=10 {
+                if let Ok(mut borrow) = self.transport.try_borrow_mut() {
+                    *borrow = None;
+                    cleared = true;
+                    if attempt > 1 {
+                        web_sys::console::log_1(
+                            &format!(
+                                "DEBUG: disconnect() - cleared transport on attempt {} (device \
+                                 already disconnected)",
+                                attempt
+                            )
+                            .into(),
+                        );
+                    } else {
+                        web_sys::console::log_1(
+                            &"DEBUG: disconnect() - cleared transport (device already \
+                              disconnected)"
+                                .into(),
+                        );
+                    }
+                    break;
+                }
+                // Wait 50ms before retry (total max 500ms)
+                let _ = wasm_bindgen_futures::JsFuture::from(js_sys::Promise::new(&mut |r, _| {
+                    if let Some(window) = web_sys::window() {
+                        let _ =
+                            window.set_timeout_with_callback_and_timeout_and_arguments_0(&r, 50);
+                    }
+                }))
+                .await;
+            }
+            if !cleared {
+                // CRITICAL FIX: Force close the port to release browser lock
+                // We've waited 800ms for read loop to exit gracefully, but it's still holding the
+                // borrow Closing the port will force read_chunk() to error and read
+                // loop to exit
+                web_sys::console::warn_1(
+                    &"CRITICAL: Forcing port close after failed transport cleanup (device \
+                      disconnected)"
+                        .into(),
+                );
+
+                // Try to access active_port and close it
+                // This should cause read loop's read_chunk() to fail and release the borrow
+                if let Some(port) = self.active_port.borrow().as_ref() {
+                    let promise = port.close();
+                    web_sys::console::log_1(&"DEBUG: Forced port.close() called".into());
+
+                    // CRITICAL: WAIT for close() to complete before continuing
+                    // This ensures read loop has exited before we return
+                    let _ = wasm_bindgen_futures::JsFuture::from(promise).await;
+                    web_sys::console::log_1(&"DEBUG: Forced port.close() completed".into());
+
+                    // Try one last time to clear transport after port is closed
+                    if let Ok(mut borrow) = self.transport.try_borrow_mut() {
+                        *borrow = None;
+                        web_sys::console::log_1(
+                            &"DEBUG: Transport cleared after forced port close".into(),
+                        );
+                    } else {
+                        web_sys::console::warn_1(
+                            &"WARNING: Transport still locked even after forced port close".into(),
+                        );
+                    }
+                } else {
+                    web_sys::console::warn_1(
+                        &"WARNING: Could not access active_port for forced close".into(),
+                    );
+                }
+            }
+        } else {
+            // Normal disconnect - need to close transport properly
+            let mut t_opt = None;
+            let mut retry_count = 0;
+            let max_retries = 5;
+
+            loop {
+                if let Ok(mut borrow) = self.transport.try_borrow_mut() {
+                    t_opt = borrow.take();
+                    web_sys::console::log_1(
+                        &format!(
+                            "DEBUG: disconnect() - acquired transport lock (attempt {})",
+                            retry_count + 1
+                        )
+                        .into(),
+                    );
+                    break;
+                } else {
+                    retry_count += 1;
+                    if retry_count >= max_retries {
+                        web_sys::console::warn_1(
+                            &format!(
+                                "Disconnect: Could not acquire transport lock after {} retries \
+                                 ({}ms total)",
+                                max_retries,
+                                max_retries * 300
+                            )
+                            .into(),
+                        );
+                        break;
+                    }
+                    // Wait 300ms before retry
+                    let _ =
+                        wasm_bindgen_futures::JsFuture::from(js_sys::Promise::new(&mut |r, _| {
+                            if let Some(window) = web_sys::window() {
+                                let _ = window
+                                    .set_timeout_with_callback_and_timeout_and_arguments_0(&r, 300);
+                            }
+                        }))
+                        .await;
+                    web_sys::console::log_1(
+                        &format!(
+                            "DEBUG: disconnect() - retry {} acquiring transport lock",
+                            retry_count
+                        )
+                        .into(),
+                    );
+                }
+            }
+
+            if let Some(mut t) = t_opt {
+                web_sys::console::log_1(&"DEBUG: disconnect() - calling transport.close()".into());
+                let _ = t.close().await;
+                web_sys::console::log_1(&"DEBUG: disconnect() - transport.close() returned".into());
+            } else {
+                web_sys::console::log_1(
+                    &"DEBUG: disconnect() - no transport to close (already None)".into(),
+                );
+            }
         }
 
         // 2. Clear Port
@@ -222,6 +407,20 @@ impl ConnectionManager {
 
         self.set_connected.set(false);
         self.set_status.set("Ready to connect".into());
+
+        let elapsed = (js_sys::Date::now() - t0) as u64;
+        web_sys::console::log_1(
+            &format!(
+                "[{}ms] disconnect() - COMPLETE (took {}ms)",
+                elapsed, elapsed
+            )
+            .into(),
+        );
+
+        // Reset the disconnect guard flag
+        *self.is_disconnecting.borrow_mut() = false;
+
+        true // Return true to indicate disconnect completed successfully
     }
 
     // Reconfigure = Disconnect + Connect (Atomic logic)
@@ -597,6 +796,9 @@ impl ConnectionManager {
         port: web_sys::SerialPort,
         current_framing: &str,
     ) -> (u32, String, Vec<u8>, Option<String>) {
+        // CRITICAL: Set probing flag to ignore disconnect events during auto-detection
+        self.set_is_probing.set(true);
+
         let baud_candidates = vec![
             115200, 1500000, 1000000, 2000000, 921600, 57600, 460800, 230400, 38400, 19200, 9600,
         ];
@@ -742,6 +944,10 @@ impl ConnectionManager {
             "Detected: {} {} (Score: {:.2})",
             best_rate, best_framing, best_score
         ));
+
+        // Clear probing flag
+        self.set_is_probing.set(false);
+
         (best_rate, best_framing, best_buffer, best_proto)
     }
 
@@ -988,8 +1194,55 @@ impl ConnectionManager {
                     // Reset stop signal
                     *self.read_loop_should_stop.borrow_mut() = false;
 
-                    // Store state
-                    *self.transport.borrow_mut() = Some(t);
+                    // CRITICAL FIX: Store state with retry logic to avoid RefCell panic
+                    // If previous disconnect() couldn't acquire lock, old read loop may still hold
+                    // borrow
+                    let mut transport_opt = Some(t);
+                    let mut stored = false;
+
+                    for attempt in 1..=5 {
+                        if let Ok(mut borrow) = self.transport.try_borrow_mut() {
+                            *borrow = transport_opt.take();
+                            stored = true;
+                            if attempt > 1 {
+                                web_sys::console::log_1(
+                                    &format!(
+                                        "DEBUG: connect() - stored transport on attempt {}",
+                                        attempt
+                                    )
+                                    .into(),
+                                );
+                            }
+                            break;
+                        }
+                        // Wait 200ms before retry
+                        let _ = wasm_bindgen_futures::JsFuture::from(js_sys::Promise::new(
+                            &mut |r, _| {
+                                if let Some(window) = web_sys::window() {
+                                    let _ = window
+                                        .set_timeout_with_callback_and_timeout_and_arguments_0(
+                                            &r, 200,
+                                        );
+                                }
+                            },
+                        ))
+                        .await;
+                        web_sys::console::log_1(
+                            &format!(
+                                "DEBUG: connect() - retry {} acquiring transport lock",
+                                attempt
+                            )
+                            .into(),
+                        );
+                    }
+
+                    if !stored {
+                        web_sys::console::error_1(
+                            &"CRITICAL: connect() could not store transport after retries".into(),
+                        );
+                        break Err("Could not acquire transport lock".into());
+                    }
+
                     *self.active_port.borrow_mut() = Some(port);
 
                     self.set_connected.set(true);
@@ -1079,6 +1332,8 @@ impl ConnectionManager {
         &self,
         last_vid: Signal<Option<u16>>,
         last_pid: Signal<Option<u16>>,
+        set_last_vid: WriteSignal<Option<u16>>,
+        set_last_pid: WriteSignal<Option<u16>>,
         baud_signal: Signal<u32>,
         detected_baud: Signal<u32>,
         framing_signal: Signal<String>,
@@ -1086,15 +1341,31 @@ impl ConnectionManager {
         let manager_conn = self.clone();
         let manager_disc = self.clone();
         let is_reconfiguring = self.is_reconfiguring;
+        let is_probing = self.is_probing;
 
         let on_connect_closure = Closure::wrap(Box::new(move |_e: web_sys::Event| {
-            // On Connect (Device plugged in)
+            let t_onconnect = js_sys::Date::now();
+            web_sys::console::log_1(
+                &format!("[{}ms] serial.onconnect triggered", t_onconnect as u64).into(),
+            );
+
             // Check if it matches our last device
-            if let (Some(target_vid), Some(target_pid)) =
-                (last_vid.get_untracked(), last_pid.get_untracked())
-            {
+            let vid_opt = last_vid.get_untracked();
+            let pid_opt = last_pid.get_untracked();
+            web_sys::console::log_1(
+                &format!(
+                    "[{}ms] last_vid={:?}, last_pid={:?}",
+                    (js_sys::Date::now() - t_onconnect) as u64,
+                    vid_opt,
+                    pid_opt
+                )
+                .into(),
+            );
+
+            if let (Some(target_vid), Some(target_pid)) = (vid_opt, pid_opt) {
                 let manager_conn = manager_conn.clone();
                 spawn_local(async move {
+                    let t0 = js_sys::Date::now();
                     let Some(window) = web_sys::window() else {
                         return;
                     };
@@ -1103,8 +1374,25 @@ impl ConnectionManager {
                     // getPorts() returns Promise directly
                     let promise = serial.get_ports();
 
+                    web_sys::console::log_1(
+                        &format!(
+                            "[{}ms] Calling getPorts()...",
+                            (js_sys::Date::now() - t0) as u64
+                        )
+                        .into(),
+                    );
+
                     if let Ok(val) = wasm_bindgen_futures::JsFuture::from(promise).await {
                         let ports: js_sys::Array = val.unchecked_into();
+                        web_sys::console::log_1(
+                            &format!(
+                                "[{}ms] Scanning {} ports for reconnect",
+                                (js_sys::Date::now() - t0) as u64,
+                                ports.length()
+                            )
+                            .into(),
+                        );
+
                         for i in 0..ports.length() {
                             let p: web_sys::SerialPort = ports.get(i).unchecked_into();
                             let info = p.get_info();
@@ -1117,7 +1405,24 @@ impl ConnectionManager {
                                 .and_then(|v| v.as_f64())
                                 .map(|v| v as u16);
 
+                            web_sys::console::log_1(
+                                &format!(
+                                    "DEBUG: Port {}: vid={:?} pid={:?} (looking for vid={} pid={})",
+                                    i, vid, pid, target_vid, target_pid
+                                )
+                                .into(),
+                            );
+
                             if vid == Some(target_vid) && pid == Some(target_pid) {
+                                web_sys::console::log_1(
+                                    &format!(
+                                        "[{}ms] Matched device! vid={:?} pid={:?}",
+                                        (js_sys::Date::now() - t0) as u64,
+                                        vid,
+                                        pid
+                                    )
+                                    .into(),
+                                );
                                 manager_conn
                                     .set_status
                                     .set("Device found. Auto-reconnecting...".into());
@@ -1155,28 +1460,121 @@ impl ConnectionManager {
                                 // Auto-reconnect not needed here, handled by manager internal state
                                 // or explicit loop
 
+                                // CRITICAL FIX: Check if reconnection already in progress to
+                                // prevent race When multiple
+                                // serial.onconnect events fire (wrong device, then correct device),
+                                // both the immediate check and retry loop can trigger reconnection
+                                // simultaneously
+                                if *manager_conn.is_connecting_internal.borrow() {
+                                    web_sys::console::log_1(
+                                        &"DEBUG: Skipping auto-reconnect - connection already in \
+                                          progress"
+                                            .into(),
+                                    );
+                                    return; // Exit early, don't spawn duplicate reconnect
+                                }
+
                                 spawn_local(async move {
+                                    let t_reconnect = js_sys::Date::now();
+                                    web_sys::console::log_1(
+                                        &format!(
+                                            "[{}ms] Auto-reconnect - calling disconnect()",
+                                            t_reconnect as u64
+                                        )
+                                        .into(),
+                                    );
+
                                     // FORCE RESET: Close any stale handles (even if we think we are
                                     // disconnected, the browser might hold the lock)
-                                    manager_conn.disconnect().await;
+                                    // CRITICAL FIX: Exit task if disconnect() was skipped (another
+                                    // task already running)
+                                    if !manager_conn.disconnect().await {
+                                        web_sys::console::log_1(
+                                            &"DEBUG: Auto-reconnect - exiting task, disconnect \
+                                              already handled by another task"
+                                                .into(),
+                                        );
+                                        return; // Exit entire reconnection task
+                                    }
 
-                                    // Wait for OS/Browser to release resource fully (Crucial for
-                                    // auto-reconnect)
+                                    // CRITICAL FIX: Reset user_initiated flag immediately
+                                    // disconnect() sets this flag to true, but auto-reconnect is
+                                    // NOT user-initiated
+                                    // If we don't reset it before next physical disconnect, that
+                                    // disconnect will be
+                                    // incorrectly treated as user-initiated, disabling
+                                    // auto-reconnect
+                                    *manager_conn.user_initiated_disconnect.borrow_mut() = false;
+                                    web_sys::console::log_1(
+                                        &"DEBUG: Auto-reconnect - reset user_initiated flag to \
+                                          false"
+                                            .into(),
+                                    );
+
+                                    web_sys::console::log_1(
+                                        &format!(
+                                            "[{}ms] Auto-reconnect - disconnect() completed, \
+                                             waiting 100ms",
+                                            (js_sys::Date::now() - t_reconnect) as u64
+                                        )
+                                        .into(),
+                                    );
+
+                                    // OPTIMIZATION: Reduced wait from 500ms→200ms→100ms
+                                    // Skip-close optimization makes disconnect() much faster
                                     let _ = wasm_bindgen_futures::JsFuture::from(
                                             js_sys::Promise::new(&mut |r, _| {
                                                 if let Some(window) = web_sys::window() {
-                                                    let _ = window.set_timeout_with_callback_and_timeout_and_arguments_0(&r, 500);
+                                                    let _ = window.set_timeout_with_callback_and_timeout_and_arguments_0(&r, 100);
                                                 }
                                             })
                                         ).await;
 
+                                    web_sys::console::log_1(
+                                        &format!(
+                                            "[{}ms] Auto-reconnect - calling connect() with \
+                                             baud={}",
+                                            (js_sys::Date::now() - t_reconnect) as u64,
+                                            target_baud
+                                        )
+                                        .into(),
+                                    );
+
                                     // Manager updates status signals automatically
-                                    if let Err(_e) = manager_conn
+                                    if let Err(e) = manager_conn
                                         .connect(p, target_baud, &final_framing_str)
                                         .await
                                     {
-                                        // Connect failed
+                                        // OPTIMIZATION: Don't log "Already connecting" as failure
+                                        // (expected race)
+                                        if e == "Already connecting" {
+                                            web_sys::console::log_1(
+                                                &format!(
+                                                    "[{}ms] Auto-reconnect - another path already \
+                                                     connecting, exiting gracefully",
+                                                    (js_sys::Date::now() - t_reconnect) as u64
+                                                )
+                                                .into(),
+                                            );
+                                        } else {
+                                            web_sys::console::log_1(
+                                                &format!(
+                                                    "[{}ms] Auto-reconnect FAILED: {:?}",
+                                                    (js_sys::Date::now() - t_reconnect) as u64,
+                                                    e
+                                                )
+                                                .into(),
+                                            );
+                                        }
                                     } else {
+                                        let elapsed = (js_sys::Date::now() - t_reconnect) as u64;
+                                        web_sys::console::log_1(
+                                            &format!(
+                                                "[{}ms] Auto-reconnect SUCCESS (total {}ms)",
+                                                elapsed, elapsed
+                                            )
+                                            .into(),
+                                        );
                                         // Manual status update for "Restored" vs just "Connected"
                                         manager_conn.set_status.set("Restored Connection".into());
                                     }
@@ -1184,19 +1582,307 @@ impl ConnectionManager {
                                 return; // Stop checking
                             }
                         }
+                        // PERFORMANCE FIX: Retry getPorts() instead of waiting for next onconnect
+                        // On USB re-insertion, browser may enumerate wrong device first,
+                        // then correct device appears shortly after
+                        web_sys::console::log_1(
+                            &format!(
+                                "[{}ms] No matching device found (target vid={}, pid={}), \
+                                 retrying...",
+                                (js_sys::Date::now() - t0) as u64,
+                                target_vid,
+                                target_pid
+                            )
+                            .into(),
+                        );
+
+                        // PERFORMANCE FIX: Retry up to 200 times with 50ms intervals (10000ms max)
+                        // Extended from 120 retries (6s) to handle worst-case OS device
+                        // enumeration. Analysis: Most USB enumerations
+                        // complete in 2-6s, worst case is 8-10s.
+                        // On USB re-insertion, OS may enumerate wrong device first (e.g.,
+                        // VID=12642), then correct device appears 2-8
+                        // seconds later (e.g., VID=7052). User testing
+                        // showed 6s window missed device by only 164ms in edge cases.
+                        // This 10s window provides adequate buffer while maintaining
+                        // responsiveness. If device still not found after
+                        // 10s, serial.onconnect fallback still applies.
+                        for retry_attempt in 1..=200 {
+                            // OPTIMIZATION: Exit retry loop if another path already started
+                            // reconnecting This happens when a new
+                            // serial.onconnect event finds device while retry loop is still running
+                            if *manager_conn.is_connecting_internal.borrow() {
+                                web_sys::console::log_1(
+                                    &format!(
+                                        "[{}ms] Retry loop - exiting early, reconnection already \
+                                         started by another path",
+                                        (js_sys::Date::now() - t0) as u64
+                                    )
+                                    .into(),
+                                );
+                                return;
+                            }
+
+                            // Wait 50ms before retry
+                            let _ = wasm_bindgen_futures::JsFuture::from(js_sys::Promise::new(
+                                &mut |r, _| {
+                                    if let Some(window) = web_sys::window() {
+                                        let _ = window
+                                            .set_timeout_with_callback_and_timeout_and_arguments_0(
+                                                &r, 50,
+                                            );
+                                    }
+                                },
+                            ))
+                            .await;
+
+                            // DIAGNOSTIC: Log progress every 10 retries to track polling activity
+                            if retry_attempt % 10 == 0 {
+                                web_sys::console::log_1(
+                                    &format!(
+                                        "[{}ms] Retry attempt {}/200 - still polling for device \
+                                         (target vid={}, pid={})...",
+                                        (js_sys::Date::now() - t0) as u64,
+                                        retry_attempt,
+                                        target_vid,
+                                        target_pid
+                                    )
+                                    .into(),
+                                );
+                            }
+
+                            // Retry getPorts()
+                            let promise_retry = serial.get_ports();
+                            if let Ok(val_retry) =
+                                wasm_bindgen_futures::JsFuture::from(promise_retry).await
+                            {
+                                let ports_retry: js_sys::Array = val_retry.unchecked_into();
+
+                                for i in 0..ports_retry.length() {
+                                    let p: web_sys::SerialPort =
+                                        ports_retry.get(i).unchecked_into();
+                                    let info = p.get_info();
+                                    let vid = js_sys::Reflect::get(&info, &"usbVendorId".into())
+                                        .ok()
+                                        .and_then(|v| v.as_f64())
+                                        .map(|v| v as u16);
+                                    let pid = js_sys::Reflect::get(&info, &"usbProductId".into())
+                                        .ok()
+                                        .and_then(|v| v.as_f64())
+                                        .map(|v| v as u16);
+
+                                    if vid == Some(target_vid) && pid == Some(target_pid) {
+                                        web_sys::console::log_1(
+                                            &format!(
+                                                "[{}ms] Matched device on retry {}! vid={:?} \
+                                                 pid={:?}",
+                                                (js_sys::Date::now() - t0) as u64,
+                                                retry_attempt,
+                                                vid,
+                                                pid
+                                            )
+                                            .into(),
+                                        );
+
+                                        // Same reconnection logic as above
+                                        manager_conn
+                                            .set_status
+                                            .set("Device found. Auto-reconnecting...".into());
+
+                                        let user_pref_baud = baud_signal.get_untracked();
+                                        let last_known_baud = detected_baud.get_untracked();
+                                        let target_baud =
+                                            if user_pref_baud == 0 && last_known_baud > 0 {
+                                                last_known_baud
+                                            } else if user_pref_baud == 0 {
+                                                115200
+                                            } else {
+                                                user_pref_baud
+                                            };
+
+                                        let current_framing = framing_signal.get_untracked();
+                                        let final_framing_str = if current_framing == "Auto" {
+                                            "8N1".to_string()
+                                        } else {
+                                            current_framing
+                                        };
+
+                                        // CRITICAL FIX: Check if reconnection already in progress
+                                        // to prevent race
+                                        // Retry loop may find device after immediate check already
+                                        // triggered reconnect
+                                        if *manager_conn.is_connecting_internal.borrow() {
+                                            web_sys::console::log_1(
+                                                &"DEBUG: Retry loop - skipping reconnect, \
+                                                  connection already in progress"
+                                                    .into(),
+                                            );
+                                            return; // Exit retry loop, don't spawn duplicate
+                                                    // reconnect
+                                        }
+
+                                        let manager_conn_clone = manager_conn.clone();
+                                        spawn_local(async move {
+                                            let t_reconnect = js_sys::Date::now();
+                                            web_sys::console::log_1(
+                                                &format!(
+                                                    "[{}ms] Auto-reconnect - calling disconnect()",
+                                                    t_reconnect as u64
+                                                )
+                                                .into(),
+                                            );
+
+                                            // CRITICAL FIX: Exit task if disconnect() was skipped
+                                            // (another task already running)
+                                            if !manager_conn_clone.disconnect().await {
+                                                web_sys::console::log_1(
+                                                    &"DEBUG: Auto-reconnect - exiting task, \
+                                                      disconnect already handled by another task"
+                                                        .into(),
+                                                );
+                                                return; // Exit entire reconnection task
+                                            }
+
+                                            *manager_conn_clone
+                                                .user_initiated_disconnect
+                                                .borrow_mut() = false;
+                                            web_sys::console::log_1(
+                                                &"DEBUG: Auto-reconnect - reset user_initiated \
+                                                  flag to false"
+                                                    .into(),
+                                            );
+
+                                            web_sys::console::log_1(
+                                                &format!(
+                                                    "[{}ms] Auto-reconnect - disconnect() \
+                                                     completed, waiting 100ms",
+                                                    (js_sys::Date::now() - t_reconnect) as u64
+                                                )
+                                                .into(),
+                                            );
+
+                                            let _ = wasm_bindgen_futures::JsFuture::from(
+                                                    js_sys::Promise::new(&mut |r, _| {
+                                                        if let Some(window) = web_sys::window() {
+                                                            let _ = window.set_timeout_with_callback_and_timeout_and_arguments_0(&r, 100);
+                                                        }
+                                                    })
+                                                ).await;
+
+                                            web_sys::console::log_1(
+                                                &format!(
+                                                    "[{}ms] Auto-reconnect - calling connect() \
+                                                     with baud={}",
+                                                    (js_sys::Date::now() - t_reconnect) as u64,
+                                                    target_baud
+                                                )
+                                                .into(),
+                                            );
+
+                                            if let Err(e) = manager_conn_clone
+                                                .connect(p, target_baud, &final_framing_str)
+                                                .await
+                                            {
+                                                // OPTIMIZATION: Don't log "Already connecting" as
+                                                // failure (expected race)
+                                                if e == "Already connecting" {
+                                                    web_sys::console::log_1(
+                                                        &format!(
+                                                            "[{}ms] Auto-reconnect - another path \
+                                                             already connecting, exiting \
+                                                             gracefully",
+                                                            (js_sys::Date::now() - t_reconnect)
+                                                                as u64
+                                                        )
+                                                        .into(),
+                                                    );
+                                                } else {
+                                                    web_sys::console::log_1(
+                                                        &format!(
+                                                            "[{}ms] Auto-reconnect FAILED: {:?}",
+                                                            (js_sys::Date::now() - t_reconnect)
+                                                                as u64,
+                                                            e
+                                                        )
+                                                        .into(),
+                                                    );
+                                                }
+                                            } else {
+                                                let elapsed =
+                                                    (js_sys::Date::now() - t_reconnect) as u64;
+                                                web_sys::console::log_1(
+                                                    &format!(
+                                                        "[{}ms] Auto-reconnect SUCCESS (total \
+                                                         {}ms)",
+                                                        elapsed, elapsed
+                                                    )
+                                                    .into(),
+                                                );
+                                                manager_conn_clone
+                                                    .set_status
+                                                    .set("Restored Connection".into());
+                                            }
+                                        });
+                                        return;
+                                    }
+                                }
+                            }
+                        }
+
+                        web_sys::console::log_1(
+                            &format!(
+                                "[{}ms] No matching device found after 200 retries (target \
+                                 vid={}, pid={}). Waiting for serial.onconnect event...",
+                                (js_sys::Date::now() - t0) as u64,
+                                target_vid,
+                                target_pid
+                            )
+                            .into(),
+                        );
                     }
                 });
+            } else {
+                web_sys::console::log_1(&"DEBUG: No last_vid/last_pid to match against".into());
             }
         }) as Box<dyn FnMut(_)>);
 
         // On Disconnect
         let on_disconnect_closure = Closure::wrap(Box::new(move |_e: web_sys::Event| {
+            web_sys::console::log_1(&"DEBUG: serial.ondisconnect triggered".into());
+
             if is_reconfiguring.get_untracked() {
+                web_sys::console::log_1(&"DEBUG: ignoring disconnect (reconfiguring)".into());
                 return;
             }
-            manager_disc
-                .set_status
-                .set("Device Disconnected (Waiting to Reconnect...)".into());
+
+            if is_probing.get_untracked() {
+                web_sys::console::log_1(&"DEBUG: ignoring disconnect (probing)".into());
+                return;
+            }
+
+            // Check if this was a user-initiated disconnect
+            let user_initiated = *manager_disc.user_initiated_disconnect.borrow();
+
+            if user_initiated {
+                web_sys::console::log_1(
+                    &"DEBUG: User-initiated disconnect - disabling auto-reconnect".into(),
+                );
+                // Clear last_vid/last_pid to prevent auto-reconnect
+                set_last_vid.set(None);
+                set_last_pid.set(None);
+                manager_disc.set_status.set("Disconnected".into());
+                // Reset the flag for next time
+                *manager_disc.user_initiated_disconnect.borrow_mut() = false;
+            } else {
+                web_sys::console::log_1(
+                    &"DEBUG: Device disconnected (not user-initiated) - will auto-reconnect".into(),
+                );
+                // Keep last_vid/last_pid to enable auto-reconnect
+                manager_disc
+                    .set_status
+                    .set("Device Lost (Auto-reconnecting...)".into());
+            }
+
             manager_disc.set_connected.set(false);
         }) as Box<dyn FnMut(_)>);
 

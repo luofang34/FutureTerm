@@ -172,7 +172,22 @@ impl Transport for WebSerialTransport {
         }
         if let Some(writer) = self.writer.take() {
             let start_w = js_sys::Date::now();
-            let _ = JsFuture::from(writer.close()).await;
+
+            // CRITICAL FIX: writer.close() can hang indefinitely if device disconnected
+            // Use Promise.race() with 100ms timeout to prevent blocking reconnection
+            let close_promise = writer.close();
+            let timeout_promise = js_sys::Promise::new(&mut |resolve, _reject| {
+                if let Some(window) = web_sys::window() {
+                    let _ = window.set_timeout_with_callback_and_timeout_and_arguments_0(
+                        &resolve, 100, // 100ms timeout
+                    );
+                }
+            });
+
+            let race_result =
+                js_sys::Promise::race(&js_sys::Array::of2(&close_promise, &timeout_promise));
+            let _ = JsFuture::from(race_result).await;
+
             writer.release_lock();
             let dur_w = js_sys::Date::now() - start_w;
             web_sys::console::log_1(
@@ -184,20 +199,50 @@ impl Transport for WebSerialTransport {
             // port.close() via Reflect if binding fails
             if let Ok(func_val) = js_sys::Reflect::get(&port, &"close".into()) {
                 if let Ok(func) = func_val.dyn_into::<js_sys::Function>() {
-                    if let Ok(p) = func.call0(&port) {
-                        web_sys::console::log_1(
-                            &"WebSerialTransport: port.close() invoking...".into(),
-                        );
-                        let start_c = js_sys::Date::now();
-                        JsFuture::from(js_sys::Promise::from(p)).await.ok();
-                        let dur_c = js_sys::Date::now() - start_c;
-                        web_sys::console::log_1(
-                            &format!(
-                                "WebSerialTransport: port.close() resolved in {:.1}ms",
-                                dur_c
-                            )
-                            .into(),
-                        );
+                    // CRITICAL FIX: port.close() can hang or throw if device disconnected
+                    // Use timeout and error handling to ensure we don't block
+                    match func.call0(&port) {
+                        Ok(p) => {
+                            web_sys::console::log_1(
+                                &"WebSerialTransport: port.close() invoking...".into(),
+                            );
+                            let start_c = js_sys::Date::now();
+
+                            // OPTIMIZATION: Use shorter timeout (50ms) for port.close()
+                            // If device disconnected, close() promise hangs - don't wait long
+                            let close_promise = js_sys::Promise::from(p);
+                            let timeout_promise = js_sys::Promise::new(&mut |resolve, _reject| {
+                                if let Some(window) = web_sys::window() {
+                                    let _ = window
+                                        .set_timeout_with_callback_and_timeout_and_arguments_0(
+                                            &resolve, 50,
+                                        );
+                                }
+                            });
+
+                            let race_result = js_sys::Promise::race(&js_sys::Array::of2(
+                                &close_promise,
+                                &timeout_promise,
+                            ));
+                            let _ = JsFuture::from(race_result).await;
+
+                            let dur_c = js_sys::Date::now() - start_c;
+                            web_sys::console::log_1(
+                                &format!(
+                                    "WebSerialTransport: port.close() resolved in {:.1}ms",
+                                    dur_c
+                                )
+                                .into(),
+                            );
+                        }
+                        Err(_) => {
+                            // Port already closed or other error - this is fine
+                            web_sys::console::log_1(
+                                &"WebSerialTransport: port.close() call failed (port likely \
+                                  already closed)"
+                                    .into(),
+                            );
+                        }
                     }
                 }
             }

@@ -365,9 +365,8 @@ pub fn App() -> impl IntoView {
                     .and_then(|v| v.as_f64())
                     .map(|v| v as u16);
 
-                // Store for reconnect
-                set_last_vid.set(vid);
-                set_last_pid.set(pid);
+                // CRITICAL FIX: VID/PID will be cached ONLY after successful connection
+                // (moved to Ok(_) branch below to prevent caching wrong device)
 
                 let current_framing = framing.get_untracked();
 
@@ -391,6 +390,11 @@ pub fn App() -> impl IntoView {
                             .await
                         {
                             Ok(_) => {
+                                // CRITICAL FIX: Cache VID/PID ONLY after connection succeeds
+                                // This prevents caching wrong device if probing fails
+                                set_last_vid.set(vid);
+                                set_last_pid.set(pid);
+
                                 // Save to LocalStorage
                                 if let (Some(v), Some(p)) = (vid, pid) {
                                     if let Some(window) = web_sys::window() {
@@ -402,6 +406,11 @@ pub fn App() -> impl IntoView {
                                 }
                             }
                             Err(_) => {
+                                // CRITICAL FIX: Clear cached VID/PID on connection failure
+                                // This prevents retry logic from searching for the wrong device
+                                set_last_vid.set(None);
+                                set_last_pid.set(None);
+
                                 // Status updated by manager
                             }
                         }
@@ -412,6 +421,8 @@ pub fn App() -> impl IntoView {
                     manager.setup_auto_reconnect(
                         last_vid.into(),
                         last_pid.into(),
+                        set_last_vid,
+                        set_last_pid,
                         baud_rate.into(),
                         detected_baud,
                         framing.into(),
@@ -638,7 +649,13 @@ pub fn App() -> impl IntoView {
                         style="padding: 0 12px; width: 100px; text-align: center; background: #007acc; color: white; border: none; cursor: pointer; font-size: 0.9rem; border-right: 1px solid rgba(255,255,255,0.2);"
                         title="Smart Connect (Auto-detects USB-Serial)"
                         on:click=move |_| on_connect(false)>
-                        {move || if connected.get() { "Disconnect" } else { "Connect" }}
+                        {move || {
+                            let is_connected = connected.get();
+                            let s = status.get();
+                            let is_auto_reconnecting = s.contains("Auto-reconnecting") || s.contains("Device Lost");
+                            // Show "Disconnect" if connected OR if auto-reconnecting (yellow light state)
+                            if is_connected || is_auto_reconnecting { "Disconnect" } else { "Connect" }
+                        }}
                     </button>
                     <button
                          class="split-btn"
