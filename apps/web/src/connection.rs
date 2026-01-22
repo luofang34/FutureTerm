@@ -19,6 +19,26 @@ use futures_channel::{mpsc, oneshot};
 // We need to move the protocol module usage here or make it public
 use crate::protocol::UiToWorker;
 
+// ============ Timing Constants ============
+
+/// Adaptive polling intervals for device re-enumeration
+const POLL_INTERVAL_FAST_MS: i32 = 100; // First 5 attempts (0-500ms)
+const POLL_INTERVAL_MEDIUM_MS: i32 = 200; // Next 5 attempts (500-1500ms)
+const POLL_INTERVAL_SLOW_MS: i32 = 400; // Final 5 attempts (1500-3500ms)
+
+/// Wait time for device to be ready after re-enumeration
+const REENUMERATION_WAIT_MS: i32 = 200;
+
+/// Wait time for OS to release port after probing
+const PROBING_CLEANUP_WAIT_MS: i32 = 150;
+
+/// Auto-reconnect retry configuration
+const AUTO_RECONNECT_RETRY_INTERVAL_MS: i32 = 50;
+const AUTO_RECONNECT_MAX_RETRIES: usize = 200; // 200 * 50ms = 10 seconds max
+
+/// Timeout for read loop completion during disconnect
+const DISCONNECT_COMPLETION_TIMEOUT_MS: i32 = 2000; // 2 seconds
+
 // ============ Connection State Machine ============
 
 /// Unified connection state for robust state management
@@ -354,6 +374,18 @@ impl ConnectionManager {
         self.status
     }
 
+    /// Clear stored VID/PID to prevent auto-reconnect
+    /// Centralized method to avoid logic duplication across disconnect paths
+    fn clear_auto_reconnect_device(&self) {
+        if let Some(set_vid) = *self.set_last_vid.borrow() {
+            set_vid.set(None);
+        }
+        if let Some(set_pid) = *self.set_last_pid.borrow() {
+            set_pid.set(None);
+        }
+        web_sys::console::log_1(&"DEBUG: Cleared VID/PID to prevent auto-reconnect".into());
+    }
+
     /// Helper: Poll for device re-enumeration after disconnect events
     /// Uses adaptive polling intervals for optimal performance
     async fn poll_for_device_reenumeration(&self) -> Result<web_sys::SerialPort, String> {
@@ -399,11 +431,11 @@ impl ConnectionManager {
 
             // Adaptive wait interval based on attempt number
             let wait_ms = if attempt <= 5 {
-                100 // Fast polling for first 500ms
+                POLL_INTERVAL_FAST_MS
             } else if attempt <= 10 {
-                200 // Medium polling for next 1000ms
+                POLL_INTERVAL_MEDIUM_MS
             } else {
-                400 // Slow polling for final 2000ms
+                POLL_INTERVAL_SLOW_MS
             };
 
             elapsed_ms += wait_ms;
@@ -419,10 +451,19 @@ impl ConnectionManager {
 
         if let Some(port) = fresh_port {
             // Wait a bit more for port to be fully ready
-            web_sys::console::log_1(&"DEBUG: Waiting 200ms for port to be ready".into());
+            web_sys::console::log_1(
+                &format!(
+                    "DEBUG: Waiting {}ms for port to be ready",
+                    REENUMERATION_WAIT_MS
+                )
+                .into(),
+            );
             let _ = wasm_bindgen_futures::JsFuture::from(js_sys::Promise::new(&mut |r, _| {
                 if let Some(window) = web_sys::window() {
-                    let _ = window.set_timeout_with_callback_and_timeout_and_arguments_0(&r, 200);
+                    let _ = window.set_timeout_with_callback_and_timeout_and_arguments_0(
+                        &r,
+                        REENUMERATION_WAIT_MS,
+                    );
                 }
             }))
             .await;
@@ -515,14 +556,19 @@ impl ConnectionManager {
                         // CRITICAL FIX: Wait for OS to fully release port after probing
                         // Probing opens/closes port multiple times - OS needs time to clean up
                         web_sys::console::log_1(
-                            &"DEBUG: Probing complete, waiting 150ms for port cleanup".into(),
+                            &format!(
+                                "DEBUG: Probing complete, waiting {}ms for port cleanup",
+                                PROBING_CLEANUP_WAIT_MS
+                            )
+                            .into(),
                         );
                         let _ = wasm_bindgen_futures::JsFuture::from(js_sys::Promise::new(
                             &mut |r, _| {
                                 if let Some(window) = web_sys::window() {
                                     let _ = window
                                         .set_timeout_with_callback_and_timeout_and_arguments_0(
-                                            &r, 150,
+                                            &r,
+                                            PROBING_CLEANUP_WAIT_MS,
                                         );
                                 }
                             },
@@ -530,7 +576,8 @@ impl ConnectionManager {
                         .await;
 
                         // CRITICAL FIX: Check interrupt flag AGAIN after cleanup wait
-                        // ondisconnect event may fire DURING the 150ms wait, invalidating the port
+                        // ondisconnect event may fire DURING the cleanup wait, invalidating the
+                        // port
                         if *self.probing_interrupted.borrow() {
                             web_sys::console::warn_1(
                                 &"DEBUG: Disconnect occurred during cleanup wait - port is stale"
@@ -621,15 +668,47 @@ impl ConnectionManager {
             let _ = h.cmd_tx.unbounded_send(ConnectionCommand::Stop);
 
             // Wait for read loop to fully exit and drop transport (releases stream locks)
+            // Use timeout to prevent indefinite blocking if read loop hangs
             web_sys::console::log_1(&"DEBUG: Waiting for read loop to release streams...".into());
-            match h.completion_rx.await {
-                Ok(_) => {
-                    web_sys::console::log_1(&"DEBUG: Read loop completed, streams released".into());
+
+            // Create timeout promise
+            let timeout_promise = js_sys::Promise::new(&mut |resolve, _reject| {
+                if let Some(window) = web_sys::window() {
+                    let _ = window.set_timeout_with_callback_and_timeout_and_arguments_0(
+                        &resolve,
+                        DISCONNECT_COMPLETION_TIMEOUT_MS,
+                    );
                 }
-                Err(_) => {
-                    web_sys::console::log_1(
-                        &"WARN: Read loop completion signal dropped (loop may have panicked)"
-                            .into(),
+            });
+
+            // Race completion against timeout
+            let completion_future = h.completion_rx;
+            let timeout_signal = wasm_bindgen_futures::JsFuture::from(timeout_promise);
+
+            // Use select! to race futures
+            futures::select! {
+                result = completion_future.fuse() => {
+                    match result {
+                        Ok(_) => {
+                            web_sys::console::log_1(
+                                &"DEBUG: Read loop completed, streams released".into()
+                            );
+                        }
+                        Err(_) => {
+                            web_sys::console::log_1(
+                                &"WARN: Read loop completion signal dropped (loop may have panicked)"
+                                    .into(),
+                            );
+                        }
+                    }
+                }
+                _ = timeout_signal.fuse() => {
+                    web_sys::console::error_1(
+                        &format!(
+                            "WARN: Read loop did not complete within {}ms - proceeding with disconnect",
+                            DISCONNECT_COMPLETION_TIMEOUT_MS
+                        )
+                        .into(),
                     );
                 }
             }
@@ -643,15 +722,7 @@ impl ConnectionManager {
         // This is critical: when disconnect() is called from DeviceLost state, the device
         // is already physically gone, so ondisconnect event won't fire to clear VID/PID.
         // We must clear them here to prevent auto-reconnect when cable is replugged.
-        if let Some(set_vid) = *self.set_last_vid.borrow() {
-            set_vid.set(None);
-        }
-        if let Some(set_pid) = *self.set_last_pid.borrow() {
-            set_pid.set(None);
-        }
-        web_sys::console::log_1(
-            &"DEBUG: Cleared VID/PID in disconnect() to prevent auto-reconnect".into(),
-        );
+        self.clear_auto_reconnect_device();
 
         // Transition to Disconnected state
         // The retry loop checks state in addition to flag, so no sleep needed
@@ -678,19 +749,18 @@ impl ConnectionManager {
         }
     }
 
-    async fn rollback_state(&self, snapshot: ConnectionSnapshot) {
+    /// Restore UI state after failed reconfiguration
+    /// NOTE: This is NOT a true transactional rollback - we cannot restore the connection
+    /// after disconnect(). This only restores UI-facing state (detected baud/framing/decoder)
+    /// for consistency after a failed baud rate change attempt.
+    async fn restore_ui_state(&self, snapshot: ConnectionSnapshot) {
         web_sys::console::log_1(
             &format!(
-                "Rolling back connection state: baud={}, framing={}, decoder={}",
+                "Restoring UI state: baud={}, framing={}, decoder={}",
                 snapshot.baud, snapshot.framing, snapshot.decoder_id
             )
             .into(),
         );
-
-        // NOTE: True transaction rollback is not possible with WebSerial API
-        // because we cannot open the same port twice simultaneously.
-        // Once disconnect() is called, the read loop is stopped and cannot be restored.
-        // This rollback only restores UI state (detected config) for consistency.
 
         // Restore detected config for UI consistency
         self.set_detected_baud.set(snapshot.baud);
@@ -780,7 +850,7 @@ impl ConnectionManager {
                 Err(e) => {
                     // Restore UI state (actual connection cannot be restored)
                     web_sys::console::error_1(&format!("Reconfigure failed: {}", e).into());
-                    self.rollback_state(snapshot).await;
+                    self.restore_ui_state(snapshot).await;
                     // Transition to Disconnected state on failure
                     self.transition_to(ConnectionState::Disconnected);
                     self.set_status.set(format!(
@@ -850,7 +920,22 @@ impl ConnectionManager {
                                 );
                                 break;
                             }
-                            _ => {} // Empty read, continue
+                            _ => {
+                                // Empty read - yield to prevent CPU spinning
+                                // Without this, continuous empty reads can cause 100% CPU usage
+                                // This small delay allows browser to process other events
+                                let _ = wasm_bindgen_futures::JsFuture::from(
+                                    js_sys::Promise::new(&mut |r, _| {
+                                        if let Some(window) = web_sys::window() {
+                                            let _ = window
+                                                .set_timeout_with_callback_and_timeout_and_arguments_0(
+                                                    &r, 1, // 1ms yield
+                                                );
+                                        }
+                                    }),
+                                )
+                                .await;
+                            }
                         }
                     }
                 }
@@ -1861,8 +1946,8 @@ impl ConnectionManager {
                         // showed 6s window missed device by only 164ms in edge cases.
                         // This 10s window provides adequate buffer while maintaining
                         // responsiveness. If device still not found after
-                        // 10s, serial.onconnect fallback still applies.
-                        for retry_attempt in 1..=200 {
+                        // max timeout, serial.onconnect fallback still applies.
+                        for retry_attempt in 1..=AUTO_RECONNECT_MAX_RETRIES {
                             // OPTIMIZATION: Exit retry loop if another path already started
                             // reconnecting This happens when a new
                             // serial.onconnect event finds device while retry loop is still running
@@ -1907,24 +1992,19 @@ impl ConnectionManager {
                                     manager_conn.transition_to(ConnectionState::Disconnected);
                                 }
 
-                                // Clear last_vid/last_pid to prevent auto-reconnect on next
-                                // insertion
-                                set_last_vid.set(None);
-                                set_last_pid.set(None);
-                                web_sys::console::log_1(
-                                    &"[Auto-reconnect] Cleared VID/PID to prevent re-triggering"
-                                        .into(),
-                                );
+                                // Clear VID/PID to prevent auto-reconnect on next insertion
+                                manager_conn.clear_auto_reconnect_device();
                                 return;
                             }
 
-                            // Wait 50ms before retry
+                            // Wait before retry
                             let _ = wasm_bindgen_futures::JsFuture::from(js_sys::Promise::new(
                                 &mut |r, _| {
                                     if let Some(window) = web_sys::window() {
                                         let _ = window
                                             .set_timeout_with_callback_and_timeout_and_arguments_0(
-                                                &r, 50,
+                                                &r,
+                                                AUTO_RECONNECT_RETRY_INTERVAL_MS,
                                             );
                                     }
                                 },
@@ -2188,9 +2268,8 @@ impl ConnectionManager {
                 web_sys::console::log_1(
                     &"DEBUG: User-initiated disconnect - disabling auto-reconnect".into(),
                 );
-                // Clear last_vid/last_pid to prevent auto-reconnect
-                set_last_vid.set(None);
-                set_last_pid.set(None);
+                // Clear VID/PID to prevent auto-reconnect
+                manager_disc.clear_auto_reconnect_device();
                 // Transition to Disconnected state
                 manager_disc.transition_to(ConnectionState::Disconnected);
                 // Reset the flag for next time
