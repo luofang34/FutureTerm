@@ -594,16 +594,19 @@ pub fn App() -> impl IntoView {
                      // Use status text as proxy for "Connecting..." since is_reconfiguring might not cover initial connection
                     let s = status.get();
                     let is_busy = s.to_lowercase().contains("connecting") || s.to_lowercase().contains("scanning") || s.to_lowercase().contains("reconfiguring");
+                    let is_auto_reconnecting = manager.is_auto_reconnecting.get();
 
-                    let color = if is_conn && !is_busy {
-                        "rgb(95, 200, 85)" // Connected (Green)
+                    let (color, animation) = if is_conn && !is_busy {
+                        ("rgb(95, 200, 85)", "") // Connected (Green)
+                    } else if is_auto_reconnecting {
+                        ("rgb(245, 190, 80)", "animation: pulse 1s ease-in-out infinite;") // Auto-reconnecting (Blinking Orange)
                     } else if is_busy {
-                        "rgb(245, 190, 80)" // Connecting/Busy (Orange)
+                        ("rgb(245, 190, 80)", "") // Connecting/Busy (Orange)
                     } else {
-                        "rgb(240, 105, 95)" // Disconnected (Red)
+                        ("rgb(240, 105, 95)", "") // Disconnected (Red)
                     };
 
-                    format!("width: 12px; height: 12px; border-radius: 50%; background: {}; transition: background 0.3s ease;", color)
+                    format!("width: 12px; height: 12px; border-radius: 50%; background: {}; transition: background 0.3s ease; {}", color, animation)
                 }></div>
 
                 // RX/TX Indicators (Compact Stack)
@@ -638,7 +641,11 @@ pub fn App() -> impl IntoView {
 
                 <style>
                     {
-                    ".split-btn { transition: background-color 0.2s; }
+                    "@keyframes pulse {
+                        0%, 100% { opacity: 1; }
+                        50% { opacity: 0.3; }
+                    }
+                    .split-btn { transition: background-color 0.2s; }
                     .split-btn:hover { background-color: #0062a3 !important; }
                     .split-btn:active { background-color: #005a96 !important; }"
                     }

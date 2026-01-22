@@ -76,6 +76,10 @@ pub struct ConnectionManager {
     pub tx_active: Signal<bool>,
     set_tx_active: WriteSignal<bool>,
 
+    // Auto-reconnect status (for UI visual feedback)
+    pub is_auto_reconnecting: Signal<bool>,
+    pub set_is_auto_reconnecting: WriteSignal<bool>,
+
     // Decoder State
     pub decoder_id: Signal<String>,
     pub set_decoder_id: WriteSignal<String>,
@@ -95,6 +99,7 @@ impl ConnectionManager {
 
         let (rx_active, set_rx_active) = create_signal(false);
         let (tx_active, set_tx_active) = create_signal(false);
+        let (is_auto_reconnecting, set_is_auto_reconnecting) = create_signal(false);
         let (decoder_id, set_decoder_id) = create_signal("utf8".to_string());
 
         Self {
@@ -121,6 +126,8 @@ impl ConnectionManager {
             set_rx_active,
             tx_active: tx_active.into(),
             set_tx_active,
+            is_auto_reconnecting: is_auto_reconnecting.into(),
+            set_is_auto_reconnecting,
             decoder_id: decoder_id.into(),
             set_decoder_id,
             user_initiated_disconnect: Rc::new(RefCell::new(false)),
@@ -1395,6 +1402,9 @@ impl ConnectionManager {
                             .into(),
                         );
 
+                        // Set auto-reconnecting flag for UI visual feedback (status light blink)
+                        manager_conn.set_is_auto_reconnecting.set(true);
+
                         // PERFORMANCE FIX: Retry up to 200 times with 50ms intervals (10000ms max)
                         // Extended from 120 retries (6s) to handle worst-case OS device
                         // enumeration. Analysis: Most USB enumerations
@@ -1419,6 +1429,7 @@ impl ConnectionManager {
                                     )
                                     .into(),
                                 );
+                                manager_conn.set_is_auto_reconnecting.set(false);
                                 return;
                             }
 
@@ -1508,6 +1519,13 @@ impl ConnectionManager {
 
                                         let manager_conn_clone = manager_conn.clone();
                                         spawn_local(async move {
+                                            // Ensure auto-reconnecting flag is cleared on exit
+                                            let _guard = scopeguard::guard((), |_| {
+                                                manager_conn_clone
+                                                    .set_is_auto_reconnecting
+                                                    .set(false);
+                                            });
+
                                             // Check if already connecting (without holding lock)
                                             if manager_conn_clone
                                                 .is_connecting
@@ -1625,6 +1643,9 @@ impl ConnectionManager {
                                 }
                             }
                         }
+
+                        // Clear auto-reconnecting flag after retry loop ends
+                        manager_conn.set_is_auto_reconnecting.set(false);
 
                         web_sys::console::log_1(
                             &format!(
