@@ -30,6 +30,9 @@ mavlink = { version = "0.12", default-features = false, features = ["common", "s
 embedded-hal = "0.2"
 nb = "1.0"
 js-sys = "0.3"
+futures-channel = "0.3"
+scopeguard = "1.2"
+futures = "0.3"
 
 
 [features]

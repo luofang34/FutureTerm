@@ -1,6 +1,8 @@
 use leptos::*;
 use std::cell::RefCell;
 use std::rc::Rc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 use wasm_bindgen::prelude::*;
 use wasm_bindgen::JsCast;
 
@@ -9,8 +11,36 @@ use transport_webserial::WebSerialTransport;
 use wasm_bindgen_futures::spawn_local;
 use web_sys::Worker;
 
+use futures::select;
+use futures::stream::StreamExt;
+use futures::FutureExt;
+use futures_channel::{mpsc, oneshot};
+
 // We need to move the protocol module usage here or make it public
 use crate::protocol::UiToWorker;
+
+// Message passing infrastructure
+enum ConnectionCommand {
+    Stop,
+    Write {
+        data: Vec<u8>,
+        response: oneshot::Sender<Result<(), String>>,
+    },
+}
+
+#[derive(Clone)]
+struct ConnectionHandle {
+    cmd_tx: mpsc::UnboundedSender<ConnectionCommand>,
+}
+
+// Snapshot for transaction safety
+#[derive(Clone)]
+struct ConnectionSnapshot {
+    baud: u32,
+    framing: String,
+    port: Option<web_sys::SerialPort>,
+    handle: Option<ConnectionHandle>,
+}
 
 #[derive(Clone)]
 pub struct ConnectionManager {
@@ -31,16 +61,13 @@ pub struct ConnectionManager {
     pub set_detected_framing: WriteSignal<String>,
 
     // Internal State
-    transport: Rc<RefCell<Option<WebSerialTransport>>>,
+    connection_handle: Rc<RefCell<Option<ConnectionHandle>>>,
     active_port: Rc<RefCell<Option<web_sys::SerialPort>>>,
     worker: Signal<Option<Worker>>, // Read-only access to worker for sending data
     last_auto_baud: Rc<RefCell<Option<u32>>>,
-    // Signal to stop the read loop gracefully
-    read_loop_should_stop: Rc<RefCell<bool>>,
-    // Guard against double-connect race conditions
-    is_connecting_internal: Rc<RefCell<bool>>,
-    // Guard against duplicate disconnect calls during auto-reconnect
-    is_disconnecting: Rc<RefCell<bool>>,
+    // Atomic guards for connection state
+    is_connecting: Arc<AtomicBool>,
+    is_disconnecting: Arc<AtomicBool>,
 
     // Hooks for external UI updates (optional, or we just expose signals)
 
@@ -84,13 +111,12 @@ impl ConnectionManager {
             set_detected_baud,
             detected_framing: detected_framing.into(),
             set_detected_framing,
-            transport: Rc::new(RefCell::new(None)),
+            connection_handle: Rc::new(RefCell::new(None)),
             active_port: Rc::new(RefCell::new(None)),
             worker: worker_signal,
             last_auto_baud: Rc::new(RefCell::new(None)),
-            read_loop_should_stop: Rc::new(RefCell::new(false)),
-            is_connecting_internal: Rc::new(RefCell::new(false)),
-            is_disconnecting: Rc::new(RefCell::new(false)),
+            is_connecting: Arc::new(AtomicBool::new(false)),
+            is_disconnecting: Arc::new(AtomicBool::new(false)),
 
             rx_active: rx_active.into(),
             set_rx_active,
@@ -153,19 +179,27 @@ impl ConnectionManager {
         baud: u32,
         framing: &str,
     ) -> Result<(), String> {
-        if *self.is_connecting_internal.borrow() {
+        // Atomic test-and-set for connection guard
+        if self
+            .is_connecting
+            .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+            .is_err()
+        {
             // OPTIMIZATION: Log as info instead of warn (expected during auto-reconnect races)
             web_sys::console::log_1(&"Connection attempt blocked: Already connecting.".into());
             return Err("Already connecting".to_string());
         }
+
+        // Ensure flag is cleared on ALL exit paths
+        let _guard = scopeguard::guard((), |_| {
+            self.is_connecting.store(false, Ordering::SeqCst);
+        });
 
         // Stale UI Guard
         if self.active_port.borrow().is_some() {
             web_sys::console::warn_1(&"Connection attempt blocked: Port already active.".into());
             return Err("Already connected".to_string());
         }
-
-        *self.is_connecting_internal.borrow_mut() = true;
 
         let result = if baud > 0 && framing == "Auto" {
             let (detect_framing, initial_buf, proto) =
@@ -209,261 +243,102 @@ impl ConnectionManager {
                 .await
         };
 
-        *self.is_connecting_internal.borrow_mut() = false;
         result
     }
 
     pub async fn disconnect(&self) -> bool {
-        // CRITICAL FIX: Prevent duplicate disconnect() calls during auto-reconnect races
-        // When multiple auto-reconnect tasks spawn, they may both call disconnect() simultaneously
-        // This guard ensures only ONE disconnect runs, preventing transport lock conflicts
+        // Atomic test-and-set for disconnect guard
+        if self
+            .is_disconnecting
+            .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+            .is_err()
         {
-            let mut flag = self.is_disconnecting.borrow_mut();
-            if *flag {
-                web_sys::console::log_1(
-                    &"DEBUG: disconnect() - already in progress, skipping".into(),
-                );
-                return false; // Another disconnect() is already running, caller should exit
-            }
-            *flag = true; // Claim the disconnect slot
+            web_sys::console::log_1(&"Disconnect already in progress".into());
+            return false;
         }
-
-        let t0 = js_sys::Date::now();
-        web_sys::console::log_1(&format!("[{}ms] disconnect() - START", t0 as u64).into());
 
         // Mark this as user-initiated disconnect
         *self.user_initiated_disconnect.borrow_mut() = true;
 
         self.set_status.set("Disconnecting...".into());
 
-        // OPTIMIZATION: Detect if device is already physically disconnected
-        // If so, we can skip close() and save ~150ms
-        let already_disconnected = !self.connected.get_untracked();
-        if already_disconnected {
-            web_sys::console::log_1(
-                &format!(
-                    "[{}ms] disconnect() - device already disconnected, skipping close()",
-                    (js_sys::Date::now() - t0) as u64
-                )
-                .into(),
-            );
-        }
+        // Send stop command to read loop (non-blocking!)
+        let handle = self.connection_handle.borrow_mut().take();
+        if let Some(h) = handle {
+            let _ = h.cmd_tx.unbounded_send(ConnectionCommand::Stop);
 
-        // 1. Signal Read Loop to Stop
-        *self.read_loop_should_stop.borrow_mut() = true;
-        web_sys::console::log_1(&"DEBUG: disconnect() - signaled read loop to stop".into());
-
-        // 2. Wait for read loop to exit (with retry logic)
-        // CRITICAL FIX: Wait longer (300ms) to ensure read loop completes async read_chunk()
-        // Read loop may be blocked in t.read_chunk().await which holds immutable borrow
-        // If we don't wait long enough, auto-reconnect's connect() will fail to acquire lock
-        let _ = wasm_bindgen_futures::JsFuture::from(js_sys::Promise::new(&mut |r, _| {
-            if let Some(window) = web_sys::window() {
-                let _ = window.set_timeout_with_callback_and_timeout_and_arguments_0(&r, 300);
-            }
-        }))
-        .await;
-        web_sys::console::log_1(&"DEBUG: disconnect() - waited 300ms for read loop".into());
-
-        // 3. Close Transport with retry logic
-        // OPTIMIZATION: Skip close() if device already disconnected (saves ~150ms)
-        if already_disconnected {
-            // Device physically disconnected - just clear the transport reference
-            // CRITICAL: Retry to ensure read loop has released borrow
-            let mut cleared = false;
-            for attempt in 1..=10 {
-                if let Ok(mut borrow) = self.transport.try_borrow_mut() {
-                    *borrow = None;
-                    cleared = true;
-                    if attempt > 1 {
-                        web_sys::console::log_1(
-                            &format!(
-                                "DEBUG: disconnect() - cleared transport on attempt {} (device \
-                                 already disconnected)",
-                                attempt
-                            )
-                            .into(),
-                        );
-                    } else {
-                        web_sys::console::log_1(
-                            &"DEBUG: disconnect() - cleared transport (device already \
-                              disconnected)"
-                                .into(),
-                        );
-                    }
-                    break;
-                }
-                // Wait 50ms before retry (total max 500ms)
-                let _ = wasm_bindgen_futures::JsFuture::from(js_sys::Promise::new(&mut |r, _| {
-                    if let Some(window) = web_sys::window() {
-                        let _ =
-                            window.set_timeout_with_callback_and_timeout_and_arguments_0(&r, 50);
-                    }
-                }))
-                .await;
-            }
-            if !cleared {
-                // CRITICAL FIX: Force close the port to release browser lock
-                // We've waited 800ms for read loop to exit gracefully, but it's still holding the
-                // borrow Closing the port will force read_chunk() to error and read
-                // loop to exit
-                web_sys::console::warn_1(
-                    &"CRITICAL: Forcing port close after failed transport cleanup (device \
-                      disconnected)"
-                        .into(),
-                );
-
-                // Try to access active_port and close it
-                // This should cause read loop's read_chunk() to fail and release the borrow
-                let port_clone = self.active_port.borrow().as_ref().cloned();
-                if let Some(port) = port_clone {
-                    let promise = port.close();
-                    web_sys::console::log_1(&"DEBUG: Forced port.close() called".into());
-
-                    // CRITICAL: WAIT for close() to complete before continuing
-                    // This ensures read loop has exited before we return
-                    let _ = wasm_bindgen_futures::JsFuture::from(promise).await;
-                    web_sys::console::log_1(&"DEBUG: Forced port.close() completed".into());
-
-                    // Try one last time to clear transport after port is closed
-                    if let Ok(mut borrow) = self.transport.try_borrow_mut() {
-                        *borrow = None;
-                        web_sys::console::log_1(
-                            &"DEBUG: Transport cleared after forced port close".into(),
-                        );
-                    } else {
-                        web_sys::console::warn_1(
-                            &"WARNING: Transport still locked even after forced port close".into(),
-                        );
-                    }
-                } else {
-                    web_sys::console::warn_1(
-                        &"WARNING: Could not access active_port for forced close".into(),
-                    );
-                }
-            }
-        } else {
-            // Normal disconnect - need to close transport properly
-            let mut t_opt = None;
-            let mut retry_count = 0;
-            let max_retries = 5;
-
-            loop {
-                if let Ok(mut borrow) = self.transport.try_borrow_mut() {
-                    t_opt = borrow.take();
-                    web_sys::console::log_1(
-                        &format!(
-                            "DEBUG: disconnect() - acquired transport lock (attempt {})",
-                            retry_count + 1
-                        )
-                        .into(),
-                    );
-                    break;
-                } else {
-                    retry_count += 1;
-                    if retry_count >= max_retries {
-                        web_sys::console::warn_1(
-                            &format!(
-                                "Disconnect: Could not acquire transport lock after {} retries \
-                                 ({}ms total)",
-                                max_retries,
-                                max_retries * 300
-                            )
-                            .into(),
-                        );
-                        break;
-                    }
-                    // Wait 300ms before retry
-                    let _ =
-                        wasm_bindgen_futures::JsFuture::from(js_sys::Promise::new(&mut |r, _| {
-                            if let Some(window) = web_sys::window() {
-                                let _ = window
-                                    .set_timeout_with_callback_and_timeout_and_arguments_0(&r, 300);
-                            }
-                        }))
-                        .await;
-                    web_sys::console::log_1(
-                        &format!(
-                            "DEBUG: disconnect() - retry {} acquiring transport lock",
-                            retry_count
-                        )
-                        .into(),
-                    );
-                }
-            }
-
-            if let Some(mut t) = t_opt {
-                web_sys::console::log_1(&"DEBUG: disconnect() - calling transport.close()".into());
-                let _ = t.close().await;
-                web_sys::console::log_1(&"DEBUG: disconnect() - transport.close() returned".into());
-            } else {
-                web_sys::console::log_1(
-                    &"DEBUG: disconnect() - no transport to close (already None)".into(),
-                );
-            }
-        }
-
-        // 2. Clear Port
-        *self.active_port.borrow_mut() = None;
-
-        self.set_connected.set(false);
-        self.set_status.set("Ready to connect".into());
-
-        let elapsed = (js_sys::Date::now() - t0) as u64;
-        web_sys::console::log_1(
-            &format!(
-                "[{}ms] disconnect() - COMPLETE (took {}ms)",
-                elapsed, elapsed
-            )
-            .into(),
-        );
-
-        // Reset the disconnect guard flag
-        *self.is_disconnecting.borrow_mut() = false;
-
-        true // Return true to indicate disconnect completed successfully
-    }
-
-    // Reconfigure = Disconnect + Connect (Atomic logic)
-    pub async fn reconfigure(&self, baud: u32, framing: &str) {
-        if !self.connected.get_untracked() {
-            return;
-        }
-
-        // Set flag to suppress "Device Lost" logic in read loop (if it races)
-        self.set_is_reconfiguring.set(true);
-        self.set_status.set("Reconfiguring...".into());
-
-        let port_opt = self.active_port.borrow().clone();
-
-        if let Some(port) = port_opt {
-            // 1. Signal Read Loop to Stop
-            *self.read_loop_should_stop.borrow_mut() = true;
-
-            // 2. Wait for it to exit (e.g. 200ms)
+            // Wait briefly for graceful shutdown
             let _ = wasm_bindgen_futures::JsFuture::from(js_sys::Promise::new(&mut |r, _| {
                 if let Some(window) = web_sys::window() {
                     let _ = window.set_timeout_with_callback_and_timeout_and_arguments_0(&r, 200);
                 }
             }))
             .await;
+        }
 
-            // 3. Close existing
-            let mut t_opt = None;
-            if let Ok(mut borrow) = self.transport.try_borrow_mut() {
-                t_opt = borrow.take();
-            } else {
-                web_sys::console::warn_1(
-                    &"Reconfigure: Could not acquire transport lock even after wait.".into(),
-                );
-            }
+        // Clear port
+        *self.active_port.borrow_mut() = None;
+        self.set_connected.set(false);
+        self.set_status.set("Ready to connect".into());
 
-            if let Some(mut t) = t_opt {
-                // Resize safe close
-                let _ = t.close().await;
-            }
+        // Release disconnect guard
+        self.is_disconnecting.store(false, Ordering::SeqCst);
 
-            // 2. Wait for browser to release lock fully
+        true
+    }
+
+    fn capture_state(&self) -> ConnectionSnapshot {
+        ConnectionSnapshot {
+            baud: self.detected_baud.get_untracked(),
+            framing: self.detected_framing.get_untracked(),
+            port: self.active_port.borrow().clone(),
+            handle: self.connection_handle.borrow().clone(),
+        }
+    }
+
+    async fn rollback_state(&self, snapshot: ConnectionSnapshot) {
+        web_sys::console::log_1(&"Rolling back connection state".into());
+
+        // Check if we had a connection before moving
+        let had_connection = snapshot.handle.is_some();
+
+        // Restore port and handle
+        *self.active_port.borrow_mut() = snapshot.port.clone();
+        *self.connection_handle.borrow_mut() = snapshot.handle;
+
+        // Restore detected config
+        self.set_detected_baud.set(snapshot.baud);
+        self.set_detected_framing.set(snapshot.framing);
+
+        // Restart read loop if we had a connection
+        if had_connection {
+            self.set_connected.set(true);
+            self.set_status
+                .set("Connection restored (reconfigure failed)".into());
+        }
+    }
+
+    // Reconfigure = Disconnect + Connect with Transaction Safety
+    pub async fn reconfigure(&self, baud: u32, framing: &str) {
+        if !self.connected.get_untracked() {
+            return;
+        }
+
+        self.set_is_reconfiguring.set(true);
+        self.set_status.set("Reconfiguring...".into());
+
+        let snapshot = self.capture_state();
+
+        // Try disconnect
+        if !self.disconnect().await {
+            self.set_is_reconfiguring.set(false);
+            return;
+        }
+
+        let port_opt = snapshot.port.clone();
+
+        if let Some(port) = port_opt {
+            // Wait for port release
             let _ = wasm_bindgen_futures::JsFuture::from(js_sys::Promise::new(&mut |r, _| {
                 if let Some(window) = web_sys::window() {
                     let _ = window.set_timeout_with_callback_and_timeout_and_arguments_0(&r, 100);
@@ -471,15 +346,10 @@ impl ConnectionManager {
             }))
             .await;
 
-            // 3. Open New
-            // We reuse the connect_impl logic, manually handling detection so we can check for
-            // cancellation
+            // Detect config if needed
             let (final_baud, final_framing, initial_buf, proto) = if baud == 0 {
                 let cached_auto = *self.last_auto_baud.borrow();
 
-                // IMPROVEMENT: If we have a trusted PAST auto-detection result, use it.
-                // This persists even if user temporarily switches to a wrong Manual baud rate.
-                // This also avoids the aggressive 'enter' probe on context switch.
                 if let Some(cached) = cached_auto {
                     let effective_framing = if framing == "Auto" { "8N1" } else { framing };
                     (cached, effective_framing.to_string(), None, None)
@@ -493,7 +363,6 @@ impl ConnectionManager {
                     (b, f, Some(buf), proto)
                 }
             } else if framing == "Auto" {
-                // Smart Probe on Reconfigure as well
                 let (detect_f, buf, proto) = self.smart_probe_framing(port.clone(), baud).await;
                 if let Some(p) = proto.clone() {
                     self.set_decoder(p);
@@ -503,26 +372,24 @@ impl ConnectionManager {
                 (baud, framing.to_string(), None, None)
             };
 
-            // Final sanity check before opening
-            if self.active_port.borrow().is_none() {
-                self.set_is_reconfiguring.set(false);
-                return;
-            }
-
             if let Some(p) = proto {
                 self.set_decoder(p);
             }
 
+            // Try to reconnect
             match self
                 .connect_impl(port, final_baud, &final_framing, initial_buf)
                 .await
             {
                 Ok(_) => {
-                    // Success
+                    self.set_status.set("Reconfigured".into());
                 }
                 Err(e) => {
-                    self.set_status.set(format!("Reconfig Failed: {}", e));
-                    self.set_connected.set(false);
+                    // ROLLBACK on failure
+                    web_sys::console::error_1(&format!("Reconfigure failed: {}", e).into());
+                    self.rollback_state(snapshot).await;
+                    self.set_status
+                        .set(format!("Reconfigure failed: {} (restored)", e));
                 }
             }
         }
@@ -530,98 +397,73 @@ impl ConnectionManager {
         self.set_is_reconfiguring.set(false);
     }
 
-    #[allow(clippy::await_holding_refcell_ref)]
-    fn spawn_read_loop(&self) {
-        let t_strong = self.transport.clone();
+    fn spawn_read_loop(
+        &self,
+        transport: WebSerialTransport,
+        mut cmd_rx: mpsc::UnboundedReceiver<ConnectionCommand>,
+    ) {
         let connected_signal = self.connected;
         let set_connected = self.set_connected;
         let set_status = self.set_status;
         let is_reconf = self.is_reconfiguring;
         let worker_signal = self.worker;
-
         let manager = self.clone();
-
-        let should_stop = self.read_loop_should_stop.clone();
 
         spawn_local(async move {
             web_sys::console::log_1(&"DEBUG: Read Loop STARTED".into());
+
             loop {
-                // Check stop signal FIRST
-                if *should_stop.borrow() {
-                    web_sys::console::log_1(&"DEBUG: Read Loop STOP SIGNAL received.".into());
-                    break;
-                }
-
-                let mut chunk = Vec::new();
-                let mut ts = 0;
-                let mut should_break = false;
-
-                // Scope to drop borrow
-                {
-                    if let Ok(borrow) = t_strong.try_borrow() {
-                        if let Some(t) = borrow.as_ref() {
-                            if !t.is_open() {
-                                web_sys::console::log_1(
-                                    &"DEBUG: Read Loop - Transport Closed".into(),
-                                );
-                                should_break = true;
-                            } else {
-                                match t.read_chunk().await {
-                                    Ok((d, t_val)) => {
-                                        chunk = d;
-                                        ts = t_val;
-                                    }
-                                    Err(e) => {
-                                        web_sys::console::log_1(
-                                            &format!("DEBUG: Read Loop - Read Error: {:?}", e)
-                                                .into(),
-                                        );
-                                        should_break = true;
-                                    }
+                // Use futures::select! to race between commands and reads
+                select! {
+                    cmd = cmd_rx.next() => {
+                        match cmd {
+                            Some(ConnectionCommand::Stop) => {
+                                web_sys::console::log_1(&"DEBUG: Read Loop received STOP".into());
+                                break;
+                            }
+                            Some(ConnectionCommand::Write { data, response }) => {
+                                let result = transport.write(&data).await
+                                    .map_err(|e| format!("TX Error: {:?}", e));
+                                let is_ok = result.is_ok();
+                                let _ = response.send(result);
+                                if is_ok {
+                                    manager.trigger_tx();
                                 }
                             }
-                        } else {
-                            web_sys::console::log_1(&"DEBUG: Read Loop - Transport None".into());
-                            should_break = true;
-                        }
-                    } else {
-                        web_sys::console::log_1(&"DEBUG: Read Loop - Transport Locked".into());
-                        should_break = true;
-                    }
-                }
-
-                if should_break {
-                    break;
-                }
-
-                if !chunk.is_empty() {
-                    if let Some(w) = worker_signal.get_untracked() {
-                        let msg = UiToWorker::IngestData {
-                            data: chunk,
-                            timestamp_us: ts,
-                        };
-                        if let Ok(cmd_val) = serde_wasm_bindgen::to_value(&msg) {
-                            let _ = w.post_message(&cmd_val);
+                            None => break, // Channel closed
                         }
                     }
-                    // Trigger RX
-                    manager.trigger_rx();
-                } else {
-                    // Yield
-                    let _ =
-                        wasm_bindgen_futures::JsFuture::from(js_sys::Promise::new(&mut |r, _| {
-                            if let Some(window) = web_sys::window() {
-                                let _ = window
-                                    .set_timeout_with_callback_and_timeout_and_arguments_0(&r, 10);
+
+                    read_result = transport.read_chunk().fuse() => {
+                        match read_result {
+                            Ok((chunk, ts)) if !chunk.is_empty() => {
+                                // Send to worker
+                                if let Some(w) = worker_signal.get_untracked() {
+                                    let msg = UiToWorker::IngestData {
+                                        data: chunk,
+                                        timestamp_us: ts,
+                                    };
+                                    if let Ok(cmd_val) = serde_wasm_bindgen::to_value(&msg) {
+                                        let _ = w.post_message(&cmd_val);
+                                    }
+                                }
+                                manager.trigger_rx();
                             }
-                        }))
-                        .await;
+                            Err(e) => {
+                                web_sys::console::log_1(
+                                    &format!("DEBUG: Read Loop - Read Error: {:?}", e).into()
+                                );
+                                break;
+                            }
+                            _ => {} // Empty read, continue
+                        }
+                    }
                 }
             }
 
             web_sys::console::log_1(&"DEBUG: Read Loop EXITED".into());
 
-            // Loop exited
+            // Loop exited - notify manager of disconnection
             if connected_signal.get_untracked() && !is_reconf.get_untracked() {
                 set_status.set("Device Lost".into());
                 set_connected.set(false);
@@ -637,20 +479,30 @@ impl ConnectionManager {
             }
         }
     }
-    #[allow(clippy::await_holding_refcell_ref)]
     pub async fn write(&self, data: &[u8]) -> Result<(), String> {
-        if let Ok(borrow) = self.transport.try_borrow() {
-            if let Some(t) = borrow.as_ref() {
-                if t.is_open() {
-                    if let Err(e) = t.write(data).await {
-                        return Err(format!("TX Error: {:?}", e));
-                    }
-                    self.trigger_tx();
-                    return Ok(());
-                }
+        let handle = self.connection_handle.borrow().clone();
+
+        if let Some(h) = handle {
+            let (tx, rx) = oneshot::channel();
+
+            if h.cmd_tx
+                .unbounded_send(ConnectionCommand::Write {
+                    data: data.to_vec(),
+                    response: tx,
+                })
+                .is_err()
+            {
+                return Err("Connection closed".to_string());
             }
+
+            // Wait for response
+            match rx.await {
+                Ok(result) => result,
+                Err(_) => Err("Write timeout".to_string()),
+            }
+        } else {
+            Err("Not connected".to_string())
         }
-        Err("TX Dropped: Transport busy/locked or closed".to_string())
     }
     pub fn set_framer(&self, id: String) {
         if let Some(w) = self.worker.get_untracked() {
@@ -1192,58 +1044,13 @@ impl ConnectionManager {
         let result = loop {
             match t.open(port.clone(), cfg.clone()).await {
                 Ok(_) => {
-                    // Reset stop signal
-                    *self.read_loop_should_stop.borrow_mut() = false;
+                    // CREATE channel for commands
+                    let (cmd_tx, cmd_rx) = mpsc::unbounded();
 
-                    // CRITICAL FIX: Store state with retry logic to avoid RefCell panic
-                    // If previous disconnect() couldn't acquire lock, old read loop may still hold
-                    // borrow
-                    let mut transport_opt = Some(t);
-                    let mut stored = false;
-
-                    for attempt in 1..=5 {
-                        if let Ok(mut borrow) = self.transport.try_borrow_mut() {
-                            *borrow = transport_opt.take();
-                            stored = true;
-                            if attempt > 1 {
-                                web_sys::console::log_1(
-                                    &format!(
-                                        "DEBUG: connect() - stored transport on attempt {}",
-                                        attempt
-                                    )
-                                    .into(),
-                                );
-                            }
-                            break;
-                        }
-                        // Wait 200ms before retry
-                        let _ = wasm_bindgen_futures::JsFuture::from(js_sys::Promise::new(
-                            &mut |r, _| {
-                                if let Some(window) = web_sys::window() {
-                                    let _ = window
-                                        .set_timeout_with_callback_and_timeout_and_arguments_0(
-                                            &r, 200,
-                                        );
-                                }
-                            },
-                        ))
-                        .await;
-                        web_sys::console::log_1(
-                            &format!(
-                                "DEBUG: connect() - retry {} acquiring transport lock",
-                                attempt
-                            )
-                            .into(),
-                        );
-                    }
-
-                    if !stored {
-                        web_sys::console::error_1(
-                            &"CRITICAL: connect() could not store transport after retries".into(),
-                        );
-                        break Err("Could not acquire transport lock".into());
-                    }
-
+                    // Store handle
+                    *self.connection_handle.borrow_mut() = Some(ConnectionHandle {
+                        cmd_tx: cmd_tx.clone(),
+                    });
                     *self.active_port.borrow_mut() = Some(port);
 
                     self.set_connected.set(true);
@@ -1253,8 +1060,8 @@ impl ConnectionManager {
                     self.set_detected_baud.set(baud);
                     self.set_detected_framing.set(framing.to_string());
 
-                    // Spawn Read Loop
-                    self.spawn_read_loop();
+                    // Spawn read loop with command channel
+                    self.spawn_read_loop(t, cmd_rx);
 
                     // Notify Worker
                     self.send_worker_config(baud);
@@ -1462,21 +1269,15 @@ impl ConnectionManager {
                                 // Auto-reconnect not needed here, handled by manager internal state
                                 // or explicit loop
 
-                                // CRITICAL FIX: Check if reconnection already in progress to
-                                // prevent race When multiple
-                                // serial.onconnect events fire (wrong device, then correct device),
-                                // both the immediate check and retry loop can trigger reconnection
-                                // simultaneously
-                                if *manager_conn.is_connecting_internal.borrow() {
-                                    web_sys::console::log_1(
-                                        &"DEBUG: Skipping auto-reconnect - connection already in \
-                                          progress"
-                                            .into(),
-                                    );
-                                    return; // Exit early, don't spawn duplicate reconnect
-                                }
-
                                 spawn_local(async move {
+                                    // Check if already connecting (without holding lock)
+                                    if manager_conn.is_connecting.load(Ordering::SeqCst) {
+                                        web_sys::console::log_1(
+                                            &"Reconnect skipped - already connecting".into(),
+                                        );
+                                        return; // Exit immediately
+                                    }
+
                                     let t_reconnect = js_sys::Date::now();
                                     web_sys::console::log_1(
                                         &format!(
@@ -1613,7 +1414,7 @@ impl ConnectionManager {
                             // OPTIMIZATION: Exit retry loop if another path already started
                             // reconnecting This happens when a new
                             // serial.onconnect event finds device while retry loop is still running
-                            if *manager_conn.is_connecting_internal.borrow() {
+                            if manager_conn.is_connecting.load(Ordering::SeqCst) {
                                 web_sys::console::log_1(
                                     &format!(
                                         "[{}ms] Retry loop - exiting early, reconnection already \
@@ -1709,22 +1510,20 @@ impl ConnectionManager {
                                             current_framing
                                         };
 
-                                        // CRITICAL FIX: Check if reconnection already in progress
-                                        // to prevent race
-                                        // Retry loop may find device after immediate check already
-                                        // triggered reconnect
-                                        if *manager_conn.is_connecting_internal.borrow() {
-                                            web_sys::console::log_1(
-                                                &"DEBUG: Retry loop - skipping reconnect, \
-                                                  connection already in progress"
-                                                    .into(),
-                                            );
-                                            return; // Exit retry loop, don't spawn duplicate
-                                                    // reconnect
-                                        }
-
                                         let manager_conn_clone = manager_conn.clone();
                                         spawn_local(async move {
+                                            // Check if already connecting (without holding lock)
+                                            if manager_conn_clone
+                                                .is_connecting
+                                                .load(Ordering::SeqCst)
+                                            {
+                                                web_sys::console::log_1(
+                                                    &"Reconnect skipped - already connecting"
+                                                        .into(),
+                                                );
+                                                return; // Exit immediately
+                                            }
+
                                             let t_reconnect = js_sys::Date::now();
                                             web_sys::console::log_1(
                                                 &format!(
@@ -1932,5 +1731,28 @@ mod tests {
         assert_eq!(d, 8);
         assert_eq!(p, "odd");
         assert_eq!(s, 2);
+    }
+
+    #[test]
+    fn test_atomic_connection_guard() {
+        let guard = Arc::new(AtomicBool::new(false));
+
+        // First acquire succeeds
+        assert!(guard
+            .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+            .is_ok());
+
+        // Second acquire fails (already true)
+        assert!(guard
+            .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+            .is_err());
+
+        // Release
+        guard.store(false, Ordering::SeqCst);
+
+        // Can acquire again
+        assert!(guard
+            .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+            .is_ok());
     }
 }
