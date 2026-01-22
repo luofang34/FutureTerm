@@ -109,6 +109,12 @@ struct ConnectionHandle {
     completion_rx: oneshot::Receiver<()>,
 }
 
+// Type alias for event handler closures to avoid clippy::type_complexity warning
+type EventClosures = (
+    Closure<dyn FnMut(web_sys::Event)>,
+    Closure<dyn FnMut(web_sys::Event)>,
+);
+
 // Snapshot for UI state consistency (not true transaction rollback)
 // WebSerial API doesn't support true rollback since port can't be opened twice
 #[derive(Clone)]
@@ -164,6 +170,9 @@ pub struct ConnectionManager {
 
     // Track if probing was interrupted by ondisconnect events
     probing_interrupted: Rc<RefCell<bool>>,
+
+    // Event handler closures (to prevent memory leaks on re-initialization)
+    event_closures: Rc<RefCell<Option<EventClosures>>>,
 }
 
 impl ConnectionManager {
@@ -205,6 +214,7 @@ impl ConnectionManager {
             set_last_vid: Rc::new(RefCell::new(None)),
             set_last_pid: Rc::new(RefCell::new(None)),
             probing_interrupted: Rc::new(RefCell::new(false)),
+            event_closures: Rc::new(RefCell::new(None)),
         }
     }
 
@@ -2176,9 +2186,19 @@ impl ConnectionManager {
             serial.set_onconnect(Some(on_connect_closure.as_ref().unchecked_ref()));
             serial.set_ondisconnect(Some(on_disconnect_closure.as_ref().unchecked_ref()));
 
-            // Leak closures to keep them alive
-            on_connect_closure.forget();
-            on_disconnect_closure.forget();
+            // MEMORY LEAK FIX: Store closures instead of leaking them
+            // If setup_auto_reconnect() is called multiple times (e.g., reconnect with
+            // auto-detect), the old closures are properly dropped and cleaned up
+            let old_closures = self
+                .event_closures
+                .borrow_mut()
+                .replace((on_connect_closure, on_disconnect_closure));
+
+            if old_closures.is_some() {
+                web_sys::console::log_1(
+                    &"DEBUG: Replaced old event handlers (prevented memory leak)".into(),
+                );
+            }
         }
     }
 }
