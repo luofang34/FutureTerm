@@ -85,7 +85,7 @@ run_quality_checks() {
 
     # Cargo check
     echo -e "${YELLOW}▶ Cargo Check${NC}"
-    if cargo check --workspace --all-features 2>&1; then
+    if RUSTFLAGS="--cfg=web_sys_unstable_apis" cargo check --workspace --all-features 2>&1; then
         echo -e "${GREEN}✓ Cargo check passed${NC}"
         echo ""
     else
