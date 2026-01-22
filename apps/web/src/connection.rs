@@ -400,6 +400,8 @@ impl ConnectionManager {
                 self.set_decoder(p);
             }
 
+            // Note: State is already Connecting (set at line 392), so no transition needed here
+
             self.connect_impl(port, baud, &detect_framing, Some(initial_buf))
                 .await
         } else {
@@ -656,6 +658,13 @@ impl ConnectionManager {
             // Switch Decoder if detected
             if let Some(p) = detected_proto {
                 self.set_decoder(p);
+            }
+
+            // CRITICAL: Transition from Probing to Connecting before connect_impl()
+            // This ensures proper state machine flow: Probing → Connecting → Connected
+            // Without this, we'd have invalid Probing → Connected transition
+            if self.state.get_untracked() == ConnectionState::Probing {
+                self.transition_to(ConnectionState::Connecting);
             }
 
             self.connect_impl(final_port, final_baud, &final_framing_str, initial_buffer)
