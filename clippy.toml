@@ -1,0 +1,14 @@
+# Clippy configuration for strict code quality enforcement
+
+# Allow unwrap only in tests and consts
+allow-unwrap-in-tests = true
+allow-unwrap-in-consts = true
+
+# Warn on large types passed by value (bytes threshold)
+pass-by-value-size-limit = 256
+
+# Warn on functions with too many arguments
+too-many-arguments-threshold = 7
+
+# Warn on large stack arrays
+array-size-threshold = 512000

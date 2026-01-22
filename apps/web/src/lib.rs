@@ -91,6 +91,8 @@ pub fn App() -> impl IntoView {
 
     let (events_list, set_events_list) = create_signal::<Vec<DecodedEvent>>(Vec::new());
     let (raw_log, set_raw_log) = create_signal::<Vec<RawEvent>>(Vec::new());
+    // Cumulative byte counter for raw_log to avoid O(N) iteration
+    let (raw_log_bytes, set_raw_log_bytes) = create_signal(0usize);
     let (hex_cursor, set_hex_cursor) = create_signal(0usize);
 
     // ========== Cross-View Selection Sync ==========
@@ -105,10 +107,12 @@ pub fn App() -> impl IntoView {
     // status, connected, transport, active_port, is_reconfiguring
 
     create_effect(move |_| {
-        let nav = web_sys::window().unwrap().navigator();
-        let serial = nav.serial();
-        if serial.is_undefined() {
-            set_is_webserial_supported.set(false);
+        if let Some(window) = web_sys::window() {
+            let nav = window.navigator();
+            let serial = nav.serial();
+            if serial.is_undefined() {
+                set_is_webserial_supported.set(false);
+            }
         }
     });
 
@@ -117,8 +121,8 @@ pub fn App() -> impl IntoView {
     create_effect(move |_| {
         let manager = manager_worker_init.clone();
         if let Ok(w) = Worker::new("worker_bootstrap.js") {
-            // Restore TextDecoder for RX to Main Thread (if we ever want to decode locally? No, worker does that)
-            // But wait, worker sends BACK a 'DataBatch' with frames.
+            // Restore TextDecoder for RX to Main Thread (if we ever want to decode locally? No,
+            // worker does that) But wait, worker sends BACK a 'DataBatch' with frames.
             // We need to print raw text to terminal.
             // The worker parses frames. Does it decode text?
             // Looking at worker_logic.rs:
@@ -127,7 +131,12 @@ pub fn App() -> impl IntoView {
             // Frames contain raw bytes.
             // So Main Thread needs to decode bytes to string for Xterm.
 
-            let decoder = web_sys::TextDecoder::new().unwrap();
+            let Ok(decoder) = web_sys::TextDecoder::new() else {
+                manager
+                    .set_status
+                    .set("Failed to create TextDecoder".into());
+                return;
+            };
             let decode_opts = js_sys::Object::new();
             let _ = js_sys::Reflect::set(&decode_opts, &"stream".into(), &JsValue::from(true));
             let opts: web_sys::TextDecodeOptions = decode_opts.unchecked_into();
@@ -145,14 +154,17 @@ pub fn App() -> impl IntoView {
                             // Update unified raw log with frames
                             if !frames.is_empty() {
                                 set_raw_log.update(|log| {
-                                    // Append new raw events
+                                    // Append new raw events and update byte counter
+                                    let mut bytes_added = 0;
                                     for frame in &frames {
-                                        log.push(RawEvent::from_frame(frame));
+                                        let event = RawEvent::from_frame(frame);
+                                        bytes_added += event.byte_size();
+                                        log.push(event);
                                     }
 
-                                    // Byte-based capping to prevent unbounded memory growth
-                                    let total_bytes: usize =
-                                        log.iter().map(|e| e.byte_size()).sum();
+                                    // Update cumulative byte counter
+                                    let total_bytes = raw_log_bytes.get_untracked() + bytes_added;
+                                    set_raw_log_bytes.set(total_bytes);
 
                                     if total_bytes > MAX_LOG_BYTES || log.len() > MAX_LOG_EVENTS {
                                         // Trim oldest events until under limit
@@ -163,12 +175,17 @@ pub fn App() -> impl IntoView {
                                             || log.len() - trimmed > MAX_LOG_EVENTS)
                                             && trimmed < log.len()
                                         {
-                                            bytes_removed += log[trimmed].byte_size();
+                                            if let Some(event) = log.get(trimmed) {
+                                                bytes_removed += event.byte_size();
+                                            }
                                             trimmed += 1;
                                         }
 
                                         if trimmed > 0 {
                                             log.drain(0..trimmed);
+
+                                            // Update cumulative byte counter after trimming
+                                            set_raw_log_bytes.set(total_bytes - bytes_removed);
 
                                             // Adjust terminal_metadata for the trimmed bytes
                                             set_terminal_metadata.update(|meta| {
@@ -180,8 +197,9 @@ pub fn App() -> impl IntoView {
                             }
 
                             // Terminal direct write - always write to maintain metadata mapping
-                            // Terminal exists even when view is hidden, and we need complete metadata
-                            // for cross-view selection sync to work
+                            // Terminal exists even when view is hidden, and we need complete
+                            // metadata for cross-view selection sync to
+                            // work
                             if let Some(term) = term_handle.get_untracked() {
                                 for f in &frames {
                                     if !f.bytes.is_empty() {
@@ -193,7 +211,8 @@ pub fn App() -> impl IntoView {
                                                 term.write(&text);
 
                                                 // Record metadata for cross-view selection sync
-                                                // This must happen for ALL data, not just when Terminal is visible
+                                                // This must happen for ALL data, not just when
+                                                // Terminal is visible
                                                 set_terminal_metadata.update(|meta| {
                                                     meta.record_write(
                                                         &f.bytes,
@@ -211,7 +230,8 @@ pub fn App() -> impl IntoView {
                             if !events.is_empty() {
                                 set_events_list.update(|list| {
                                     list.extend(events);
-                                    // Cap at MAX_DECODED_EVENTS to ensure we don't drop high-freq MAVLink packets
+                                    // Cap at MAX_DECODED_EVENTS to ensure we don't drop high-freq
+                                    // MAVLink packets
                                     // before the View effect can process them.
                                     // 500 was too aggressive for 50Hz streams.
                                     if list.len() > MAX_DECODED_EVENTS {
@@ -272,7 +292,7 @@ pub fn App() -> impl IntoView {
 
         // Store connection info for checking against future events
         // Load connection info from local storage if available
-        let storage = web_sys::window().unwrap().local_storage().ok().flatten();
+        let storage = web_sys::window().and_then(|w| w.local_storage().ok().flatten());
         let init_vid = storage
             .as_ref()
             .and_then(|s| s.get_item("last_vid").ok().flatten())
@@ -287,7 +307,13 @@ pub fn App() -> impl IntoView {
         let manager = manager_con_main.clone();
 
         spawn_local(async move {
-            let nav = web_sys::window().unwrap().navigator();
+            let Some(window) = web_sys::window() else {
+                manager
+                    .set_status
+                    .set("Error: window not available.".into());
+                return;
+            };
+            let nav = window.navigator();
             let serial = nav.serial();
 
             if serial.is_undefined() {
@@ -321,11 +347,12 @@ pub fn App() -> impl IntoView {
 
                 // Capture VID/PID for Reconnect
                 let info = port.get_info();
-                // web-sys SerialPortInfo doesn't expose fields directly without structural casting usually?
-                // Let's rely on Reflect for safety or try methods if available.
-                // Actually web-sys 0.3.69+ exposes `usb_vendor_id` and `usb_product_id`.
-                // Let's use Reflect to be safe against version mismatch or use provided methods.
-                // Checking docs: SerialPortInfo has `usb_vendor_id` and `usb_product_id` getters.
+                // web-sys SerialPortInfo doesn't expose fields directly without structural casting
+                // usually? Let's rely on Reflect for safety or try methods if
+                // available. Actually web-sys 0.3.69+ exposes `usb_vendor_id` and
+                // `usb_product_id`. Let's use Reflect to be safe against version
+                // mismatch or use provided methods. Checking docs: SerialPortInfo
+                // has `usb_vendor_id` and `usb_product_id` getters.
 
                 // NOTE: We need to enable `SerialPortInfo` in Cargo.toml (Already Done).
                 // However, let's use a small helper to extract it safely.
@@ -338,9 +365,8 @@ pub fn App() -> impl IntoView {
                     .and_then(|v| v.as_f64())
                     .map(|v| v as u16);
 
-                // Store for reconnect
-                set_last_vid.set(vid);
-                set_last_pid.set(pid);
+                // CRITICAL FIX: VID/PID will be cached ONLY after successful connection
+                // (moved to Ok(_) branch below to prevent caching wrong device)
 
                 let current_framing = framing.get_untracked();
 
@@ -364,17 +390,27 @@ pub fn App() -> impl IntoView {
                             .await
                         {
                             Ok(_) => {
+                                // CRITICAL FIX: Cache VID/PID ONLY after connection succeeds
+                                // This prevents caching wrong device if probing fails
+                                set_last_vid.set(vid);
+                                set_last_pid.set(pid);
+
                                 // Save to LocalStorage
                                 if let (Some(v), Some(p)) = (vid, pid) {
-                                    if let Ok(Some(storage)) =
-                                        web_sys::window().unwrap().local_storage()
-                                    {
-                                        let _ = storage.set_item("last_vid", &v.to_string());
-                                        let _ = storage.set_item("last_pid", &p.to_string());
+                                    if let Some(window) = web_sys::window() {
+                                        if let Ok(Some(storage)) = window.local_storage() {
+                                            let _ = storage.set_item("last_vid", &v.to_string());
+                                            let _ = storage.set_item("last_pid", &p.to_string());
+                                        }
                                     }
                                 }
                             }
                             Err(_) => {
+                                // CRITICAL FIX: Clear cached VID/PID on connection failure
+                                // This prevents retry logic from searching for the wrong device
+                                set_last_vid.set(None);
+                                set_last_pid.set(None);
+
                                 // Status updated by manager
                             }
                         }
@@ -385,6 +421,8 @@ pub fn App() -> impl IntoView {
                     manager.setup_auto_reconnect(
                         last_vid.into(),
                         last_pid.into(),
+                        set_last_vid,
+                        set_last_pid,
                         baud_rate.into(),
                         detected_baud,
                         framing.into(),
@@ -407,8 +445,9 @@ pub fn App() -> impl IntoView {
 
             spawn_local(async move {
                 // If b=0 and f=Auto, we assume it's the "Auto" state and don't force reconfig
-                // (unless we add a "Re-Scan" button later, but for now this prevents redundant loops if both set to Auto)
-                // Allow Auto (0 / Auto) to trigger reconfiguration too
+                // (unless we add a "Re-Scan" button later, but for now this prevents redundant
+                // loops if both set to Auto) Allow Auto (0 / Auto) to trigger
+                // reconfiguration too
 
                 web_sys::console::log_1(&"Dynamically Reconfiguring Port...".into());
 
@@ -610,7 +649,13 @@ pub fn App() -> impl IntoView {
                         style="padding: 0 12px; width: 100px; text-align: center; background: #007acc; color: white; border: none; cursor: pointer; font-size: 0.9rem; border-right: 1px solid rgba(255,255,255,0.2);"
                         title="Smart Connect (Auto-detects USB-Serial)"
                         on:click=move |_| on_connect(false)>
-                        {move || if connected.get() { "Disconnect" } else { "Connect" }}
+                        {move || {
+                            let is_connected = connected.get();
+                            let s = status.get();
+                            let is_auto_reconnecting = s.contains("Auto-reconnecting") || s.contains("Device Lost");
+                            // Show "Disconnect" if connected OR if auto-reconnecting (yellow light state)
+                            if is_connected || is_auto_reconnecting { "Disconnect" } else { "Connect" }
+                        }}
                     </button>
                     <button
                          class="split-btn"
@@ -641,7 +686,7 @@ pub fn App() -> impl IntoView {
                     <Show when=move || view_mode.get() == ViewMode::Hex fallback=|| ()>
                         {move || {
                             if manager.decoder_id.get() == "mavlink" {
-                                view! { <mavlink_view::MavlinkView events_list=events_list /> }
+                                view! { <mavlink_view::MavlinkView events_list=events_list connected=connected /> }
                             } else {
                                 view! { <hex_view::HexView
                                     raw_log=raw_log

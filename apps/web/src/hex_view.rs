@@ -72,9 +72,15 @@ pub fn HexView(
     // Lock signal for overflow protection: When one side is active, lock the other side.
     let (selection_lock, set_selection_lock) = create_signal::<Option<SelectionOrigin>>(None);
 
+    // Track previous selection range to optimize DOM updates
+    let (prev_selection, set_prev_selection) =
+        create_signal::<Option<(usize, usize, SelectionSource)>>(None);
+
     // Clear lock on global mouseup and mouseleave (handles edge case of mouse leaving window)
     create_effect(move |_| {
-        let window = web_sys::window().unwrap();
+        let Some(window) = web_sys::window() else {
+            return;
+        };
 
         let mouseup_callback = Closure::wrap(Box::new(move || {
             set_selection_lock.set(None);
@@ -102,6 +108,8 @@ pub fn HexView(
                     mouseleave_callback.as_ref().unchecked_ref(),
                 );
             }
+            // Note: Callbacks remain in memory after removal from DOM.
+            // This is a known limitation with wasm-bindgen event handlers.
             mouseup_callback.forget();
             mouseleave_callback.forget();
         });
@@ -151,12 +159,15 @@ pub fn HexView(
             if let Ok(observer) = web_sys::ResizeObserver::new(callback.as_ref().unchecked_ref()) {
                 observer.observe(&container);
 
-                // Store observer and callback for cleanup
+                // Store observer for cleanup
+                // Note: callback must remain alive for the observer, so we intentionally
+                // keep it in memory. This is unavoidable with ResizeObserver API.
                 let observer_clone = observer.clone();
                 on_cleanup(move || {
                     observer_clone.disconnect();
                 });
 
+                // Intentionally keep callback alive for observer lifetime
                 callback.forget();
             }
         }
@@ -219,7 +230,10 @@ pub fn HexView(
         let visible_count = (viewport_h / ROW_HEIGHT).ceil() as usize + (SCROLL_BUFFER_ROWS * 2);
         let end_idx = (start_idx + visible_count).min(total_count);
 
-        let slice = rows[start_idx..end_idx].to_vec();
+        let slice = rows
+            .get(start_idx..end_idx)
+            .map(|s| s.to_vec())
+            .unwrap_or_default();
 
         let padding_top = start_idx as f64 * ROW_HEIGHT;
         let padding_bottom = (total_count - end_idx) as f64 * ROW_HEIGHT;
@@ -264,11 +278,20 @@ pub fn HexView(
                     let byte_count = range.end_byte_offset - range.start_byte_offset;
                     let expected_rows = byte_count.div_ceil(bpr); // Ceiling division
 
-                    web_sys::console::log_1(&format!(
-                        "HexView received selection from {:?}: bytes {}-{} (count: {}), scrolling to row {} ({}px), should highlight ~{} rows",
-                        range.source_view, range.start_byte_offset, range.end_byte_offset,
-                        byte_count, target_row, target_scroll, expected_rows
-                    ).into());
+                    web_sys::console::log_1(
+                        &format!(
+                            "HexView received selection from {:?}: bytes {}-{} (count: {}), \
+                             scrolling to row {} ({}px), should highlight ~{} rows",
+                            range.source_view,
+                            range.start_byte_offset,
+                            range.end_byte_offset,
+                            byte_count,
+                            target_row,
+                            target_scroll,
+                            expected_rows
+                        )
+                        .into(),
+                    );
 
                     if let Some(div) = container_ref.get() {
                         div.set_scroll_top(target_scroll as i32);
@@ -372,7 +395,12 @@ pub fn HexView(
             }
         }) as Box<dyn FnMut()>);
 
-        let document = web_sys::window().unwrap().document().unwrap();
+        let Some(window) = web_sys::window() else {
+            return;
+        };
+        let Some(document) = window.document() else {
+            return;
+        };
         let _ = document
             .add_event_listener_with_callback("selectionchange", callback.as_ref().unchecked_ref());
 
@@ -381,26 +409,61 @@ pub fn HexView(
                 "selectionchange",
                 callback.as_ref().unchecked_ref(),
             );
+            // Note: Callback remains in memory after removal.
+            // This is a known limitation with wasm-bindgen event handlers.
             callback.forget();
         });
     });
 
-    // Direct DOM manipulation for highlighting (maximum performance)
-    // This bypasses Leptos reactivity and updates classes directly
+    // Optimized DOM manipulation for highlighting
+    // Uses incremental updates instead of full DOM traversal
     create_effect(move |_| {
         let range_opt = global_selection.and_then(|g| g.get());
         let origin = active_origin.get();
+        let prev = prev_selection.get();
 
         // Use requestAnimationFrame to batch DOM updates
+        let set_prev = set_prev_selection;
         let callback = Closure::once(Box::new(move || {
             if let Some(window) = web_sys::window() {
                 if let Some(document) = window.document() {
-                    // Clear all previous highlights efficiently
-                    if let Ok(elements) = document.query_selector_all(".hex-byte") {
-                        for i in 0..elements.length() {
-                            if let Some(el) = elements.get(i) {
-                                if let Some(el) = el.dyn_ref::<web_sys::HtmlElement>() {
-                                    let _ = el.class_list().remove_2("bg-sync", "bg-term");
+                    // Convert current selection to comparable tuple
+                    let current = range_opt
+                        .as_ref()
+                        .map(|r| (r.start_byte_offset, r.end_byte_offset, r.source_view));
+
+                    // Only update if selection actually changed
+                    if prev == current {
+                        return;
+                    }
+
+                    // Clear only previously highlighted elements
+                    if let Some((prev_start, prev_end, _)) = prev {
+                        // Use more specific selector to limit scope
+                        if let Ok(elements) =
+                            document.query_selector_all(".hex-byte.bg-sync, .hex-byte.bg-term")
+                        {
+                            for i in 0..elements.length() {
+                                if let Some(el) = elements.get(i) {
+                                    if let Some(el) = el.dyn_ref::<web_sys::HtmlElement>() {
+                                        if let Some(offset_str) = el.dataset().get("offset") {
+                                            if let Ok(offset) = offset_str.parse::<usize>() {
+                                                // Only clear if outside new range
+                                                let in_new_range = range_opt
+                                                    .as_ref()
+                                                    .map(|r| r.contains_offset(offset))
+                                                    .unwrap_or(false);
+                                                if !in_new_range
+                                                    && offset >= prev_start
+                                                    && offset < prev_end
+                                                {
+                                                    let _ = el
+                                                        .class_list()
+                                                        .remove_2("bg-sync", "bg-term");
+                                                }
+                                            }
+                                        }
+                                    }
                                 }
                             }
                         }
@@ -420,7 +483,8 @@ pub fn HexView(
                                         if let Some(offset_str) = el.dataset().get("offset") {
                                             if let Ok(offset) = offset_str.parse::<usize>() {
                                                 if range.contains_offset(offset) {
-                                                    // Terminal selection: both hex and ASCII get bg-term
+                                                    // Terminal selection: both hex and ASCII get
+                                                    // bg-term
                                                     if is_terminal {
                                                         let _ = el.class_list().add_1("bg-term");
                                                     }
@@ -428,7 +492,8 @@ pub fn HexView(
                                                     else if is_hex_view {
                                                         let is_ascii =
                                                             el.class_list().contains("ascii-char");
-                                                        // If origin is ASCII and this is hex, or vice versa, apply sync color
+                                                        // If origin is ASCII and this is hex, or
+                                                        // vice versa, apply sync color
                                                         if (origin == Some(SelectionOrigin::Ascii)
                                                             && !is_ascii)
                                                             || (origin
@@ -447,12 +512,18 @@ pub fn HexView(
                             }
                         }
                     }
+
+                    // Update previous selection for next comparison
+                    set_prev.set(current);
                 }
             }
         }) as Box<dyn FnOnce()>);
 
         if let Some(window) = web_sys::window() {
             let _ = window.request_animation_frame(callback.as_ref().unchecked_ref());
+            // For FnOnce callbacks in requestAnimationFrame, we need to forget
+            // because they execute once and then should be cleaned up by the browser.
+            // This is a known limitation in wasm-bindgen for one-shot callbacks.
             callback.forget();
         }
     });

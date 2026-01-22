@@ -75,14 +75,17 @@ fn decode_slip(data: &[u8]) -> Result<Vec<u8>, ()> {
     let mut out = Vec::with_capacity(data.len());
     let mut i = 0;
     while i < data.len() {
-        match data[i] {
+        let Some(&byte) = data.get(i) else {
+            break;
+        };
+        match byte {
             SLIP_ESC => {
                 i += 1;
-                if i >= data.len() {
+                let Some(&escaped_byte) = data.get(i) else {
                     // Trailing ESC? Error.
                     return Err(());
-                }
-                match data[i] {
+                };
+                match escaped_byte {
                     SLIP_ESC_END => out.push(SLIP_END),
                     SLIP_ESC_ESC => out.push(SLIP_ESC),
                     _ => return Err(()), // Invalid escape

@@ -31,6 +31,10 @@ build/target/
 tmp/
 *.log
 gemini.md
-
-*.sh
 *.txt
+
+# Shell scripts - ignore generated logs/temp scripts but keep dev/build scripts
+socat.log
+
+# Important: dev.sh and scripts/ directory are version controlled
+# Add specific temp scripts to ignore here if needed

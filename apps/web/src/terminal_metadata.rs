@@ -8,23 +8,30 @@ fn count_visible_chars(s: &str) -> usize {
 
     while idx < bytes.len() {
         // Skip ANSI escape sequences
-        if bytes[idx] == 0x1B && idx + 1 < bytes.len() {
-            if bytes[idx + 1] == b'[' {
+        if bytes.get(idx) == Some(&0x1B) && idx + 1 < bytes.len() {
+            if bytes.get(idx + 1) == Some(&b'[') {
                 // CSI sequence
                 idx += 2;
-                while idx < bytes.len() && !bytes[idx].is_ascii_alphabetic() {
+                while idx < bytes.len() {
+                    if let Some(&b) = bytes.get(idx) {
+                        if b.is_ascii_alphabetic() {
+                            break;
+                        }
+                    }
                     idx += 1;
                 }
                 idx += 1; // Skip the terminating letter
                 continue;
-            } else if bytes[idx + 1] == b']' {
+            } else if bytes.get(idx + 1) == Some(&b']') {
                 // OSC sequence
                 idx += 2;
                 while idx < bytes.len() {
-                    if bytes[idx] == 0x07 {
+                    if bytes.get(idx) == Some(&0x07) {
                         idx += 1;
                         break;
-                    } else if idx + 1 < bytes.len() && bytes[idx] == 0x1B && bytes[idx + 1] == b'\\'
+                    } else if idx + 1 < bytes.len()
+                        && bytes.get(idx) == Some(&0x1B)
+                        && bytes.get(idx + 1) == Some(&b'\\')
                     {
                         idx += 2;
                         break;
@@ -36,9 +43,11 @@ fn count_visible_chars(s: &str) -> usize {
         }
 
         // Skip carriage return and newline (they're not visible column positions)
-        if bytes[idx] == b'\r' || bytes[idx] == b'\n' {
-            idx += 1;
-            continue;
+        if let Some(&b) = bytes.get(idx) {
+            if b == b'\r' || b == b'\n' {
+                idx += 1;
+                continue;
+            }
         }
 
         // Count visible character
@@ -151,31 +160,34 @@ impl TerminalMetadata {
 
         while byte_idx < raw_bytes.len() {
             // Check for ANSI escape sequence: ESC [ ... (letter)
-            if raw_bytes[byte_idx] == 0x1B && byte_idx + 1 < raw_bytes.len() {
-                if raw_bytes[byte_idx + 1] == b'[' {
+            if raw_bytes.get(byte_idx) == Some(&0x1B) && byte_idx + 1 < raw_bytes.len() {
+                if raw_bytes.get(byte_idx + 1) == Some(&b'[') {
                     // ANSI CSI sequence: ESC [ ... (letter)
                     byte_idx += 2;
                     while byte_idx < raw_bytes.len() {
-                        let c = raw_bytes[byte_idx];
-                        byte_idx += 1;
-                        // CSI sequences end with a letter (0x40-0x7E range)
-                        if (0x40..=0x7E).contains(&c) {
+                        if let Some(&c) = raw_bytes.get(byte_idx) {
+                            byte_idx += 1;
+                            // CSI sequences end with a letter (0x40-0x7E range)
+                            if (0x40..=0x7E).contains(&c) {
+                                break;
+                            }
+                        } else {
                             break;
                         }
                     }
                     // Skip ANSI sequences (don't add to map, don't increment column)
                     continue;
-                } else if raw_bytes[byte_idx + 1] == b']' {
+                } else if raw_bytes.get(byte_idx + 1) == Some(&b']') {
                     // OSC sequence: ESC ] ... ST (ESC \ or BEL)
                     byte_idx += 2;
                     while byte_idx < raw_bytes.len() {
-                        if raw_bytes[byte_idx] == 0x07 {
+                        if raw_bytes.get(byte_idx) == Some(&0x07) {
                             // BEL terminator
                             byte_idx += 1;
                             break;
                         } else if byte_idx + 1 < raw_bytes.len()
-                            && raw_bytes[byte_idx] == 0x1B
-                            && raw_bytes[byte_idx + 1] == b'\\'
+                            && raw_bytes.get(byte_idx) == Some(&0x1B)
+                            && raw_bytes.get(byte_idx + 1) == Some(&b'\\')
                         {
                             // ESC \ terminator
                             byte_idx += 2;
@@ -188,13 +200,13 @@ impl TerminalMetadata {
             }
 
             // Check for carriage return (skip, it's not a visible character)
-            if raw_bytes[byte_idx] == b'\r' {
+            if raw_bytes.get(byte_idx) == Some(&b'\r') {
                 byte_idx += 1;
                 continue;
             }
 
             // Check for newline character
-            if raw_bytes[byte_idx] == b'\n' {
+            if raw_bytes.get(byte_idx) == Some(&b'\n') {
                 // Add newline to map (it's a visible character in terms of layout)
                 map.push(CharByteMapping {
                     line_in_span: line_idx,
@@ -211,16 +223,20 @@ impl TerminalMetadata {
 
             // Regular character (UTF-8)
             let char_start = byte_idx;
-            let char_len = if raw_bytes[byte_idx] & 0x80 == 0 {
-                1 // ASCII (0xxxxxxx)
-            } else if raw_bytes[byte_idx] & 0xE0 == 0xC0 {
-                2 // 2-byte UTF-8 (110xxxxx)
-            } else if raw_bytes[byte_idx] & 0xF0 == 0xE0 {
-                3 // 3-byte UTF-8 (1110xxxx)
-            } else if raw_bytes[byte_idx] & 0xF8 == 0xF0 {
-                4 // 4-byte UTF-8 (11110xxx)
+            let char_len = if let Some(&b) = raw_bytes.get(byte_idx) {
+                if b & 0x80 == 0 {
+                    1 // ASCII (0xxxxxxx)
+                } else if b & 0xE0 == 0xC0 {
+                    2 // 2-byte UTF-8 (110xxxxx)
+                } else if b & 0xF0 == 0xE0 {
+                    3 // 3-byte UTF-8 (1110xxxx)
+                } else if b & 0xF8 == 0xF0 {
+                    4 // 4-byte UTF-8 (11110xxx)
+                } else {
+                    1 // Invalid, treat as single byte
+                }
             } else {
-                1 // Invalid, treat as single byte
+                break; // End of buffer
             };
 
             map.push(CharByteMapping {
@@ -405,7 +421,8 @@ impl TerminalMetadata {
         #[cfg(all(debug_assertions, target_arch = "wasm32"))]
         web_sys::console::log_1(
             &format!(
-                "Found start_span: terminal_line={}, column_offset={}, byte_range={}-{}, text_len={}, char_map_entries={}",
+                "Found start_span: terminal_line={}, column_offset={}, byte_range={}-{}, \
+                 text_len={}, char_map_entries={}",
                 start_span.terminal_line,
                 start_span.column_offset,
                 start_span.raw_log_byte_start,
@@ -450,7 +467,8 @@ impl TerminalMetadata {
         #[cfg(all(debug_assertions, target_arch = "wasm32"))]
         web_sys::console::log_1(
             &format!(
-                "Found end_span: terminal_line={}, column_offset={}, byte_range={}-{}, text_len={}, char_map_entries={}",
+                "Found end_span: terminal_line={}, column_offset={}, byte_range={}-{}, \
+                 text_len={}, char_map_entries={}",
                 end_span.terminal_line,
                 end_span.column_offset,
                 end_span.raw_log_byte_start,
@@ -510,7 +528,8 @@ impl TerminalMetadata {
         #[cfg(all(debug_assertions, target_arch = "wasm32"))]
         web_sys::console::log_1(
             &format!(
-                "Looking for end char: line_in_span={}, col={} (already adjusted from {} since xterm end is exclusive)",
+                "Looking for end char: line_in_span={}, col={} (already adjusted from {} since \
+                 xterm end is exclusive)",
                 end_line_in_span, actual_end_col, end_col
             )
             .into(),
@@ -540,7 +559,8 @@ impl TerminalMetadata {
         #[cfg(all(debug_assertions, target_arch = "wasm32"))]
         web_sys::console::log_1(
             &format!(
-                "Found end char: line={}, col={}, byte_offset={}, len={} -> global_byte={} (inclusive)",
+                "Found end char: line={}, col={}, byte_offset={}, len={} -> global_byte={} \
+                 (inclusive)",
                 end_char_map.line_in_span,
                 end_char_map.terminal_column,
                 end_char_map.byte_offset_in_span,
@@ -659,18 +679,19 @@ impl TerminalMetadata {
                             && (m.byte_offset_in_span + m.byte_length) >= local_offset
                         // End of char is >= end
                     }) {
-                        // Correct logic: If end_byte is 5, and char is 4-5, we want end of that char?
-                        // Selection is exclusive.
+                        // Correct logic: If end_byte is 5, and char is 4-5, we want end of that
+                        // char? Selection is exclusive.
                         end_pos = Some((
                             span.terminal_line + map.line_in_span,
-                            map.terminal_column, // xterm end is exclusive, so if map is col 5, and we end at start of col 5, it's 5.
-                                                 // If we end strictly AFTER start of col 5...
-                                                 // Simpler: Map byte to char index.
+                            map.terminal_column, /* xterm end is exclusive, so if map is col 5,
+                                                  * and we end at start of col 5, it's 5.
+                                                  * If we end strictly AFTER start of col 5...
+                                                  * Simpler: Map byte to char index. */
                         ));
 
                         // Adjust for partial overlap?
-                        // If local_offset == m.byte_offset_in_span, we end exactly at char start -> col
-                        // If local_offset > m, we end inside -> col + 1
+                        // If local_offset == m.byte_offset_in_span, we end exactly at char start ->
+                        // col If local_offset > m, we end inside -> col + 1
                         if local_offset > map.byte_offset_in_span {
                             end_pos = Some((
                                 span.terminal_line + map.line_in_span,

@@ -144,12 +144,14 @@ async fn handle_message(
                         d.ingest(frame, &mut events_out);
                     }
                 } else {
-                    // log!("Worker: IngestData received {} bytes but produced 0 frames", data.len());
+                    // log!("Worker: IngestData received {} bytes but produced 0 frames",
+                    // data.len());
                 }
 
                 // 3. Send back
                 if !frames_out.is_empty() || !events_out.is_empty() {
-                    // if !events_out.is_empty() { log!("Worker: Sending {} events", events_out.len()); }
+                    // if !events_out.is_empty() { log!("Worker: Sending {} events",
+                    // events_out.len()); }
                     post_to_ui(&WorkerToUi::DataBatch {
                         frames: frames_out,
                         events: events_out,
