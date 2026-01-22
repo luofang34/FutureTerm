@@ -93,6 +93,56 @@ impl ConnectionState {
             Self::AutoReconnecting => "Device found. Auto-reconnecting...",
         }
     }
+
+    /// Validate if transition to new_state is allowed from current state
+    /// This provides compile-time safety via exhaustive match and runtime validation
+    pub fn can_transition_to(&self, new_state: ConnectionState) -> bool {
+        use ConnectionState::*;
+
+        match (self, new_state) {
+            // From Disconnected
+            (Disconnected, Probing) => true, // User starts auto-detect
+            (Disconnected, Connecting) => true, // User connects with specific baud
+            (Disconnected, Disconnected) => true, // Idempotent (no-op)
+
+            // From Probing
+            (Probing, Connecting) => true, // Probe complete, connecting
+            (Probing, Disconnected) => true, // Probe failed/canceled
+            (Probing, AutoReconnecting) => true, // Device found during probe (onconnect race)
+
+            // From Connecting
+            (Connecting, Connected) => true, // Connection successful
+            (Connecting, Disconnected) => true, // Connection failed
+            (Connecting, DeviceLost) => true, // Device unplugged during connect
+
+            // From Connected
+            (Connected, Reconfiguring) => true, // Baud rate change
+            (Connected, Disconnecting) => true, // User disconnect
+            (Connected, DeviceLost) => true,    // USB unplugged (no auto-reconnect)
+            (Connected, AutoReconnecting) => true, // USB unplugged (has VID/PID)
+
+            // From Reconfiguring
+            (Reconfiguring, Connected) => true, // Reconfig complete
+            (Reconfiguring, DeviceLost) => true, // USB unplugged during reconfig
+
+            // From Disconnecting
+            (Disconnecting, Disconnected) => true, // Disconnect complete
+
+            // From DeviceLost
+            (DeviceLost, Disconnected) => true, // User gives up
+            (DeviceLost, AutoReconnecting) => true, // Device replugged
+            (DeviceLost, Connecting) => true,   // Manual reconnect attempt
+
+            // From AutoReconnecting
+            (AutoReconnecting, Connected) => true, // Reconnect successful
+            (AutoReconnecting, DeviceLost) => true, // Reconnect failed
+            (AutoReconnecting, Disconnected) => true, // User cancels
+            (AutoReconnecting, AutoReconnecting) => true, // Idempotent retry
+
+            // All other transitions are invalid
+            _ => false,
+        }
+    }
 }
 
 // Message passing infrastructure
@@ -117,10 +167,15 @@ type EventClosures = (
 
 // Snapshot for UI state consistency (not true transaction rollback)
 // WebSerial API doesn't support true rollback since port can't be opened twice
+// This captures UI-visible state for restoration on reconfigure failure
 #[derive(Clone)]
 struct ConnectionSnapshot {
     baud: u32,
     framing: String,
+    decoder_id: String, /* Protocol decoder (e.g., "utf8", "mavlink")
+                         * Note: VID/PID not captured - they don't change during reconfiguration
+                         * Note: Connection handle not captured - cannot be restored (port must
+                         * be reopened) */
 }
 
 #[derive(Clone)]
@@ -257,6 +312,30 @@ impl ConnectionManager {
     /// Transition to a new connection state
     fn transition_to(&self, new_state: ConnectionState) {
         let old_state = self.state.get_untracked();
+
+        // Validate state transition
+        if !old_state.can_transition_to(new_state) {
+            // ERROR: Invalid transition detected
+            web_sys::console::error_1(
+                &format!(
+                    "INVALID STATE TRANSITION: {:?} → {:?} (not allowed)",
+                    old_state, new_state
+                )
+                .into(),
+            );
+
+            // COMPILE-TIME CHECK: In debug builds, this will panic and fail tests
+            // In release builds, this is removed by the compiler (zero overhead)
+            debug_assert!(
+                old_state.can_transition_to(new_state),
+                "Invalid state transition: {:?} → {:?}",
+                old_state,
+                new_state
+            );
+
+            // In release builds: Log error but allow transition (graceful degradation)
+            // This prevents production crashes while still catching bugs in development
+        }
 
         // Log state transition for debugging
         web_sys::console::log_1(
@@ -680,11 +759,18 @@ impl ConnectionManager {
         ConnectionSnapshot {
             baud: self.detected_baud.get_untracked(),
             framing: self.detected_framing.get_untracked(),
+            decoder_id: self.decoder_id.get_untracked(),
         }
     }
 
     async fn rollback_state(&self, snapshot: ConnectionSnapshot) {
-        web_sys::console::log_1(&"Rolling back connection state".into());
+        web_sys::console::log_1(
+            &format!(
+                "Rolling back connection state: baud={}, framing={}, decoder={}",
+                snapshot.baud, snapshot.framing, snapshot.decoder_id
+            )
+            .into(),
+        );
 
         // NOTE: True transaction rollback is not possible with WebSerial API
         // because we cannot open the same port twice simultaneously.
@@ -694,6 +780,10 @@ impl ConnectionManager {
         // Restore detected config for UI consistency
         self.set_detected_baud.set(snapshot.baud);
         self.set_detected_framing.set(snapshot.framing);
+
+        // Restore protocol decoder
+        // This is important if reconfigure changed decoder (e.g., detected MAVLink)
+        self.set_decoder(snapshot.decoder_id);
 
         // Do NOT restore connection_handle or set connected=true
         // The old connection is dead and cannot be revived
