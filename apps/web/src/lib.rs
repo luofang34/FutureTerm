@@ -105,10 +105,12 @@ pub fn App() -> impl IntoView {
     // status, connected, transport, active_port, is_reconfiguring
 
     create_effect(move |_| {
-        let nav = web_sys::window().unwrap().navigator();
-        let serial = nav.serial();
-        if serial.is_undefined() {
-            set_is_webserial_supported.set(false);
+        if let Some(window) = web_sys::window() {
+            let nav = window.navigator();
+            let serial = nav.serial();
+            if serial.is_undefined() {
+                set_is_webserial_supported.set(false);
+            }
         }
     });
 
@@ -127,7 +129,12 @@ pub fn App() -> impl IntoView {
             // Frames contain raw bytes.
             // So Main Thread needs to decode bytes to string for Xterm.
 
-            let decoder = web_sys::TextDecoder::new().unwrap();
+            let Ok(decoder) = web_sys::TextDecoder::new() else {
+                manager
+                    .set_status
+                    .set("Failed to create TextDecoder".into());
+                return;
+            };
             let decode_opts = js_sys::Object::new();
             let _ = js_sys::Reflect::set(&decode_opts, &"stream".into(), &JsValue::from(true));
             let opts: web_sys::TextDecodeOptions = decode_opts.unchecked_into();
@@ -163,7 +170,9 @@ pub fn App() -> impl IntoView {
                                             || log.len() - trimmed > MAX_LOG_EVENTS)
                                             && trimmed < log.len()
                                         {
-                                            bytes_removed += log[trimmed].byte_size();
+                                            if let Some(event) = log.get(trimmed) {
+                                                bytes_removed += event.byte_size();
+                                            }
                                             trimmed += 1;
                                         }
 
@@ -275,7 +284,7 @@ pub fn App() -> impl IntoView {
 
         // Store connection info for checking against future events
         // Load connection info from local storage if available
-        let storage = web_sys::window().unwrap().local_storage().ok().flatten();
+        let storage = web_sys::window().and_then(|w| w.local_storage().ok().flatten());
         let init_vid = storage
             .as_ref()
             .and_then(|s| s.get_item("last_vid").ok().flatten())
@@ -290,7 +299,13 @@ pub fn App() -> impl IntoView {
         let manager = manager_con_main.clone();
 
         spawn_local(async move {
-            let nav = web_sys::window().unwrap().navigator();
+            let Some(window) = web_sys::window() else {
+                manager
+                    .set_status
+                    .set("Error: window not available.".into());
+                return;
+            };
+            let nav = window.navigator();
             let serial = nav.serial();
 
             if serial.is_undefined() {
@@ -370,11 +385,11 @@ pub fn App() -> impl IntoView {
                             Ok(_) => {
                                 // Save to LocalStorage
                                 if let (Some(v), Some(p)) = (vid, pid) {
-                                    if let Ok(Some(storage)) =
-                                        web_sys::window().unwrap().local_storage()
-                                    {
-                                        let _ = storage.set_item("last_vid", &v.to_string());
-                                        let _ = storage.set_item("last_pid", &p.to_string());
+                                    if let Some(window) = web_sys::window() {
+                                        if let Ok(Some(storage)) = window.local_storage() {
+                                            let _ = storage.set_item("last_vid", &v.to_string());
+                                            let _ = storage.set_item("last_pid", &p.to_string());
+                                        }
                                     }
                                 }
                             }

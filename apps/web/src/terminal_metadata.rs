@@ -8,23 +8,30 @@ fn count_visible_chars(s: &str) -> usize {
 
     while idx < bytes.len() {
         // Skip ANSI escape sequences
-        if bytes[idx] == 0x1B && idx + 1 < bytes.len() {
-            if bytes[idx + 1] == b'[' {
+        if bytes.get(idx) == Some(&0x1B) && idx + 1 < bytes.len() {
+            if bytes.get(idx + 1) == Some(&b'[') {
                 // CSI sequence
                 idx += 2;
-                while idx < bytes.len() && !bytes[idx].is_ascii_alphabetic() {
+                while idx < bytes.len() {
+                    if let Some(&b) = bytes.get(idx) {
+                        if b.is_ascii_alphabetic() {
+                            break;
+                        }
+                    }
                     idx += 1;
                 }
                 idx += 1; // Skip the terminating letter
                 continue;
-            } else if bytes[idx + 1] == b']' {
+            } else if bytes.get(idx + 1) == Some(&b']') {
                 // OSC sequence
                 idx += 2;
                 while idx < bytes.len() {
-                    if bytes[idx] == 0x07 {
+                    if bytes.get(idx) == Some(&0x07) {
                         idx += 1;
                         break;
-                    } else if idx + 1 < bytes.len() && bytes[idx] == 0x1B && bytes[idx + 1] == b'\\'
+                    } else if idx + 1 < bytes.len()
+                        && bytes.get(idx) == Some(&0x1B)
+                        && bytes.get(idx + 1) == Some(&b'\\')
                     {
                         idx += 2;
                         break;
@@ -36,9 +43,11 @@ fn count_visible_chars(s: &str) -> usize {
         }
 
         // Skip carriage return and newline (they're not visible column positions)
-        if bytes[idx] == b'\r' || bytes[idx] == b'\n' {
-            idx += 1;
-            continue;
+        if let Some(&b) = bytes.get(idx) {
+            if b == b'\r' || b == b'\n' {
+                idx += 1;
+                continue;
+            }
         }
 
         // Count visible character
@@ -151,31 +160,34 @@ impl TerminalMetadata {
 
         while byte_idx < raw_bytes.len() {
             // Check for ANSI escape sequence: ESC [ ... (letter)
-            if raw_bytes[byte_idx] == 0x1B && byte_idx + 1 < raw_bytes.len() {
-                if raw_bytes[byte_idx + 1] == b'[' {
+            if raw_bytes.get(byte_idx) == Some(&0x1B) && byte_idx + 1 < raw_bytes.len() {
+                if raw_bytes.get(byte_idx + 1) == Some(&b'[') {
                     // ANSI CSI sequence: ESC [ ... (letter)
                     byte_idx += 2;
                     while byte_idx < raw_bytes.len() {
-                        let c = raw_bytes[byte_idx];
-                        byte_idx += 1;
-                        // CSI sequences end with a letter (0x40-0x7E range)
-                        if (0x40..=0x7E).contains(&c) {
+                        if let Some(&c) = raw_bytes.get(byte_idx) {
+                            byte_idx += 1;
+                            // CSI sequences end with a letter (0x40-0x7E range)
+                            if (0x40..=0x7E).contains(&c) {
+                                break;
+                            }
+                        } else {
                             break;
                         }
                     }
                     // Skip ANSI sequences (don't add to map, don't increment column)
                     continue;
-                } else if raw_bytes[byte_idx + 1] == b']' {
+                } else if raw_bytes.get(byte_idx + 1) == Some(&b']') {
                     // OSC sequence: ESC ] ... ST (ESC \ or BEL)
                     byte_idx += 2;
                     while byte_idx < raw_bytes.len() {
-                        if raw_bytes[byte_idx] == 0x07 {
+                        if raw_bytes.get(byte_idx) == Some(&0x07) {
                             // BEL terminator
                             byte_idx += 1;
                             break;
                         } else if byte_idx + 1 < raw_bytes.len()
-                            && raw_bytes[byte_idx] == 0x1B
-                            && raw_bytes[byte_idx + 1] == b'\\'
+                            && raw_bytes.get(byte_idx) == Some(&0x1B)
+                            && raw_bytes.get(byte_idx + 1) == Some(&b'\\')
                         {
                             // ESC \ terminator
                             byte_idx += 2;
@@ -188,13 +200,13 @@ impl TerminalMetadata {
             }
 
             // Check for carriage return (skip, it's not a visible character)
-            if raw_bytes[byte_idx] == b'\r' {
+            if raw_bytes.get(byte_idx) == Some(&b'\r') {
                 byte_idx += 1;
                 continue;
             }
 
             // Check for newline character
-            if raw_bytes[byte_idx] == b'\n' {
+            if raw_bytes.get(byte_idx) == Some(&b'\n') {
                 // Add newline to map (it's a visible character in terms of layout)
                 map.push(CharByteMapping {
                     line_in_span: line_idx,
@@ -211,16 +223,20 @@ impl TerminalMetadata {
 
             // Regular character (UTF-8)
             let char_start = byte_idx;
-            let char_len = if raw_bytes[byte_idx] & 0x80 == 0 {
-                1 // ASCII (0xxxxxxx)
-            } else if raw_bytes[byte_idx] & 0xE0 == 0xC0 {
-                2 // 2-byte UTF-8 (110xxxxx)
-            } else if raw_bytes[byte_idx] & 0xF0 == 0xE0 {
-                3 // 3-byte UTF-8 (1110xxxx)
-            } else if raw_bytes[byte_idx] & 0xF8 == 0xF0 {
-                4 // 4-byte UTF-8 (11110xxx)
+            let char_len = if let Some(&b) = raw_bytes.get(byte_idx) {
+                if b & 0x80 == 0 {
+                    1 // ASCII (0xxxxxxx)
+                } else if b & 0xE0 == 0xC0 {
+                    2 // 2-byte UTF-8 (110xxxxx)
+                } else if b & 0xF0 == 0xE0 {
+                    3 // 3-byte UTF-8 (1110xxxx)
+                } else if b & 0xF8 == 0xF0 {
+                    4 // 4-byte UTF-8 (11110xxx)
+                } else {
+                    1 // Invalid, treat as single byte
+                }
             } else {
-                1 // Invalid, treat as single byte
+                break; // End of buffer
             };
 
             map.push(CharByteMapping {

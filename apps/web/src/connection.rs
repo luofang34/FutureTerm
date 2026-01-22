@@ -97,9 +97,10 @@ impl ConnectionManager {
             // Blink for 100ms
             spawn_local(async move {
                 let _ = wasm_bindgen_futures::JsFuture::from(js_sys::Promise::new(&mut |r, _| {
-                    let _ = web_sys::window()
-                        .unwrap()
-                        .set_timeout_with_callback_and_timeout_and_arguments_0(&r, 100);
+                    if let Some(window) = web_sys::window() {
+                        let _ =
+                            window.set_timeout_with_callback_and_timeout_and_arguments_0(&r, 100);
+                    }
                 }))
                 .await;
                 s.set(false);
@@ -114,9 +115,10 @@ impl ConnectionManager {
             // Blink for 70ms
             spawn_local(async move {
                 let _ = wasm_bindgen_futures::JsFuture::from(js_sys::Promise::new(&mut |r, _| {
-                    let _ = web_sys::window()
-                        .unwrap()
-                        .set_timeout_with_callback_and_timeout_and_arguments_0(&r, 70);
+                    if let Some(window) = web_sys::window() {
+                        let _ =
+                            window.set_timeout_with_callback_and_timeout_and_arguments_0(&r, 70);
+                    }
                 }))
                 .await;
                 s.set(false);
@@ -194,9 +196,9 @@ impl ConnectionManager {
         // This gives the read loop a chance to see the flag and break, dropping its borrow of
         // transport.
         let _ = wasm_bindgen_futures::JsFuture::from(js_sys::Promise::new(&mut |r, _| {
-            let _ = web_sys::window()
-                .unwrap()
-                .set_timeout_with_callback_and_timeout_and_arguments_0(&r, 200);
+            if let Some(window) = web_sys::window() {
+                let _ = window.set_timeout_with_callback_and_timeout_and_arguments_0(&r, 200);
+            }
         }))
         .await;
 
@@ -240,9 +242,9 @@ impl ConnectionManager {
 
             // 2. Wait for it to exit (e.g. 200ms)
             let _ = wasm_bindgen_futures::JsFuture::from(js_sys::Promise::new(&mut |r, _| {
-                let _ = web_sys::window()
-                    .unwrap()
-                    .set_timeout_with_callback_and_timeout_and_arguments_0(&r, 200);
+                if let Some(window) = web_sys::window() {
+                    let _ = window.set_timeout_with_callback_and_timeout_and_arguments_0(&r, 200);
+                }
             }))
             .await;
 
@@ -263,9 +265,9 @@ impl ConnectionManager {
 
             // 2. Wait for browser to release lock fully
             let _ = wasm_bindgen_futures::JsFuture::from(js_sys::Promise::new(&mut |r, _| {
-                let _ = web_sys::window()
-                    .unwrap()
-                    .set_timeout_with_callback_and_timeout_and_arguments_0(&r, 100);
+                if let Some(window) = web_sys::window() {
+                    let _ = window.set_timeout_with_callback_and_timeout_and_arguments_0(&r, 100);
+                }
             }))
             .await;
 
@@ -408,9 +410,10 @@ impl ConnectionManager {
                     // Yield
                     let _ =
                         wasm_bindgen_futures::JsFuture::from(js_sys::Promise::new(&mut |r, _| {
-                            let _ = web_sys::window()
-                                .unwrap()
-                                .set_timeout_with_callback_and_timeout_and_arguments_0(&r, 10);
+                            if let Some(window) = web_sys::window() {
+                                let _ = window
+                                    .set_timeout_with_callback_and_timeout_and_arguments_0(&r, 10);
+                            }
                         }))
                         .await;
                 }
@@ -487,7 +490,8 @@ impl ConnectionManager {
         last_vid: Option<u16>,
         last_pid: Option<u16>,
     ) -> Option<web_sys::SerialPort> {
-        let nav = web_sys::window().unwrap().navigator();
+        let window = web_sys::window()?;
+        let nav = window.navigator();
         let serial = nav.serial();
 
         if serial.is_undefined() {
@@ -534,7 +538,8 @@ impl ConnectionManager {
     }
 
     pub async fn request_port(&self) -> Option<web_sys::SerialPort> {
-        let nav = web_sys::window().unwrap().navigator();
+        let window = web_sys::window()?;
+        let nav = window.navigator();
         let serial = nav.serial();
 
         if serial.is_undefined() {
@@ -575,15 +580,15 @@ impl ConnectionManager {
     // Helper: Parse Framing String
     pub fn parse_framing(s: &str) -> (u8, String, u8) {
         let chars: Vec<char> = s.chars().collect();
-        let d = chars[0].to_digit(10).unwrap_or(8) as u8;
-        let p = match chars[1] {
-            'N' => "none",
-            'E' => "even",
-            'O' => "odd",
+        let d = chars.first().and_then(|c| c.to_digit(10)).unwrap_or(8) as u8;
+        let p = match chars.get(1) {
+            Some('N') => "none",
+            Some('E') => "even",
+            Some('O') => "odd",
             _ => "none",
         }
         .to_string();
-        let s_bits = chars[2].to_digit(10).unwrap_or(1) as u8;
+        let s_bits = chars.get(2).and_then(|c| c.to_digit(10)).unwrap_or(1) as u8;
         (d, p, s_bits)
     }
 
@@ -773,9 +778,12 @@ impl ConnectionManager {
                         // Wait 100ms
                         let _ = wasm_bindgen_futures::JsFuture::from(js_sys::Promise::new(
                             &mut |r, _| {
-                                let _ = web_sys::window()
-                                    .unwrap()
-                                    .set_timeout_with_callback_and_timeout_and_arguments_0(&r, 100);
+                                if let Some(window) = web_sys::window() {
+                                    let _ = window
+                                        .set_timeout_with_callback_and_timeout_and_arguments_0(
+                                            &r, 100,
+                                        );
+                                }
                             },
                         ))
                         .await;
@@ -838,9 +846,9 @@ impl ConnectionManager {
 
             // Mandatory Cool-down: Give OS/Browser 200ms to release the lock completely
             let _ = wasm_bindgen_futures::JsFuture::from(js_sys::Promise::new(&mut |r, _| {
-                let _ = web_sys::window()
-                    .unwrap()
-                    .set_timeout_with_callback_and_timeout_and_arguments_0(&r, 200);
+                if let Some(window) = web_sys::window() {
+                    let _ = window.set_timeout_with_callback_and_timeout_and_arguments_0(&r, 200);
+                }
             }))
             .await;
         }
@@ -859,7 +867,9 @@ impl ConnectionManager {
                 if idx + 1 >= reader.len() {
                     return false;
                 }
-                let magic = reader[idx];
+                let Some(&magic) = reader.get(idx) else {
+                    return false;
+                };
                 // Make sure we have AT LEAST enough for a minimal valid header/payload
                 // v1 min: 8 + 0 = 8. v2 min: 12 + 0 = 12.
                 let min_packet_size = if magic == 0xFE { 8 } else { 12 };
@@ -868,7 +878,9 @@ impl ConnectionManager {
                     return false;
                 }
 
-                let sub_slice = &reader[idx..];
+                let Some(sub_slice) = reader.get(idx..) else {
+                    return false;
+                };
 
                 // Try Parse
                 let mut try_reader = sub_slice;
@@ -894,7 +906,10 @@ impl ConnectionManager {
                 }
 
                 // Failed? Advance past this magic and retry
-                reader = &reader[idx + 1..];
+                let Some(next_reader) = reader.get(idx + 1..) else {
+                    return false;
+                };
+                reader = next_reader;
             } else {
                 return false;
             }
@@ -998,8 +1013,8 @@ impl ConnectionManager {
                                 .iter()
                                 .position(|&x| x != b'\r' && x != b'\n')
                                 .unwrap_or(0);
-                            let clean_buf = if start_idx < buf.len() {
-                                buf[start_idx..].to_vec()
+                            let clean_buf = if let Some(slice) = buf.get(start_idx..) {
+                                slice.to_vec()
                             } else {
                                 Vec::new()
                             };
@@ -1037,9 +1052,12 @@ impl ConnectionManager {
                         // Wait 200ms
                         let _ = wasm_bindgen_futures::JsFuture::from(js_sys::Promise::new(
                             &mut |r, _| {
-                                let _ = web_sys::window()
-                                    .unwrap()
-                                    .set_timeout_with_callback_and_timeout_and_arguments_0(&r, 200);
+                                if let Some(window) = web_sys::window() {
+                                    let _ = window
+                                        .set_timeout_with_callback_and_timeout_and_arguments_0(
+                                            &r, 200,
+                                        );
+                                }
                             },
                         ))
                         .await;
@@ -1077,7 +1095,10 @@ impl ConnectionManager {
             {
                 let manager_conn = manager_conn.clone();
                 spawn_local(async move {
-                    let nav = web_sys::window().unwrap().navigator();
+                    let Some(window) = web_sys::window() else {
+                        return;
+                    };
+                    let nav = window.navigator();
                     let serial = nav.serial();
                     // getPorts() returns Promise directly
                     let promise = serial.get_ports();
@@ -1143,7 +1164,9 @@ impl ConnectionManager {
                                     // auto-reconnect)
                                     let _ = wasm_bindgen_futures::JsFuture::from(
                                             js_sys::Promise::new(&mut |r, _| {
-                                                let _ = web_sys::window().unwrap().set_timeout_with_callback_and_timeout_and_arguments_0(&r, 500);
+                                                if let Some(window) = web_sys::window() {
+                                                    let _ = window.set_timeout_with_callback_and_timeout_and_arguments_0(&r, 500);
+                                                }
                                             })
                                         ).await;
 
@@ -1178,7 +1201,10 @@ impl ConnectionManager {
         }) as Box<dyn FnMut(_)>);
 
         // Attach listeners
-        let nav = web_sys::window().unwrap().navigator();
+        let Some(window) = web_sys::window() else {
+            return;
+        };
+        let nav = window.navigator();
         let serial = nav.serial();
 
         if !serial.is_undefined() {

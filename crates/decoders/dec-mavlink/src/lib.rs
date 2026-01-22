@@ -128,7 +128,7 @@ impl Decoder for MavlinkDecoder {
                 break;
             }
 
-            let Some(&magic) = self.buffer.get(0) else {
+            let Some(&magic) = self.buffer.first() else {
                 break;
             };
             let Some(&payload_len_byte) = self.buffer.get(1) else {

@@ -349,9 +349,10 @@ pub fn TerminalView(
                 wasm_bindgen_futures::spawn_local(async move {
                     let _ =
                         wasm_bindgen_futures::JsFuture::from(js_sys::Promise::new(&mut |r, _| {
-                            let _ = web_sys::window()
-                                .unwrap()
-                                .set_timeout_with_callback_and_timeout_and_arguments_0(&r, 10);
+                            if let Some(window) = web_sys::window() {
+                                let _ = window
+                                    .set_timeout_with_callback_and_timeout_and_arguments_0(&r, 10);
+                            }
                         }))
                         .await;
                     fit_terminal(&fa_clone1);

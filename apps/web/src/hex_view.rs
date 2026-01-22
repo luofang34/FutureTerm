@@ -74,7 +74,9 @@ pub fn HexView(
 
     // Clear lock on global mouseup and mouseleave (handles edge case of mouse leaving window)
     create_effect(move |_| {
-        let window = web_sys::window().unwrap();
+        let Some(window) = web_sys::window() else {
+            return;
+        };
 
         let mouseup_callback = Closure::wrap(Box::new(move || {
             set_selection_lock.set(None);
@@ -219,7 +221,10 @@ pub fn HexView(
         let visible_count = (viewport_h / ROW_HEIGHT).ceil() as usize + (SCROLL_BUFFER_ROWS * 2);
         let end_idx = (start_idx + visible_count).min(total_count);
 
-        let slice = rows[start_idx..end_idx].to_vec();
+        let slice = rows
+            .get(start_idx..end_idx)
+            .map(|s| s.to_vec())
+            .unwrap_or_default();
 
         let padding_top = start_idx as f64 * ROW_HEIGHT;
         let padding_bottom = (total_count - end_idx) as f64 * ROW_HEIGHT;
@@ -381,7 +386,12 @@ pub fn HexView(
             }
         }) as Box<dyn FnMut()>);
 
-        let document = web_sys::window().unwrap().document().unwrap();
+        let Some(window) = web_sys::window() else {
+            return;
+        };
+        let Some(document) = window.document() else {
+            return;
+        };
         let _ = document
             .add_event_listener_with_callback("selectionchange", callback.as_ref().unchecked_ref());
 
