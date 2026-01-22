@@ -45,7 +45,6 @@ macro_rules! warn_log {
 }
 
 /// Error logging - always enabled
-#[allow(unused_macros)]
 macro_rules! error_log {
     ($($arg:tt)*) => {
         web_sys::console::error_1(&format!($($arg)*).into())
@@ -74,6 +73,174 @@ const DISCONNECT_COMPLETION_TIMEOUT_MS: i32 = 2000; // 2 seconds
 
 // ============ Connection State Machine ============
 
+/// # Connection State Machine
+///
+/// This module implements a unified state machine for managing serial port connections.
+/// The state machine prevents race conditions, invalid state combinations, and provides
+/// a single source of truth for connection status.
+///
+/// ## State Transition Diagram
+///
+/// ```text
+///                         ┌─────────────────────────────┐
+///                         │      Disconnected           │◄─────────────┐
+///                         │   (Ready to connect)        │              │
+///                         └──────────┬──────────────────┘              │
+///                                    │                                  │
+///                      ┌─────────────┼─────────────┐                   │
+///                      │             │             │                   │
+///                      │ (auto)      │ (manual)    │                   │
+///                      ▼             ▼             │                   │
+///           ┌──────────────┐  ┌─────────────┐     │                   │
+///           │   Probing    │  │ Connecting  │     │                   │
+///           │ (detect FW)  │  │             │     │                   │
+///           └──┬───────┬───┘  └──┬──────┬───┘     │                   │
+///              │       │         │      │         │                   │
+///         (ok) │       │ (fail)  │      │ (fail)  │                   │
+///              ▼       └─────────┼──────┘         │                   │
+///           ┌─────────────┐      │                │                   │
+///           │ Connecting  │      │                │                   │
+///           └──────┬──────┘      │                │                   │
+///                  │             │                │                   │
+///             (ok) │             │                │                   │
+///                  ▼             │                │                   │
+///           ┌─────────────────┐  │                │                   │
+///           │    Connected    │◄─┘                │                   │
+///           │                 │                   │                   │
+///           └──┬────┬───┬──┬──┘                   │                   │
+///              │    │   │  │                      │                   │
+///    (reconfig)│    │   │  │(USB unplug)          │                   │
+///              │    │   │  └────────┐             │                   │
+///              ▼    │   │           ▼             │                   │
+///      ┌──────────┐ │   │  ┌────────────────┐    │                   │
+///      │Reconfig  │ │   │  │   DeviceLost   │    │                   │
+///      │          │ │   │  │ (waiting...)   │    │                   │
+///      └─┬────┬───┘ │   │  └───┬────────┬───┘    │                   │
+///        │(ok)│(USB)│   │      │        │        │                   │
+///        │    │     │   │      │(USB)   │(cancel)│                   │
+///        ▼    │     │   │      ▼        └────────┼───────────────────┘
+///    Connected◄─────┘   │  ┌──────────────────┐  │
+///                       │  │AutoReconnecting  │  │
+///        (user disc)    │  │   (retry loop)   │  │
+///                       │  └──┬───────────┬───┘  │
+///                       │     │           │      │
+///                       │(ok) │           │(fail)│
+///                       │     │           │      │
+///                       │     └───────────┼──────┘
+///                       │                 │
+///                       ▼                 │
+///              ┌──────────────┐           │
+///              │Disconnecting │           │
+///              └──────┬───────┘           │
+///                     │                   │
+///                (ok) │                   │
+///                     └───────────────────┘
+/// ```
+///
+/// ## Valid State Transitions
+///
+/// | From State       | To State         | Trigger                           |
+/// |------------------|------------------|-----------------------------------|
+/// | Disconnected     | Probing          | User clicks connect (auto-detect) |
+/// | Disconnected     | Connecting       | User clicks connect (manual)      |
+/// | Probing          | Connecting       | Firmware detected                 |
+/// | Probing          | Disconnected     | Probe failed/canceled             |
+/// | Connecting       | Connected        | Connection established            |
+/// | Connecting       | Disconnected     | Connection failed                 |
+/// | Connecting       | DeviceLost       | USB unplugged during connect      |
+/// | Connected        | Reconfiguring    | Baud rate changed                 |
+/// | Connected        | Disconnecting    | User clicks disconnect            |
+/// | Connected        | DeviceLost       | USB unplugged (no auto-reconnect) |
+/// | Connected        | AutoReconnecting | USB unplugged (has VID/PID)       |
+/// | Reconfiguring    | Connected        | Reconfiguration complete          |
+/// | Reconfiguring    | DeviceLost       | USB unplugged during reconfig     |
+/// | Disconnecting    | Disconnected     | Disconnect complete               |
+/// | DeviceLost       | Disconnected     | User cancels (clicks disconnect)  |
+/// | DeviceLost       | AutoReconnecting | Device replugged (VID/PID match)  |
+/// | DeviceLost       | Connecting       | Manual reconnect attempt          |
+/// | AutoReconnecting | Connected        | Reconnection successful           |
+/// | AutoReconnecting | DeviceLost       | Reconnection failed (retry)       |
+/// | AutoReconnecting | Disconnected     | User cancels auto-reconnect       |
+///
+/// ## Usage Examples
+///
+/// ### Basic State Queries
+/// ```rust
+/// let state = manager.state.get();
+///
+/// // Check if user can disconnect
+/// if state.can_disconnect() {
+///     // Show "Disconnect" button
+/// }
+///
+/// // Get indicator color and animation
+/// let color = state.indicator_color();  // "rgb(95, 200, 85)" for Connected
+/// let should_pulse = state.indicator_should_pulse();  // true for AutoReconnecting
+/// ```
+///
+/// ### State Transitions
+/// ```rust
+/// // In connection code - use transition_to() which validates transitions
+/// self.transition_to(ConnectionState::Connecting);  // Validates and logs transition
+/// // ... do connection work ...
+/// self.transition_to(ConnectionState::Connected);
+///
+/// // Invalid transition will log error but not panic in release
+/// // This allows graceful degradation while catching bugs in development
+/// ```
+///
+/// ### Event Handlers
+/// ```rust
+/// // In USB disconnect event handler
+/// let current_state = self.state.get_untracked();
+///
+/// if matches!(current_state, ConnectionState::Connected) {
+///     // Determine if we should auto-reconnect
+///     if has_vid_pid {
+///         self.transition_to(ConnectionState::AutoReconnecting);
+///     } else {
+///         self.transition_to(ConnectionState::DeviceLost);
+///     }
+/// }
+/// ```
+///
+/// ## Design Rationale
+///
+/// ### Why State Machine Over Boolean Flags?
+///
+/// **Before (Boolean Flags):**
+/// - `connected: bool`
+/// - `is_auto_reconnecting: bool`
+/// - `is_connecting: bool`
+/// - `is_disconnecting: bool`
+/// - `is_reconfiguring: bool`
+/// - `is_probing: bool`
+///
+/// **Problems:**
+/// - 2^6 = 64 possible combinations, most invalid
+/// - Race conditions when flags update asynchronously
+/// - No single source of truth
+/// - Hard to determine "what can I do now?"
+///
+/// **After (State Machine):**
+/// - Single `ConnectionState` enum
+/// - Only 8 valid states (not 64)
+/// - Atomic transitions
+/// - Type-safe: compiler prevents invalid states
+/// - Clear intent: `state.can_disconnect()` vs checking 4 flags
+///
+/// ### Runtime vs Compile-Time Validation
+///
+/// The `can_transition_to()` method provides runtime validation that:
+/// 1. **In debug builds**: Logs errors and fails tests (helps catch bugs early)
+/// 2. **In release builds**: Logs errors but allows graceful degradation
+/// 3. **At compile time**: Exhaustive match ensures all transitions are considered
+///
+/// This hybrid approach gives us:
+/// - Development-time safety (tests catch invalid transitions)
+/// - Production robustness (no panics from unexpected states)
+/// - Maintainability (compiler warns if new states added without updating transitions)
+///
 /// Unified connection state for robust state management
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ConnectionState {
@@ -277,7 +444,32 @@ pub struct ConnectionManager {
     set_last_vid: Rc<RefCell<Option<WriteSignal<Option<u16>>>>>,
     set_last_pid: Rc<RefCell<Option<WriteSignal<Option<u16>>>>>,
 
-    // Track if probing was interrupted by ondisconnect events
+    /// Track if probing was interrupted by ondisconnect events
+    ///
+    /// **Purpose**: Prevent unnecessary polling delays when device re-enumeration is detected
+    ///
+    /// **Problem**: During auto-detection (probing), the OS may close the port causing an
+    /// `ondisconnect` event. We then poll for the device to return. But if the device
+    /// re-enumerates quickly, we'll get an `onconnect` event before polling starts.
+    ///
+    /// **Solution**: Set this flag when `ondisconnect` fires during probing. The polling
+    /// code checks this flag and if an `onconnect` already happened, it skips polling
+    /// entirely and proceeds immediately.
+    ///
+    /// **Example Timeline**:
+    /// ```text
+    /// T=0ms:  Start probing port A
+    /// T=50ms: OS closes port → ondisconnect event → set probing_interrupted=true
+    /// T=60ms: Device re-enumerates → onconnect event
+    /// T=70ms: Probing code checks probing_interrupted
+    ///         → sees flag is set AND state is AutoReconnecting
+    ///         → skips 100-400ms polling, proceeds immediately
+    /// ```
+    ///
+    /// **Reset**: Cleared at start of each auto-detection attempt (when baud == 0)
+    ///
+    /// **Related**: See `handle_probing_with_interrupt_recovery()` and
+    /// `poll_for_device_reenumeration()`
     probing_interrupted: Rc<RefCell<bool>>,
 
     // Event handler closures (to prevent memory leaks on re-initialization)
@@ -370,12 +562,10 @@ impl ConnectionManager {
         // Validate state transition
         if !old_state.can_transition_to(new_state) {
             // ERROR: Invalid transition detected
-            web_sys::console::error_1(
-                &format!(
-                    "INVALID STATE TRANSITION: {:?} → {:?} (not allowed)",
-                    old_state, new_state
-                )
-                .into(),
+            error_log!(
+                "INVALID STATE TRANSITION: {:?} → {:?} (not allowed)",
+                old_state,
+                new_state
             );
 
             // COMPILE-TIME CHECK: In debug builds, this will panic and fail tests
@@ -765,12 +955,9 @@ impl ConnectionManager {
                     }
                 }
                 _ = timeout_signal.fuse() => {
-                    web_sys::console::error_1(
-                        &format!(
-                            "WARN: Read loop did not complete within {}ms - proceeding with disconnect",
-                            DISCONNECT_COMPLETION_TIMEOUT_MS
-                        )
-                        .into(),
+                    warn_log!(
+                        "Read loop did not complete within {}ms - proceeding with disconnect",
+                        DISCONNECT_COMPLETION_TIMEOUT_MS
                     );
                 }
             }
@@ -911,7 +1098,7 @@ impl ConnectionManager {
                 }
                 Err(e) => {
                     // Restore UI state (actual connection cannot be restored)
-                    web_sys::console::error_1(&format!("Reconfigure failed: {}", e).into());
+                    error_log!("Reconfigure failed: {}", e);
                     self.restore_ui_state(snapshot).await;
                     // Transition to Disconnected state on failure
                     self.transition_to(ConnectionState::Disconnected);
