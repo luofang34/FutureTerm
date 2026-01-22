@@ -669,7 +669,7 @@ pub fn App() -> impl IntoView {
                     <Show when=move || view_mode.get() == ViewMode::Hex fallback=|| ()>
                         {move || {
                             if manager.decoder_id.get() == "mavlink" {
-                                view! { <mavlink_view::MavlinkView events_list=events_list /> }
+                                view! { <mavlink_view::MavlinkView events_list=events_list connected=connected /> }
                             } else {
                                 view! { <hex_view::HexView
                                     raw_log=raw_log

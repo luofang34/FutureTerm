@@ -9,7 +9,10 @@ use std::collections::BTreeMap;
 // 3. History persists via BTreeMap state (events_list no longer cleared)
 // Future: Could migrate to raw_log + embedded decoder for full isolation
 #[component]
-pub fn MavlinkView(events_list: ReadSignal<Vec<DecodedEvent>>) -> impl IntoView {
+pub fn MavlinkView(
+    events_list: ReadSignal<Vec<DecodedEvent>>,
+    connected: Signal<bool>,
+) -> impl IntoView {
     // Data structures for the view
     #[derive(Clone, PartialEq, Debug)]
     struct SystemGroup {
@@ -32,6 +35,19 @@ pub fn MavlinkView(events_list: ReadSignal<Vec<DecodedEvent>>) -> impl IntoView 
     // We iterate forward (Old -> New) to naturally let newer events overwrite older ones.
     // Optimization: Track last processed timestamp to avoid re-scanning old events
     let (processed_cursor, set_processed_cursor) = create_signal(0u64);
+
+    // Reset cursor when connection changes (for device reconnection with new timestamps)
+    create_effect(move |prev_connected: Option<bool>| {
+        let is_connected = connected.get();
+
+        // Detect reconnection: was disconnected, now connected
+        if prev_connected == Some(false) && is_connected {
+            set_processed_cursor.set(0);
+            web_sys::console::log_1(&"MAVLink: Reset cursor on reconnection".into());
+        }
+
+        is_connected
+    });
 
     // Effect: Sync events to state
     create_effect(move |_| {
