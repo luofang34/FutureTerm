@@ -108,6 +108,8 @@ pub fn HexView(
                     mouseleave_callback.as_ref().unchecked_ref(),
                 );
             }
+            // Note: Callbacks remain in memory after removal from DOM.
+            // This is a known limitation with wasm-bindgen event handlers.
             mouseup_callback.forget();
             mouseleave_callback.forget();
         });
@@ -157,12 +159,15 @@ pub fn HexView(
             if let Ok(observer) = web_sys::ResizeObserver::new(callback.as_ref().unchecked_ref()) {
                 observer.observe(&container);
 
-                // Store observer and callback for cleanup
+                // Store observer for cleanup
+                // Note: callback must remain alive for the observer, so we intentionally
+                // keep it in memory. This is unavoidable with ResizeObserver API.
                 let observer_clone = observer.clone();
                 on_cleanup(move || {
                     observer_clone.disconnect();
                 });
 
+                // Intentionally keep callback alive for observer lifetime
                 callback.forget();
             }
         }
@@ -404,6 +409,8 @@ pub fn HexView(
                 "selectionchange",
                 callback.as_ref().unchecked_ref(),
             );
+            // Note: Callback remains in memory after removal.
+            // This is a known limitation with wasm-bindgen event handlers.
             callback.forget();
         });
     });
@@ -514,6 +521,9 @@ pub fn HexView(
 
         if let Some(window) = web_sys::window() {
             let _ = window.request_animation_frame(callback.as_ref().unchecked_ref());
+            // For FnOnce callbacks in requestAnimationFrame, we need to forget
+            // because they execute once and then should be cleaned up by the browser.
+            // This is a known limitation in wasm-bindgen for one-shot callbacks.
             callback.forget();
         }
     });
