@@ -144,52 +144,20 @@ build_release() {
 }
 
 # ============================================================
-# DEV SERVER WITH INTEGRATION ENVIRONMENT
+# DEV SERVER
 # ============================================================
 run_dev_server() {
     echo ""
     echo -e "${BLUE}================================================${NC}"
-    echo -e "${BLUE}🚀 Starting Development Environment${NC}"
+    echo -e "${BLUE}🚀 Starting Development Server${NC}"
     echo -e "${BLUE}================================================${NC}"
     echo ""
 
-    # 1. Start socat in background
-    echo "[1/3] Launching socat..."
-    socat -d -d pty,raw,echo=0 pty,raw,echo=0 > socat.log 2>&1 &
-    SOCAT_PID=$!
-
-    sleep 2
-
-    # Extract ports
-    PORT1=$(grep "PTY is" socat.log | head -n1 | awk '{print $NF}')
-    PORT2=$(grep "PTY is" socat.log | tail -n1 | awk '{print $NF}')
-
-    if [ -z "$PORT1" ] || [ -z "$PORT2" ]; then
-        echo -e "${RED}Error: Failed to extract PTYs from socat output.${NC}"
-        cat socat.log
-        cleanup
-    fi
-
-    echo -e "${CYAN}      Virtual Ports Created:${NC}"
-    echo "      Generator Port: $PORT1"
-    echo "      Web App Port:   $PORT2"
+    echo -e "${GREEN}Starting Trunk dev server...${NC}"
+    echo -e "${CYAN}App will be available at http://127.0.0.1:8081${NC}"
     echo ""
-
-    # 2. Start Serial Generator
-    echo "[2/3] Starting Serial Generator on $PORT1..."
-    if [ ! -d ".venv" ]; then
-        echo "      Creating virtual environment..."
-        python3 -m venv .venv
-        .venv/bin/pip install pyserial
-    fi
-
-    .venv/bin/python3 scripts/serial_generator.py --port "$PORT1" --baud 115200 &
-    GEN_PID=$!
-
-    # 3. Start Web App
-    echo "[3/3] Starting Web App..."
-    echo -e "${GREEN}      App will be available at http://127.0.0.1:8081${NC}"
-    echo -e "${YELLOW}      ACTION REQUIRED: Connect manually to $PORT2 in the browser.${NC}"
+    echo -e "${YELLOW}Connect to a real serial device through the browser.${NC}"
+    echo -e "${YELLOW}Or use socat to create virtual ports for testing.${NC}"
     echo ""
 
     cd apps/web
