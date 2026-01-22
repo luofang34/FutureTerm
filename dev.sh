@@ -68,7 +68,7 @@ run_quality_checks() {
 
     # Clippy for WASM
     echo -e "${YELLOW}▶ Clippy (WASM)${NC}"
-    if (cd apps/web && cargo clippy --target wasm32-unknown-unknown -- \
+    if (cd apps/web && RUSTFLAGS="--cfg=web_sys_unstable_apis" cargo clippy --target wasm32-unknown-unknown -- \
         -D warnings \
         -D clippy::unwrap_used \
         -D clippy::expect_used \

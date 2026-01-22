@@ -315,7 +315,8 @@ impl ConnectionManager {
 
                 // Try to access active_port and close it
                 // This should cause read loop's read_chunk() to fail and release the borrow
-                if let Some(port) = self.active_port.borrow().as_ref() {
+                let port_clone = self.active_port.borrow().as_ref().cloned();
+                if let Some(port) = port_clone {
                     let promise = port.close();
                     web_sys::console::log_1(&"DEBUG: Forced port.close() called".into());
 
@@ -1328,6 +1329,7 @@ impl ConnectionManager {
     }
 
     // --- Auto-Reconnect Logic ---
+    #[allow(clippy::too_many_arguments)]
     pub fn setup_auto_reconnect(
         &self,
         last_vid: Signal<Option<u16>>,
