@@ -599,7 +599,7 @@ pub fn App() -> impl IntoView {
                     let (color, animation) = if is_conn && !is_busy {
                         ("rgb(95, 200, 85)", "") // Connected (Green)
                     } else if is_auto_reconnecting {
-                        ("rgb(245, 190, 80)", "animation: pulse 0.5s ease-in-out infinite;") // Auto-reconnecting (Blinking Orange)
+                        ("rgb(245, 190, 80)", "animation: pulse 0.3s ease-in-out infinite;") // Auto-reconnecting (Fast Blinking Orange)
                     } else if is_busy {
                         ("rgb(245, 190, 80)", "") // Connecting/Busy (Orange)
                     } else {
@@ -643,7 +643,7 @@ pub fn App() -> impl IntoView {
                     {
                     "@keyframes pulse {
                         0%, 100% { opacity: 1; }
-                        50% { opacity: 0.6; }
+                        50% { opacity: 0.4; }
                     }
                     .split-btn { transition: background-color 0.2s; }
                     .split-btn:hover { background-color: #0062a3 !important; }
