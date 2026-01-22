@@ -191,7 +191,8 @@ impl ConnectionManager {
         *self.read_loop_should_stop.borrow_mut() = true;
 
         // 2. Wait for it to exit (e.g. 200ms)
-        // This gives the read loop a chance to see the flag and break, dropping its borrow of transport.
+        // This gives the read loop a chance to see the flag and break, dropping its borrow of
+        // transport.
         let _ = wasm_bindgen_futures::JsFuture::from(js_sys::Promise::new(&mut |r, _| {
             let _ = web_sys::window()
                 .unwrap()
@@ -269,7 +270,8 @@ impl ConnectionManager {
             .await;
 
             // 3. Open New
-            // We reuse the connect_impl logic, manually handling detection so we can check for cancellation
+            // We reuse the connect_impl logic, manually handling detection so we can check for
+            // cancellation
             let (final_baud, final_framing, initial_buf, proto) = if baud == 0 {
                 let cached_auto = *self.last_auto_baud.borrow();
 
@@ -716,7 +718,7 @@ impl ConnectionManager {
 
                     let buf2 = self.gather_probe_data(port.clone(), rate, fr, true).await; // Use helper
 
-                    /* Original Deep Probe Logic Removed - replaced by helper call */
+                    // Original Deep Probe Logic Removed - replaced by helper call
                     let score = analysis::calculate_score_8n1(&buf2);
                     if score > best_score {
                         best_score = score;
@@ -820,7 +822,8 @@ impl ConnectionManager {
                             max_time = 250.0;
                         }
                         if buffer.len() > 64 {
-                            // Use analysis crate if available or simple check (Assuming analysis crate in scope)
+                            // Use analysis crate if available or simple check (Assuming analysis
+                            // crate in scope)
                             if analysis::calculate_score_8n1(&buffer) > 0.90 {
                                 break;
                             }
@@ -1099,17 +1102,20 @@ impl ConnectionManager {
                                     .set("Device found. Auto-reconnecting...".into());
 
                                 // We reuse the `options` / `baud`
-                                // Use default framing for auto-reconnect (or derived from valid config)
+                                // Use default framing for auto-reconnect (or derived from valid
+                                // config)
                                 let user_pref_baud = baud_signal.get_untracked();
                                 let last_known_baud = detected_baud.get_untracked();
 
                                 // SMART RECONNECT:
-                                // If user meant "Auto" (0), but we successfully connected before (last_known > 0),
-                                // reuse that rate to avoid a full re-scan (which sends '\r' and takes time).
+                                // If user meant "Auto" (0), but we successfully connected before
+                                // (last_known > 0), reuse that rate
+                                // to avoid a full re-scan (which sends '\r' and takes time).
                                 let target_baud = if user_pref_baud == 0 && last_known_baud > 0 {
                                     last_known_baud
                                 } else if user_pref_baud == 0 {
-                                    115200 // Fallback if no history (shouldn't happen on reconnect usually)
+                                    115200 // Fallback if no history (shouldn't happen on reconnect
+                                           // usually)
                                 } else {
                                     user_pref_baud
                                 };
@@ -1125,13 +1131,16 @@ impl ConnectionManager {
                                     ConnectionManager::parse_framing(&final_framing_str);
 
                                 // Manager Connect (Handles open, loop, worker)
-                                // Auto-reconnect not needed here, handled by manager internal state or explicit loop
+                                // Auto-reconnect not needed here, handled by manager internal state
+                                // or explicit loop
 
                                 spawn_local(async move {
-                                    // FORCE RESET: Close any stale handles (even if we think we are disconnected, the browser might hold the lock)
+                                    // FORCE RESET: Close any stale handles (even if we think we are
+                                    // disconnected, the browser might hold the lock)
                                     manager_conn.disconnect().await;
 
-                                    // Wait for OS/Browser to release resource fully (Crucial for auto-reconnect)
+                                    // Wait for OS/Browser to release resource fully (Crucial for
+                                    // auto-reconnect)
                                     let _ = wasm_bindgen_futures::JsFuture::from(
                                             js_sys::Promise::new(&mut |r, _| {
                                                 let _ = web_sys::window().unwrap().set_timeout_with_callback_and_timeout_and_arguments_0(&r, 500);

@@ -264,11 +264,20 @@ pub fn HexView(
                     let byte_count = range.end_byte_offset - range.start_byte_offset;
                     let expected_rows = byte_count.div_ceil(bpr); // Ceiling division
 
-                    web_sys::console::log_1(&format!(
-                        "HexView received selection from {:?}: bytes {}-{} (count: {}), scrolling to row {} ({}px), should highlight ~{} rows",
-                        range.source_view, range.start_byte_offset, range.end_byte_offset,
-                        byte_count, target_row, target_scroll, expected_rows
-                    ).into());
+                    web_sys::console::log_1(
+                        &format!(
+                            "HexView received selection from {:?}: bytes {}-{} (count: {}), \
+                             scrolling to row {} ({}px), should highlight ~{} rows",
+                            range.source_view,
+                            range.start_byte_offset,
+                            range.end_byte_offset,
+                            byte_count,
+                            target_row,
+                            target_scroll,
+                            expected_rows
+                        )
+                        .into(),
+                    );
 
                     if let Some(div) = container_ref.get() {
                         div.set_scroll_top(target_scroll as i32);
@@ -420,7 +429,8 @@ pub fn HexView(
                                         if let Some(offset_str) = el.dataset().get("offset") {
                                             if let Ok(offset) = offset_str.parse::<usize>() {
                                                 if range.contains_offset(offset) {
-                                                    // Terminal selection: both hex and ASCII get bg-term
+                                                    // Terminal selection: both hex and ASCII get
+                                                    // bg-term
                                                     if is_terminal {
                                                         let _ = el.class_list().add_1("bg-term");
                                                     }
@@ -428,7 +438,8 @@ pub fn HexView(
                                                     else if is_hex_view {
                                                         let is_ascii =
                                                             el.class_list().contains("ascii-char");
-                                                        // If origin is ASCII and this is hex, or vice versa, apply sync color
+                                                        // If origin is ASCII and this is hex, or
+                                                        // vice versa, apply sync color
                                                         if (origin == Some(SelectionOrigin::Ascii)
                                                             && !is_ascii)
                                                             || (origin

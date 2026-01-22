@@ -57,19 +57,21 @@ pub fn calculate_score_mavlink(buf: &[u8]) -> f32 {
     let mut matched_bytes = 0;
     let mut i = 0;
     while i < buf.len() {
-        let b = buf[i];
+        let Some(&b) = buf.get(i) else {
+            break;
+        };
         if b == 0xFE || b == 0xFD {
             // Potential Magic
-            if i + 1 < buf.len() {
-                let payload_len = buf[i + 1] as usize;
+            if let Some(&payload_len_byte) = buf.get(i + 1) {
+                let payload_len = payload_len_byte as usize;
                 let header_overhead = if b == 0xFE { 8 } else { 12 }; // v1=8, v2=12 (min)
                 let total_len = payload_len + header_overhead;
 
                 // Check specifically for v2 flags if possible to refine length?
                 // For now, assume min v2 length.
                 // If we have enough data for the full packet, assume it's valid for scoring.
-                // If we DON'T have enough data, we can't verify, so valid_bytes is just 0 for this chunk?
-                // Or should we count it if it LOOKS like a header?
+                // If we DON'T have enough data, we can't verify, so valid_bytes is just 0 for this
+                // chunk? Or should we count it if it LOOKS like a header?
 
                 // Strict approach: only count bytes if we can see the whole packet.
                 if i + total_len <= buf.len() {
@@ -204,12 +206,12 @@ mod tests {
 
         // Total 208 bytes. 8 valid. Score = 8/208 ~= 0.038
         // Wait, the current logic is purely ratio based.
-        // If we want "Auto-detection" to work with garbage, we need to know if it *found* a valid packet.
-        // The current score will be very low.
+        // If we want "Auto-detection" to work with garbage, we need to know if it *found* a valid
+        // packet. The current score will be very low.
         // However, smart_probe_framing uses `(score_mav >= 0.99)` or falls back to others.
         // If score is low, it might fail to detect.
-        // BUT, `verify_mavlink_integrity` (which we improved with feature gates) is the Robust Check.
-        // The scoring here is just a heuristic.
+        // BUT, `verify_mavlink_integrity` (which we improved with feature gates) is the Robust
+        // Check. The scoring here is just a heuristic.
         // Let's verify it simply returns non-zero, indicating *some* structure was found.
 
         let score = calculate_score_mavlink(&noise);

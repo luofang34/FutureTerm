@@ -121,14 +121,20 @@ impl Decoder for MavlinkDecoder {
                 }
             } else {
                 if self.buffer.len() > GARBAGE_SKIP_THRESHOLD {
-                    // leptos::logging::log!("MAVLink: Buffer full ({}) no magic found, clearing", self.buffer.len());
+                    // leptos::logging::log!("MAVLink: Buffer full ({}) no magic found, clearing",
+                    // self.buffer.len());
                     self.buffer.clear();
                 }
                 break;
             }
 
-            let magic = self.buffer[0];
-            let payload_len = self.buffer[1] as usize;
+            let Some(&magic) = self.buffer.get(0) else {
+                break;
+            };
+            let Some(&payload_len_byte) = self.buffer.get(1) else {
+                break;
+            };
+            let payload_len = payload_len_byte as usize;
 
             let base_len = if magic == MAVLINK_V1_MAGIC {
                 // v1: header(6) + payload + crc(2)
@@ -139,10 +145,11 @@ impl Decoder for MavlinkDecoder {
             };
 
             let mut total_len = base_len;
-            if magic == MAVLINK_V2_MAGIC && self.buffer.len() >= 3 {
-                let incompat_flags = self.buffer[2];
-                if incompat_flags & 0x01 != 0 {
-                    total_len += MAVLINK_V2_SIGNATURE_SIZE; // MAVLink v2 signature
+            if magic == MAVLINK_V2_MAGIC {
+                if let Some(&incompat_flags) = self.buffer.get(2) {
+                    if incompat_flags & 0x01 != 0 {
+                        total_len += MAVLINK_V2_SIGNATURE_SIZE; // MAVLink v2 signature
+                    }
                 }
             }
 
@@ -152,7 +159,10 @@ impl Decoder for MavlinkDecoder {
 
             // Try parse using the wrapper
             // Try parse using slice reader (requires std::io::Read for &[u8])
-            let mut reader = &self.buffer[0..total_len];
+            let Some(reader_slice) = self.buffer.get(0..total_len) else {
+                break;
+            };
+            let mut reader = reader_slice;
 
             let parse_result = if magic == MAVLINK_V1_MAGIC {
                 mavlink::read_v1_msg::<mavlink::common::MavMessage, _>(&mut reader)
@@ -204,14 +214,15 @@ mod tests {
     #[test]
     fn test_mavlink_heartbeat_parsing() {
         let mut decoder = MavlinkDecoder::new();
-        // Manual construction of a packet byte buffer to avoid dependency on crate writing (which might need std::io::Write)
-        // Or we use the crate?
+        // Manual construction of a packet byte buffer to avoid dependency on crate writing (which
+        // might need std::io::Write) Or we use the crate?
         // With embedded feature, write_v1_msg takes embedded::Write.
         // We can implement a ByteVecWriter.
 
         // pre-canned heartbeat v1 for Ardupilot
         // FE 09 00 01 01 00 00 00 00 00 02 03 51 04 03 1C 7F (CRC is example)
-        // Let's rely on garbage handling test mostly, or try to init from struct if possible without std write.
+        // Let's rely on garbage handling test mostly, or try to init from struct if possible
+        // without std write.
 
         // Actually, we can use a known valid packet from online example or construct one.
         // With std feature, write_v1_msg takes std::io::Write.
@@ -282,9 +293,9 @@ mod tests {
         );
         assert_eq!(results[0].summary, "HEARTBEAT");
 
-        // Verify buffer is clean (trailing junk might remain or be consumed if not enough for header)
-        // logic: invalid magic -> drain 1. 0xFF is invalid magic start (if not FE/FD).
-        // 0xFF != FE/FD. Drains. Buffer empty.
+        // Verify buffer is clean (trailing junk might remain or be consumed if not enough for
+        // header) logic: invalid magic -> drain 1. 0xFF is invalid magic start (if not
+        // FE/FD). 0xFF != FE/FD. Drains. Buffer empty.
     }
 
     #[test]

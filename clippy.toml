@@ -1,23 +1,14 @@
 # Clippy configuration for strict code quality enforcement
-# All panic-inducing patterns are DENIED
 
-# DENY all panic-inducing operations
-unwrap-used = "deny"
-expect-used = "deny"
-indexing-slicing = "deny"
-panic = "deny"
-unimplemented = "deny"
-unreachable = "deny"
-todo = "deny"
+# Allow unwrap only in tests and consts
+allow-unwrap-in-tests = true
+allow-unwrap-in-consts = true
 
-# DENY unsafe code
-unsafe-code = "deny"
+# Warn on large types passed by value (bytes threshold)
+pass-by-value-size-limit = 256
 
-# DENY safety issues
-cast-ptr-alignment = "deny"
+# Warn on functions with too many arguments
+too-many-arguments-threshold = 7
 
-# Additional strict checks
-unwrap-or-default = "deny"
-large-types-passed-by-value = "warn"
-missing-errors-doc = "warn"
-missing-panics-doc = "warn"
+# Warn on large stack arrays
+array-size-threshold = 512000

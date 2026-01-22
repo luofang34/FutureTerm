@@ -9,7 +9,8 @@ use core_types::Frame;
 pub struct LineFramer {
     buffer: Vec<u8>,
     // Timestamp of the *first byte* currently in the buffer.
-    // This ensures that when a line is completed, it gets the timestamp of when it started arriving.
+    // This ensures that when a line is completed, it gets the timestamp of when it started
+    // arriving.
     start_timestamp_us: Option<u64>,
 }
 
@@ -44,8 +45,8 @@ impl Framer for LineFramer {
                 let ts = self.start_timestamp_us.unwrap_or(timestamp_us);
 
                 // Clone buffer as frame (including the newline)
-                // We leave the newline in the frame because decoders (like NMEA) might need it for validation,
-                // or the UI might want to render it.
+                // We leave the newline in the frame because decoders (like NMEA) might need it for
+                // validation, or the UI might want to render it.
                 // However, for pure specific decoders, we might want to trim.
                 // Let's stick to "Framer preserves bytes, Decoder interprets".
                 let frame_bytes = self.buffer.clone();
@@ -55,8 +56,9 @@ impl Framer for LineFramer {
                 self.buffer.clear();
                 // The next byte (if any) will start a new line, so we'll need a new timestamp.
                 // Since strictly speaking we don't know the exact arrival time of the *next* byte
-                // within this batch, we can assume it's part of the current batch or just use current ts.
-                // Better approach: set start_timestamp_us to None, and if we loop again, logic below handles it.
+                // within this batch, we can assume it's part of the current batch or just use
+                // current ts. Better approach: set start_timestamp_us to None, and
+                // if we loop again, logic below handles it.
                 self.start_timestamp_us = None;
             }
         }

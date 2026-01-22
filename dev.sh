@@ -50,7 +50,14 @@ run_quality_checks() {
     if cargo clippy --workspace \
         --exclude transport-webserial \
         --exclude app-web \
-        -- -D warnings 2>&1; then
+        -- \
+        -D warnings \
+        -D clippy::unwrap_used \
+        -D clippy::expect_used \
+        -D clippy::panic \
+        -D clippy::indexing_slicing \
+        -D clippy::todo \
+        2>&1; then
         echo -e "${GREEN}✓ Clippy (non-WASM) passed${NC}"
         echo ""
     else
@@ -61,7 +68,13 @@ run_quality_checks() {
 
     # Clippy for WASM
     echo -e "${YELLOW}▶ Clippy (WASM)${NC}"
-    if (cd apps/web && cargo clippy --target wasm32-unknown-unknown -- -D warnings) 2>&1; then
+    if (cd apps/web && cargo clippy --target wasm32-unknown-unknown -- \
+        -D warnings \
+        -D clippy::unwrap_used \
+        -D clippy::expect_used \
+        -D clippy::panic \
+        -D clippy::indexing_slicing \
+        -D clippy::todo) 2>&1; then
         echo -e "${GREEN}✓ Clippy (WASM) passed${NC}"
         echo ""
     else

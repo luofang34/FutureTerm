@@ -405,7 +405,8 @@ impl TerminalMetadata {
         #[cfg(all(debug_assertions, target_arch = "wasm32"))]
         web_sys::console::log_1(
             &format!(
-                "Found start_span: terminal_line={}, column_offset={}, byte_range={}-{}, text_len={}, char_map_entries={}",
+                "Found start_span: terminal_line={}, column_offset={}, byte_range={}-{}, \
+                 text_len={}, char_map_entries={}",
                 start_span.terminal_line,
                 start_span.column_offset,
                 start_span.raw_log_byte_start,
@@ -450,7 +451,8 @@ impl TerminalMetadata {
         #[cfg(all(debug_assertions, target_arch = "wasm32"))]
         web_sys::console::log_1(
             &format!(
-                "Found end_span: terminal_line={}, column_offset={}, byte_range={}-{}, text_len={}, char_map_entries={}",
+                "Found end_span: terminal_line={}, column_offset={}, byte_range={}-{}, \
+                 text_len={}, char_map_entries={}",
                 end_span.terminal_line,
                 end_span.column_offset,
                 end_span.raw_log_byte_start,
@@ -510,7 +512,8 @@ impl TerminalMetadata {
         #[cfg(all(debug_assertions, target_arch = "wasm32"))]
         web_sys::console::log_1(
             &format!(
-                "Looking for end char: line_in_span={}, col={} (already adjusted from {} since xterm end is exclusive)",
+                "Looking for end char: line_in_span={}, col={} (already adjusted from {} since \
+                 xterm end is exclusive)",
                 end_line_in_span, actual_end_col, end_col
             )
             .into(),
@@ -540,7 +543,8 @@ impl TerminalMetadata {
         #[cfg(all(debug_assertions, target_arch = "wasm32"))]
         web_sys::console::log_1(
             &format!(
-                "Found end char: line={}, col={}, byte_offset={}, len={} -> global_byte={} (inclusive)",
+                "Found end char: line={}, col={}, byte_offset={}, len={} -> global_byte={} \
+                 (inclusive)",
                 end_char_map.line_in_span,
                 end_char_map.terminal_column,
                 end_char_map.byte_offset_in_span,
@@ -659,18 +663,19 @@ impl TerminalMetadata {
                             && (m.byte_offset_in_span + m.byte_length) >= local_offset
                         // End of char is >= end
                     }) {
-                        // Correct logic: If end_byte is 5, and char is 4-5, we want end of that char?
-                        // Selection is exclusive.
+                        // Correct logic: If end_byte is 5, and char is 4-5, we want end of that
+                        // char? Selection is exclusive.
                         end_pos = Some((
                             span.terminal_line + map.line_in_span,
-                            map.terminal_column, // xterm end is exclusive, so if map is col 5, and we end at start of col 5, it's 5.
-                                                 // If we end strictly AFTER start of col 5...
-                                                 // Simpler: Map byte to char index.
+                            map.terminal_column, /* xterm end is exclusive, so if map is col 5,
+                                                  * and we end at start of col 5, it's 5.
+                                                  * If we end strictly AFTER start of col 5...
+                                                  * Simpler: Map byte to char index. */
                         ));
 
                         // Adjust for partial overlap?
-                        // If local_offset == m.byte_offset_in_span, we end exactly at char start -> col
-                        // If local_offset > m, we end inside -> col + 1
+                        // If local_offset == m.byte_offset_in_span, we end exactly at char start ->
+                        // col If local_offset > m, we end inside -> col + 1
                         if local_offset > map.byte_offset_in_span {
                             end_pos = Some((
                                 span.terminal_line + map.line_in_span,

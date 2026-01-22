@@ -117,8 +117,8 @@ pub fn App() -> impl IntoView {
     create_effect(move |_| {
         let manager = manager_worker_init.clone();
         if let Ok(w) = Worker::new("worker_bootstrap.js") {
-            // Restore TextDecoder for RX to Main Thread (if we ever want to decode locally? No, worker does that)
-            // But wait, worker sends BACK a 'DataBatch' with frames.
+            // Restore TextDecoder for RX to Main Thread (if we ever want to decode locally? No,
+            // worker does that) But wait, worker sends BACK a 'DataBatch' with frames.
             // We need to print raw text to terminal.
             // The worker parses frames. Does it decode text?
             // Looking at worker_logic.rs:
@@ -180,8 +180,9 @@ pub fn App() -> impl IntoView {
                             }
 
                             // Terminal direct write - always write to maintain metadata mapping
-                            // Terminal exists even when view is hidden, and we need complete metadata
-                            // for cross-view selection sync to work
+                            // Terminal exists even when view is hidden, and we need complete
+                            // metadata for cross-view selection sync to
+                            // work
                             if let Some(term) = term_handle.get_untracked() {
                                 for f in &frames {
                                     if !f.bytes.is_empty() {
@@ -193,7 +194,8 @@ pub fn App() -> impl IntoView {
                                                 term.write(&text);
 
                                                 // Record metadata for cross-view selection sync
-                                                // This must happen for ALL data, not just when Terminal is visible
+                                                // This must happen for ALL data, not just when
+                                                // Terminal is visible
                                                 set_terminal_metadata.update(|meta| {
                                                     meta.record_write(
                                                         &f.bytes,
@@ -211,7 +213,8 @@ pub fn App() -> impl IntoView {
                             if !events.is_empty() {
                                 set_events_list.update(|list| {
                                     list.extend(events);
-                                    // Cap at MAX_DECODED_EVENTS to ensure we don't drop high-freq MAVLink packets
+                                    // Cap at MAX_DECODED_EVENTS to ensure we don't drop high-freq
+                                    // MAVLink packets
                                     // before the View effect can process them.
                                     // 500 was too aggressive for 50Hz streams.
                                     if list.len() > MAX_DECODED_EVENTS {
@@ -321,11 +324,12 @@ pub fn App() -> impl IntoView {
 
                 // Capture VID/PID for Reconnect
                 let info = port.get_info();
-                // web-sys SerialPortInfo doesn't expose fields directly without structural casting usually?
-                // Let's rely on Reflect for safety or try methods if available.
-                // Actually web-sys 0.3.69+ exposes `usb_vendor_id` and `usb_product_id`.
-                // Let's use Reflect to be safe against version mismatch or use provided methods.
-                // Checking docs: SerialPortInfo has `usb_vendor_id` and `usb_product_id` getters.
+                // web-sys SerialPortInfo doesn't expose fields directly without structural casting
+                // usually? Let's rely on Reflect for safety or try methods if
+                // available. Actually web-sys 0.3.69+ exposes `usb_vendor_id` and
+                // `usb_product_id`. Let's use Reflect to be safe against version
+                // mismatch or use provided methods. Checking docs: SerialPortInfo
+                // has `usb_vendor_id` and `usb_product_id` getters.
 
                 // NOTE: We need to enable `SerialPortInfo` in Cargo.toml (Already Done).
                 // However, let's use a small helper to extract it safely.
@@ -407,8 +411,9 @@ pub fn App() -> impl IntoView {
 
             spawn_local(async move {
                 // If b=0 and f=Auto, we assume it's the "Auto" state and don't force reconfig
-                // (unless we add a "Re-Scan" button later, but for now this prevents redundant loops if both set to Auto)
-                // Allow Auto (0 / Auto) to trigger reconfiguration too
+                // (unless we add a "Re-Scan" button later, but for now this prevents redundant
+                // loops if both set to Auto) Allow Auto (0 / Auto) to trigger
+                // reconfiguration too
 
                 web_sys::console::log_1(&"Dynamically Reconfiguring Port...".into());
 
