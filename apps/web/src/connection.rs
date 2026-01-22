@@ -43,15 +43,21 @@ struct ConnectionSnapshot {
 
 #[derive(Clone)]
 pub struct ConnectionManager {
-    // State Signals
+    // ============ Public State Signals (for UI) ============
+
+    // Connection State
     pub connected: Signal<bool>,
     pub set_connected: WriteSignal<bool>,
     pub status: Signal<String>,
     pub set_status: WriteSignal<String>,
+
+    // Operation State (for UI progress indicators)
     pub is_reconfiguring: Signal<bool>,
     pub set_is_reconfiguring: WriteSignal<bool>,
     pub is_probing: Signal<bool>,
     pub set_is_probing: WriteSignal<bool>,
+    pub is_auto_reconnecting: Signal<bool>,
+    set_is_auto_reconnecting: WriteSignal<bool>, // Private - only set by auto-reconnect logic
 
     // Detected Config (for UI feedback)
     pub detected_baud: Signal<u32>,
@@ -59,7 +65,18 @@ pub struct ConnectionManager {
     pub detected_framing: Signal<String>,
     pub set_detected_framing: WriteSignal<String>,
 
-    // Internal State
+    // Decoder State
+    pub decoder_id: Signal<String>,
+    set_decoder_id: WriteSignal<String>, // Private - use set_decoder() method
+
+    // ============ Activity Indicators (transient pulses) ============
+    // Note: WriteSignals are private - use trigger_rx()/trigger_tx() methods
+    pub rx_active: Signal<bool>,
+    set_rx_active: WriteSignal<bool>,
+    pub tx_active: Signal<bool>,
+    set_tx_active: WriteSignal<bool>,
+
+    // ============ Internal State (private) ============
     connection_handle: Rc<RefCell<Option<ConnectionHandle>>>,
     active_port: Rc<RefCell<Option<web_sys::SerialPort>>>,
     worker: Signal<Option<Worker>>, // Read-only access to worker for sending data
@@ -67,22 +84,6 @@ pub struct ConnectionManager {
     // Atomic guards for connection state
     is_connecting: Arc<AtomicBool>,
     is_disconnecting: Arc<AtomicBool>,
-
-    // Hooks for external UI updates (optional, or we just expose signals)
-
-    // RX/TX Activity Signals
-    pub rx_active: Signal<bool>,
-    set_rx_active: WriteSignal<bool>,
-    pub tx_active: Signal<bool>,
-    set_tx_active: WriteSignal<bool>,
-
-    // Auto-reconnect status (for UI visual feedback)
-    pub is_auto_reconnecting: Signal<bool>,
-    pub set_is_auto_reconnecting: WriteSignal<bool>,
-
-    // Decoder State
-    pub decoder_id: Signal<String>,
-    pub set_decoder_id: WriteSignal<String>,
 
     // User-initiated disconnect flag (to distinguish from device loss)
     user_initiated_disconnect: Rc<RefCell<bool>>,
