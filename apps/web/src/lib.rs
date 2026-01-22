@@ -91,6 +91,8 @@ pub fn App() -> impl IntoView {
 
     let (events_list, set_events_list) = create_signal::<Vec<DecodedEvent>>(Vec::new());
     let (raw_log, set_raw_log) = create_signal::<Vec<RawEvent>>(Vec::new());
+    // Cumulative byte counter for raw_log to avoid O(N) iteration
+    let (raw_log_bytes, set_raw_log_bytes) = create_signal(0usize);
     let (hex_cursor, set_hex_cursor) = create_signal(0usize);
 
     // ========== Cross-View Selection Sync ==========
@@ -152,14 +154,17 @@ pub fn App() -> impl IntoView {
                             // Update unified raw log with frames
                             if !frames.is_empty() {
                                 set_raw_log.update(|log| {
-                                    // Append new raw events
+                                    // Append new raw events and update byte counter
+                                    let mut bytes_added = 0;
                                     for frame in &frames {
-                                        log.push(RawEvent::from_frame(frame));
+                                        let event = RawEvent::from_frame(frame);
+                                        bytes_added += event.byte_size();
+                                        log.push(event);
                                     }
 
-                                    // Byte-based capping to prevent unbounded memory growth
-                                    let total_bytes: usize =
-                                        log.iter().map(|e| e.byte_size()).sum();
+                                    // Update cumulative byte counter
+                                    let total_bytes = raw_log_bytes.get_untracked() + bytes_added;
+                                    set_raw_log_bytes.set(total_bytes);
 
                                     if total_bytes > MAX_LOG_BYTES || log.len() > MAX_LOG_EVENTS {
                                         // Trim oldest events until under limit
@@ -178,6 +183,9 @@ pub fn App() -> impl IntoView {
 
                                         if trimmed > 0 {
                                             log.drain(0..trimmed);
+
+                                            // Update cumulative byte counter after trimming
+                                            set_raw_log_bytes.set(total_bytes - bytes_removed);
 
                                             // Adjust terminal_metadata for the trimmed bytes
                                             set_terminal_metadata.update(|meta| {
