@@ -19,6 +19,82 @@ use futures_channel::{mpsc, oneshot};
 // We need to move the protocol module usage here or make it public
 use crate::protocol::UiToWorker;
 
+// ============ Connection State Machine ============
+
+/// Unified connection state for robust state management
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ConnectionState {
+    /// No active connection, ready to connect
+    Disconnected,
+
+    /// Actively probing ports to detect firmware
+    Probing,
+
+    /// Initiating connection to port
+    Connecting,
+
+    /// Successfully connected and operational
+    Connected,
+
+    /// Changing baud rate or serial parameters
+    Reconfiguring,
+
+    /// User clicked disconnect, tearing down connection
+    Disconnecting,
+
+    /// Device physically disconnected, waiting for user action
+    DeviceLost,
+
+    /// Device physically disconnected, attempting to reconnect
+    AutoReconnecting,
+}
+
+impl ConnectionState {
+    /// Can the user trigger a disconnect action?
+    pub fn can_disconnect(&self) -> bool {
+        matches!(
+            self,
+            Self::Connected | Self::AutoReconnecting | Self::DeviceLost
+        )
+    }
+
+    /// Should the button show "Disconnect"?
+    pub fn button_shows_disconnect(&self) -> bool {
+        self.can_disconnect()
+    }
+
+    /// What color should the status indicator be?
+    pub fn indicator_color(&self) -> &'static str {
+        match self {
+            Self::Connected => "rgb(95, 200, 85)", // Green
+            Self::Disconnected | Self::DeviceLost => "rgb(240, 105, 95)", // Red
+            Self::AutoReconnecting => "rgb(245, 190, 80)", // Orange (pulsing)
+            Self::Connecting | Self::Probing | Self::Reconfiguring | Self::Disconnecting => {
+                "rgb(245, 190, 80)" // Orange (steady)
+            }
+        }
+    }
+
+    /// Should the indicator pulse?
+    pub fn indicator_should_pulse(&self) -> bool {
+        matches!(self, Self::AutoReconnecting)
+    }
+
+    /// User-facing status text
+    pub fn status_text(&self) -> &'static str {
+        match self {
+            Self::Disconnected => "Ready to connect",
+            Self::Probing => "Detecting firmware...",
+            Self::Connecting => "Connecting...",
+            Self::Connected => "Connected",
+            Self::Reconfiguring => "Reconfiguring...",
+            Self::Disconnecting => "Disconnecting...",
+            Self::DeviceLost => "Device Lost (waiting for device...)",
+            Self::AutoReconnecting => "Device found. Auto-reconnecting...",
+        }
+    }
+}
+
 // Message passing infrastructure
 enum ConnectionCommand {
     Stop,
@@ -28,9 +104,9 @@ enum ConnectionCommand {
     },
 }
 
-#[derive(Clone)]
 struct ConnectionHandle {
     cmd_tx: mpsc::UnboundedSender<ConnectionCommand>,
+    completion_rx: oneshot::Receiver<()>,
 }
 
 // Snapshot for UI state consistency (not true transaction rollback)
@@ -45,19 +121,13 @@ struct ConnectionSnapshot {
 pub struct ConnectionManager {
     // ============ Public State Signals (for UI) ============
 
-    // Connection State
-    pub connected: Signal<bool>,
-    pub set_connected: WriteSignal<bool>,
+    // Connection State Machine (Single Source of Truth)
+    pub state: Signal<ConnectionState>,
+    pub set_state: WriteSignal<ConnectionState>,
+
+    // Status text (for display purposes)
     pub status: Signal<String>,
     pub set_status: WriteSignal<String>,
-
-    // Operation State (for UI progress indicators)
-    pub is_reconfiguring: Signal<bool>,
-    pub set_is_reconfiguring: WriteSignal<bool>,
-    pub is_probing: Signal<bool>,
-    pub set_is_probing: WriteSignal<bool>,
-    pub is_auto_reconnecting: Signal<bool>,
-    set_is_auto_reconnecting: WriteSignal<bool>, // Private - only set by auto-reconnect logic
 
     // Detected Config (for UI feedback)
     pub detected_baud: Signal<u32>,
@@ -87,31 +157,33 @@ pub struct ConnectionManager {
 
     // User-initiated disconnect flag (to distinguish from device loss)
     user_initiated_disconnect: Rc<RefCell<bool>>,
+
+    // Auto-reconnect device tracking (to clear on user disconnect)
+    set_last_vid: Rc<RefCell<Option<WriteSignal<Option<u16>>>>>,
+    set_last_pid: Rc<RefCell<Option<WriteSignal<Option<u16>>>>>,
+
+    // Track if probing was interrupted by ondisconnect events
+    probing_interrupted: Rc<RefCell<bool>>,
 }
 
 impl ConnectionManager {
     pub fn new(worker_signal: Signal<Option<Worker>>) -> Self {
-        let (connected, set_connected) = create_signal(false);
+        // Initialize state machine with Disconnected state
+        let (state, set_state) = create_signal(ConnectionState::Disconnected);
+
         let (status, set_status) = create_signal("Ready to connect".to_string());
-        let (is_reconfiguring, set_is_reconfiguring) = create_signal(false);
-        let (is_probing, set_is_probing) = create_signal(false);
         let (detected_baud, set_detected_baud) = create_signal(0);
         let (detected_framing, set_detected_framing) = create_signal("".to_string());
 
         let (rx_active, set_rx_active) = create_signal(false);
         let (tx_active, set_tx_active) = create_signal(false);
-        let (is_auto_reconnecting, set_is_auto_reconnecting) = create_signal(false);
         let (decoder_id, set_decoder_id) = create_signal("utf8".to_string());
 
         Self {
-            connected: connected.into(),
-            set_connected,
+            state: state.into(),
+            set_state,
             status: status.into(),
             set_status,
-            is_reconfiguring: is_reconfiguring.into(),
-            set_is_reconfiguring,
-            is_probing: is_probing.into(),
-            set_is_probing,
             detected_baud: detected_baud.into(),
             set_detected_baud,
             detected_framing: detected_framing.into(),
@@ -127,11 +199,12 @@ impl ConnectionManager {
             set_rx_active,
             tx_active: tx_active.into(),
             set_tx_active,
-            is_auto_reconnecting: is_auto_reconnecting.into(),
-            set_is_auto_reconnecting,
             decoder_id: decoder_id.into(),
             set_decoder_id,
             user_initiated_disconnect: Rc::new(RefCell::new(false)),
+            set_last_vid: Rc::new(RefCell::new(None)),
+            set_last_pid: Rc::new(RefCell::new(None)),
+            probing_interrupted: Rc::new(RefCell::new(false)),
         }
     }
 
@@ -171,12 +244,24 @@ impl ConnectionManager {
         }
     }
 
-    pub fn get_status(&self) -> Signal<String> {
-        self.status
+    /// Transition to a new connection state
+    fn transition_to(&self, new_state: ConnectionState) {
+        let old_state = self.state.get_untracked();
+
+        // Log state transition for debugging
+        web_sys::console::log_1(
+            &format!("State transition: {:?} → {:?}", old_state, new_state).into(),
+        );
+
+        // Update state machine
+        self.set_state.set(new_state);
+
+        // Update status string
+        self.set_status.set(new_state.status_text().into());
     }
 
-    pub fn get_connected(&self) -> Signal<bool> {
-        self.connected
+    pub fn get_status(&self) -> Signal<String> {
+        self.status
     }
 
     // Async Connect
@@ -208,6 +293,16 @@ impl ConnectionManager {
             return Err("Already connected".to_string());
         }
 
+        // Transition to appropriate state based on whether we're probing
+        if baud == 0 {
+            // Auto-detect baud rate - transition to Probing state
+            *self.probing_interrupted.borrow_mut() = false; // Reset flag
+            self.transition_to(ConnectionState::Probing);
+        } else {
+            // Specific baud rate - transition to Connecting state
+            self.transition_to(ConnectionState::Connecting);
+        }
+
         let result = if baud > 0 && framing == "Auto" {
             let (detect_framing, initial_buf, proto) =
                 self.smart_probe_framing(port.clone(), baud).await;
@@ -220,33 +315,232 @@ impl ConnectionManager {
                 .await
         } else {
             // Auto-Detect if Baud is 0
-            let (final_baud, final_framing_str, initial_buffer, detected_proto) = if baud == 0 {
-                let (b, f, buf, proto) = self.detect_config(port.clone(), framing).await;
+            let (final_port, final_baud, final_framing_str, initial_buffer, detected_proto) =
+                if baud == 0 {
+                    let (b, f, buf, proto) = self.detect_config(port.clone(), framing).await;
 
-                // CRITICAL FIX: Wait for OS to fully release port after probing
-                // Probing opens/closes port multiple times - OS needs time to clean up
-                web_sys::console::log_1(
-                    &"DEBUG: Probing complete, waiting 150ms for port cleanup".into(),
-                );
-                let _ = wasm_bindgen_futures::JsFuture::from(js_sys::Promise::new(&mut |r, _| {
-                    if let Some(window) = web_sys::window() {
-                        let _ =
-                            window.set_timeout_with_callback_and_timeout_and_arguments_0(&r, 150);
+                    // Check if probing was interrupted by ondisconnect events
+                    let was_interrupted = *self.probing_interrupted.borrow();
+                    if was_interrupted {
+                        web_sys::console::warn_1(
+                            &"DEBUG: Probing was interrupted by ondisconnect event - port \
+                              reference is stale"
+                                .into(),
+                        );
+                        *self.probing_interrupted.borrow_mut() = false; // Clear flag
+
+                        // CRITICAL FIX: When ondisconnect fires during probing, the port reference
+                        // becomes invalid. We need to wait for the browser to re-enumerate the
+                        // device and get a fresh port reference. The
+                        // onconnect event may fire with variable timing, so
+                        // we poll get_ports() with retries.
+
+                        let Some(window) = web_sys::window() else {
+                            self.set_status
+                                .set("Connection Failed: window not available".into());
+                            return Err("Window not available".to_string());
+                        };
+                        let nav = window.navigator();
+                        let serial = nav.serial();
+
+                        web_sys::console::log_1(
+                            &"DEBUG: Polling for device re-enumeration (max 3 seconds)".into(),
+                        );
+
+                        // Poll get_ports() up to 15 times (200ms interval = 3 seconds total)
+                        let mut fresh_port: Option<web_sys::SerialPort> = None;
+                        for attempt in 1..=15 {
+                            match wasm_bindgen_futures::JsFuture::from(serial.get_ports()).await {
+                                Ok(ports_val) => {
+                                    let ports: js_sys::Array = ports_val.unchecked_into();
+                                    if ports.length() > 0 {
+                                        fresh_port = Some(ports.get(0).unchecked_into());
+                                        web_sys::console::log_1(
+                                            &format!(
+                                                "DEBUG: Device re-enumerated after {}ms (attempt \
+                                                 {})",
+                                                attempt * 200,
+                                                attempt
+                                            )
+                                            .into(),
+                                        );
+                                        break;
+                                    }
+                                }
+                                Err(e) => {
+                                    web_sys::console::log_1(
+                                        &format!("DEBUG: Failed to get ports: {:?}", e).into(),
+                                    );
+                                    self.set_status
+                                        .set("Connection Failed: Cannot access ports".into());
+                                    return Err("Cannot access ports".to_string());
+                                }
+                            }
+
+                            // Wait 200ms before next attempt
+                            let _ = wasm_bindgen_futures::JsFuture::from(js_sys::Promise::new(
+                                &mut |r, _| {
+                                    if let Some(window) = web_sys::window() {
+                                        let _ = window
+                                            .set_timeout_with_callback_and_timeout_and_arguments_0(
+                                                &r, 200,
+                                            );
+                                    }
+                                },
+                            ))
+                            .await;
+                        }
+
+                        if let Some(port) = fresh_port {
+                            // Wait a bit more for port to be fully ready
+                            web_sys::console::log_1(
+                                &"DEBUG: Waiting 200ms for port to be ready".into(),
+                            );
+                            let _ = wasm_bindgen_futures::JsFuture::from(js_sys::Promise::new(
+                                &mut |r, _| {
+                                    if let Some(window) = web_sys::window() {
+                                        let _ = window
+                                            .set_timeout_with_callback_and_timeout_and_arguments_0(
+                                                &r, 200,
+                                            );
+                                    }
+                                },
+                            ))
+                            .await;
+                            (port, b, f, Some(buf), proto)
+                        } else {
+                            web_sys::console::log_1(
+                                &"DEBUG: Device not re-enumerated after 3 seconds".into(),
+                            );
+                            self.set_status
+                                .set("Connection Failed: Device not found".into());
+                            return Err("Device not found after disconnect".to_string());
+                        }
+                    } else {
+                        // CRITICAL FIX: Wait for OS to fully release port after probing
+                        // Probing opens/closes port multiple times - OS needs time to clean up
+                        web_sys::console::log_1(
+                            &"DEBUG: Probing complete, waiting 150ms for port cleanup".into(),
+                        );
+                        let _ = wasm_bindgen_futures::JsFuture::from(js_sys::Promise::new(
+                            &mut |r, _| {
+                                if let Some(window) = web_sys::window() {
+                                    let _ = window
+                                        .set_timeout_with_callback_and_timeout_and_arguments_0(
+                                            &r, 150,
+                                        );
+                                }
+                            },
+                        ))
+                        .await;
+
+                        // CRITICAL FIX: Check interrupt flag AGAIN after cleanup wait
+                        // ondisconnect event may fire DURING the 150ms wait, invalidating the port
+                        if *self.probing_interrupted.borrow() {
+                            web_sys::console::warn_1(
+                                &"DEBUG: Disconnect occurred during cleanup wait - port is stale"
+                                    .into(),
+                            );
+                            *self.probing_interrupted.borrow_mut() = false; // Clear flag
+
+                            // Use the polling logic to get fresh port
+                            let Some(window) = web_sys::window() else {
+                                self.set_status
+                                    .set("Connection Failed: window not available".into());
+                                return Err("Window not available".to_string());
+                            };
+                            let nav = window.navigator();
+                            let serial = nav.serial();
+
+                            web_sys::console::log_1(
+                                &"DEBUG: Polling for device re-enumeration (max 3 seconds)".into(),
+                            );
+
+                            // Poll get_ports() up to 15 times (200ms interval = 3 seconds total)
+                            let mut fresh_port: Option<web_sys::SerialPort> = None;
+                            for attempt in 1..=15 {
+                                match wasm_bindgen_futures::JsFuture::from(serial.get_ports()).await
+                                {
+                                    Ok(ports_val) => {
+                                        let ports: js_sys::Array = ports_val.unchecked_into();
+                                        if ports.length() > 0 {
+                                            fresh_port = Some(ports.get(0).unchecked_into());
+                                            web_sys::console::log_1(
+                                                &format!(
+                                                    "DEBUG: Device re-enumerated after {}ms \
+                                                     (attempt {})",
+                                                    attempt * 200,
+                                                    attempt
+                                                )
+                                                .into(),
+                                            );
+                                            break;
+                                        }
+                                    }
+                                    Err(e) => {
+                                        web_sys::console::log_1(
+                                            &format!("DEBUG: Failed to get ports: {:?}", e).into(),
+                                        );
+                                        self.set_status
+                                            .set("Connection Failed: Cannot access ports".into());
+                                        return Err("Cannot access ports".to_string());
+                                    }
+                                }
+
+                                // Wait 200ms before next attempt
+                                let _ = wasm_bindgen_futures::JsFuture::from(
+                                    js_sys::Promise::new(&mut |r, _| {
+                                        if let Some(window) = web_sys::window() {
+                                            let _ = window
+                                                .set_timeout_with_callback_and_timeout_and_arguments_0(
+                                                    &r, 200,
+                                                );
+                                        }
+                                    }),
+                                )
+                                .await;
+                            }
+
+                            if let Some(port_fresh) = fresh_port {
+                                // Wait for port to be ready
+                                web_sys::console::log_1(
+                                    &"DEBUG: Waiting 200ms for port to be ready".into(),
+                                );
+                                let _ = wasm_bindgen_futures::JsFuture::from(
+                                    js_sys::Promise::new(&mut |r, _| {
+                                        if let Some(window) = web_sys::window() {
+                                            let _ = window
+                                                .set_timeout_with_callback_and_timeout_and_arguments_0(
+                                                    &r, 200,
+                                                );
+                                        }
+                                    }),
+                                )
+                                .await;
+                                (port_fresh, b, f, Some(buf), proto)
+                            } else {
+                                web_sys::console::log_1(
+                                    &"DEBUG: Device not re-enumerated after 3 seconds".into(),
+                                );
+                                self.set_status
+                                    .set("Connection Failed: Device not found".into());
+                                return Err("Device not found after disconnect".to_string());
+                            }
+                        } else {
+                            // No interrupt - use original port
+                            (port, b, f, Some(buf), proto)
+                        }
                     }
-                }))
-                .await;
-
-                (b, f, Some(buf), proto)
-            } else {
-                (baud, framing.to_string(), None, None)
-            };
+                } else {
+                    (port, baud, framing.to_string(), None, None)
+                };
 
             // Switch Decoder if detected
             if let Some(p) = detected_proto {
                 self.set_decoder(p);
             }
 
-            self.connect_impl(port, final_baud, &final_framing_str, initial_buffer)
+            self.connect_impl(final_port, final_baud, &final_framing_str, initial_buffer)
                 .await
         };
 
@@ -254,6 +548,15 @@ impl ConnectionManager {
     }
 
     pub async fn disconnect(&self) -> bool {
+        // Only allow disconnect from certain states
+        let current_state = self.state.get_untracked();
+        if !current_state.can_disconnect() {
+            web_sys::console::log_1(
+                &format!("Disconnect not allowed from state {:?}", current_state).into(),
+            );
+            return false;
+        }
+
         // Atomic test-and-set for disconnect guard
         if self
             .is_disconnecting
@@ -267,30 +570,50 @@ impl ConnectionManager {
         // Mark this as user-initiated disconnect
         *self.user_initiated_disconnect.borrow_mut() = true;
 
-        self.set_status.set("Disconnecting...".into());
+        // Transition to Disconnecting state
+        self.transition_to(ConnectionState::Disconnecting);
 
-        // Send stop command to read loop (non-blocking!)
+        // Send stop command to read loop and wait for completion
         let handle = self.connection_handle.borrow_mut().take();
         if let Some(h) = handle {
+            web_sys::console::log_1(&"DEBUG: Sending Stop command to read loop".into());
             let _ = h.cmd_tx.unbounded_send(ConnectionCommand::Stop);
 
-            // Wait briefly for graceful shutdown
-            let _ = wasm_bindgen_futures::JsFuture::from(js_sys::Promise::new(&mut |r, _| {
-                if let Some(window) = web_sys::window() {
-                    let _ = window.set_timeout_with_callback_and_timeout_and_arguments_0(&r, 200);
+            // Wait for read loop to fully exit and drop transport (releases stream locks)
+            web_sys::console::log_1(&"DEBUG: Waiting for read loop to release streams...".into());
+            match h.completion_rx.await {
+                Ok(_) => {
+                    web_sys::console::log_1(&"DEBUG: Read loop completed, streams released".into());
                 }
-            }))
-            .await;
+                Err(_) => {
+                    web_sys::console::log_1(
+                        &"WARN: Read loop completion signal dropped (loop may have panicked)"
+                            .into(),
+                    );
+                }
+            }
         }
 
-        // Clear port
-        *self.active_port.borrow_mut() = None;
-        self.set_connected.set(false);
-        self.set_status.set("Ready to connect".into());
+        // Clear the port reference
+        // Note: port.close() is already called by transport.close() in the read loop
+        self.active_port.borrow_mut().take();
 
-        // Clear auto-reconnecting flag if it was set
-        // This is important when user cancels auto-reconnect by clicking disconnect
-        self.set_is_auto_reconnecting.set(false);
+        // Clear VID/PID to prevent auto-reconnect after user-initiated disconnect
+        // This is critical: when disconnect() is called from DeviceLost state, the device
+        // is already physically gone, so ondisconnect event won't fire to clear VID/PID.
+        // We must clear them here to prevent auto-reconnect when cable is replugged.
+        if let Some(set_vid) = *self.set_last_vid.borrow() {
+            set_vid.set(None);
+        }
+        if let Some(set_pid) = *self.set_last_pid.borrow() {
+            set_pid.set(None);
+        }
+        web_sys::console::log_1(
+            &"DEBUG: Cleared VID/PID in disconnect() to prevent auto-reconnect".into(),
+        );
+
+        // Transition to Disconnected state
+        self.transition_to(ConnectionState::Disconnected);
 
         // Wait a tiny bit to ensure retry loop has time to detect the flag before we reset it
         // This prevents race condition where disconnect() resets flag before retry loop sees it
@@ -340,12 +663,13 @@ impl ConnectionManager {
 
     // Reconfigure = Disconnect + Connect with Transaction Safety
     pub async fn reconfigure(&self, baud: u32, framing: &str) {
-        if !self.connected.get_untracked() {
+        // Only allow reconfigure if currently connected
+        if self.state.get_untracked() != ConnectionState::Connected {
             return;
         }
 
-        self.set_is_reconfiguring.set(true);
-        self.set_status.set("Reconfiguring...".into());
+        // Transition to Reconfiguring state
+        self.transition_to(ConnectionState::Reconfiguring);
 
         // Capture state before disconnect for potential rollback
         let snapshot = self.capture_state();
@@ -355,7 +679,7 @@ impl ConnectionManager {
 
         // Try disconnect
         if !self.disconnect().await {
-            self.set_is_reconfiguring.set(false);
+            // disconnect() already transitioned to appropriate state
             return;
         }
 
@@ -379,7 +703,8 @@ impl ConnectionManager {
                     let (b, f, buf, proto) = self.detect_config(port.clone(), framing).await;
                     // RACE CHECK: If disconnected during detection, abort
                     if self.active_port.borrow().is_none() {
-                        self.set_is_reconfiguring.set(false);
+                        // Transition to Disconnected state on abort
+                        self.transition_to(ConnectionState::Disconnected);
                         return;
                     }
                     (b, f, Some(buf), proto)
@@ -404,32 +729,34 @@ impl ConnectionManager {
                 .await
             {
                 Ok(_) => {
+                    // connect_impl already transitioned to Connected
+                    // Just update the status message
                     self.set_status.set("Reconfigured".into());
                 }
                 Err(e) => {
                     // Restore UI state (actual connection cannot be restored)
                     web_sys::console::error_1(&format!("Reconfigure failed: {}", e).into());
                     self.rollback_state(snapshot).await;
+                    // Transition to Disconnected state on failure
+                    self.transition_to(ConnectionState::Disconnected);
                     self.set_status.set(format!(
                         "Reconfigure failed: {}. Please reconnect manually.",
                         e
                     ));
                 }
             }
+        } else {
+            // No port available, transition to Disconnected
+            self.transition_to(ConnectionState::Disconnected);
         }
-
-        self.set_is_reconfiguring.set(false);
     }
 
     fn spawn_read_loop(
         &self,
-        transport: WebSerialTransport,
+        mut transport: WebSerialTransport,
         mut cmd_rx: mpsc::UnboundedReceiver<ConnectionCommand>,
+        completion_tx: oneshot::Sender<()>,
     ) {
-        let connected_signal = self.connected;
-        let set_connected = self.set_connected;
-        let set_status = self.set_status;
-        let is_reconf = self.is_reconfiguring;
         let worker_signal = self.worker;
         let manager = self.clone();
 
@@ -487,11 +814,25 @@ impl ConnectionManager {
 
             web_sys::console::log_1(&"DEBUG: Read Loop EXITED".into());
 
+            // CRITICAL: Call transport.close() to properly release reader/writer locks
+            // Just dropping the transport doesn't call the JavaScript cancel/close methods
+            web_sys::console::log_1(
+                &"DEBUG: Calling transport.close() to release streams...".into(),
+            );
+            let _ = transport.close().await;
+            web_sys::console::log_1(&"DEBUG: Transport closed, streams released".into());
+
             // Loop exited - notify manager of disconnection
-            if connected_signal.get_untracked() && !is_reconf.get_untracked() {
-                set_status.set("Device Lost".into());
-                set_connected.set(false);
+            // Only transition to DeviceLost if we were Connected (not reconfiguring)
+            let current_state = manager.state.get_untracked();
+            if current_state == ConnectionState::Connected {
+                // Transition to DeviceLost state
+                manager.transition_to(ConnectionState::DeviceLost);
             }
+
+            // Signal completion - streams are now released and port can be closed
+            let _ = completion_tx.send(());
+            web_sys::console::log_1(&"DEBUG: Read loop completion signaled".into());
         });
     }
 
@@ -504,15 +845,20 @@ impl ConnectionManager {
         }
     }
     pub async fn write(&self, data: &[u8]) -> Result<(), String> {
-        let handle = self.connection_handle.borrow().clone();
+        // Clone only the cmd_tx sender (which is Clone), not the entire handle
+        let cmd_tx = self
+            .connection_handle
+            .borrow()
+            .as_ref()
+            .map(|h| h.cmd_tx.clone());
 
-        if let Some(h) = handle {
-            let (tx, rx) = oneshot::channel();
+        if let Some(tx) = cmd_tx {
+            let (response_tx, rx) = oneshot::channel();
 
-            if h.cmd_tx
+            if tx
                 .unbounded_send(ConnectionCommand::Write {
                     data: data.to_vec(),
-                    response: tx,
+                    response: response_tx,
                 })
                 .is_err()
             {
@@ -673,8 +1019,8 @@ impl ConnectionManager {
         port: web_sys::SerialPort,
         current_framing: &str,
     ) -> (u32, String, Vec<u8>, Option<String>) {
-        // CRITICAL: Set probing flag to ignore disconnect events during auto-detection
-        self.set_is_probing.set(true);
+        // State machine already in Probing state (set by connect())
+        // ondisconnect handler will ignore disconnects during Probing
 
         let baud_candidates = vec![
             115200, 1500000, 1000000, 2000000, 921600, 57600, 460800, 230400, 38400, 19200, 9600,
@@ -822,8 +1168,7 @@ impl ConnectionManager {
             best_rate, best_framing, best_score
         ));
 
-        // Clear probing flag
-        self.set_is_probing.set(false);
+        // State will be transitioned to Connecting/Connected by caller (connect_impl)
 
         (best_rate, best_framing, best_buffer, best_proto)
     }
@@ -1071,21 +1416,25 @@ impl ConnectionManager {
                     // CREATE channel for commands
                     let (cmd_tx, cmd_rx) = mpsc::unbounded();
 
+                    // CREATE oneshot channel for read loop completion signal
+                    let (completion_tx, completion_rx) = oneshot::channel();
+
                     // Store handle
                     *self.connection_handle.borrow_mut() = Some(ConnectionHandle {
                         cmd_tx: cmd_tx.clone(),
+                        completion_rx,
                     });
                     *self.active_port.borrow_mut() = Some(port);
 
-                    self.set_connected.set(true);
-                    self.set_status.set("Connected".into());
+                    // Transition to Connected state
+                    self.transition_to(ConnectionState::Connected);
 
                     // Update detected config for UI
                     self.set_detected_baud.set(baud);
                     self.set_detected_framing.set(framing.to_string());
 
-                    // Spawn read loop with command channel
-                    self.spawn_read_loop(t, cmd_rx);
+                    // Spawn read loop with command channel and completion signal
+                    self.spawn_read_loop(t, cmd_rx, completion_tx);
 
                     // Notify Worker
                     self.send_worker_config(baud);
@@ -1171,10 +1520,12 @@ impl ConnectionManager {
         detected_baud: Signal<u32>,
         framing_signal: Signal<String>,
     ) {
+        // Store VID/PID write signals for use in disconnect()
+        *self.set_last_vid.borrow_mut() = Some(set_last_vid);
+        *self.set_last_pid.borrow_mut() = Some(set_last_pid);
+
         let manager_conn = self.clone();
         let manager_disc = self.clone();
-        let is_reconfiguring = self.is_reconfiguring;
-        let is_probing = self.is_probing;
 
         let on_connect_closure = Closure::wrap(Box::new(move |_e: web_sys::Event| {
             let t_onconnect = js_sys::Date::now();
@@ -1256,9 +1607,8 @@ impl ConnectionManager {
                                     )
                                     .into(),
                                 );
-                                manager_conn
-                                    .set_status
-                                    .set("Device found. Auto-reconnecting...".into());
+                                // Transition to AutoReconnecting state
+                                manager_conn.transition_to(ConnectionState::AutoReconnecting);
 
                                 // We reuse the `options` / `baud`
                                 // Use default framing for auto-reconnect (or derived from valid
@@ -1402,11 +1752,10 @@ impl ConnectionManager {
                                             )
                                             .into(),
                                         );
-                                        // Manual status update for "Restored" vs just "Connected"
+                                        // connect() already transitioned to Connected
+                                        // Just update the status message for "Restored" vs
+                                        // "Connected"
                                         manager_conn.set_status.set("Restored Connection".into());
-                                        // Clear auto-reconnecting flag since we successfully
-                                        // reconnected
-                                        manager_conn.set_is_auto_reconnecting.set(false);
                                     }
                                 });
                                 return; // Stop checking
@@ -1426,8 +1775,9 @@ impl ConnectionManager {
                             .into(),
                         );
 
-                        // Set auto-reconnecting flag for UI visual feedback (status light blink)
-                        manager_conn.set_is_auto_reconnecting.set(true);
+                        // Transition to AutoReconnecting state for UI visual feedback (pulsing
+                        // orange light)
+                        manager_conn.transition_to(ConnectionState::AutoReconnecting);
 
                         // PERFORMANCE FIX: Retry up to 200 times with 50ms intervals (10000ms max)
                         // Extended from 120 retries (6s) to handle worst-case OS device
@@ -1453,7 +1803,8 @@ impl ConnectionManager {
                                     )
                                     .into(),
                                 );
-                                manager_conn.set_is_auto_reconnecting.set(false);
+                                // Transition back to DeviceLost (will be updated by other path)
+                                manager_conn.transition_to(ConnectionState::DeviceLost);
                                 return;
                             }
 
@@ -1462,7 +1813,8 @@ impl ConnectionManager {
                                 web_sys::console::log_1(
                                     &"[Auto-reconnect] Aborted by user disconnect".into(),
                                 );
-                                manager_conn.set_is_auto_reconnecting.set(false);
+                                // Transition to Disconnected state
+                                manager_conn.transition_to(ConnectionState::Disconnected);
                                 // Clear last_vid/last_pid to prevent auto-reconnect on next
                                 // insertion This mimics the
                                 // behavior of ondisconnect handler for user-initiated disconnects
@@ -1541,9 +1893,9 @@ impl ConnectionManager {
                                         );
 
                                         // Same reconnection logic as above
+                                        // Transition to AutoReconnecting state
                                         manager_conn
-                                            .set_status
-                                            .set("Device found. Auto-reconnecting...".into());
+                                            .transition_to(ConnectionState::AutoReconnecting);
 
                                         let user_pref_baud = baud_signal.get_untracked();
                                         let last_known_baud = detected_baud.get_untracked();
@@ -1565,13 +1917,6 @@ impl ConnectionManager {
 
                                         let manager_conn_clone = manager_conn.clone();
                                         spawn_local(async move {
-                                            // Ensure auto-reconnecting flag is cleared on exit
-                                            let _guard = scopeguard::guard((), |_| {
-                                                manager_conn_clone
-                                                    .set_is_auto_reconnecting
-                                                    .set(false);
-                                            });
-
                                             // Check if already connecting (without holding lock)
                                             if manager_conn_clone
                                                 .is_connecting
@@ -1679,14 +2024,12 @@ impl ConnectionManager {
                                                     )
                                                     .into(),
                                                 );
+                                                // connect() already transitioned to Connected
+                                                // Just update the status message for "Restored" vs
+                                                // "Connected"
                                                 manager_conn_clone
                                                     .set_status
                                                     .set("Restored Connection".into());
-                                                // Clear auto-reconnecting flag since we
-                                                // successfully reconnected
-                                                manager_conn_clone
-                                                    .set_is_auto_reconnecting
-                                                    .set(false);
                                             }
                                         });
                                         return;
@@ -1695,8 +2038,8 @@ impl ConnectionManager {
                             }
                         }
 
-                        // Clear auto-reconnecting flag after retry loop ends
-                        manager_conn.set_is_auto_reconnecting.set(false);
+                        // Transition back to DeviceLost after retry loop ends
+                        manager_conn.transition_to(ConnectionState::DeviceLost);
 
                         web_sys::console::log_1(
                             &format!(
@@ -1719,13 +2062,22 @@ impl ConnectionManager {
         let on_disconnect_closure = Closure::wrap(Box::new(move |_e: web_sys::Event| {
             web_sys::console::log_1(&"DEBUG: serial.ondisconnect triggered".into());
 
-            if is_reconfiguring.get_untracked() {
-                web_sys::console::log_1(&"DEBUG: ignoring disconnect (reconfiguring)".into());
+            // Ignore disconnect events during reconfiguring
+            let current_state = manager_disc.state.get_untracked();
+            if current_state == ConnectionState::Reconfiguring {
+                web_sys::console::log_1(
+                    &format!("DEBUG: ignoring disconnect (state: {:?})", current_state).into(),
+                );
                 return;
             }
 
-            if is_probing.get_untracked() {
-                web_sys::console::log_1(&"DEBUG: ignoring disconnect (probing)".into());
+            // Track disconnect events during probing (don't change state, but flag for cleanup)
+            if current_state == ConnectionState::Probing {
+                web_sys::console::warn_1(
+                    &"DEBUG: ondisconnect fired during Probing - marking probe as interrupted"
+                        .into(),
+                );
+                *manager_disc.probing_interrupted.borrow_mut() = true;
                 return;
             }
 
@@ -1739,7 +2091,8 @@ impl ConnectionManager {
                 // Clear last_vid/last_pid to prevent auto-reconnect
                 set_last_vid.set(None);
                 set_last_pid.set(None);
-                manager_disc.set_status.set("Disconnected".into());
+                // Transition to Disconnected state
+                manager_disc.transition_to(ConnectionState::Disconnected);
                 // Reset the flag for next time
                 *manager_disc.user_initiated_disconnect.borrow_mut() = false;
             } else {
@@ -1747,15 +2100,12 @@ impl ConnectionManager {
                     &"DEBUG: Device disconnected (not user-initiated) - will auto-reconnect".into(),
                 );
                 // Keep last_vid/last_pid to enable auto-reconnect
-                manager_disc
-                    .set_status
-                    .set("Device Lost (waiting for device...)".into());
+                // Transition to DeviceLost state
+                manager_disc.transition_to(ConnectionState::DeviceLost);
                 // Don't set is_auto_reconnecting yet - wait for retry loop to start
                 // This creates steady orange light while waiting for device insertion
                 // Once device is inserted and retry loop starts, it will pulse
             }
-
-            manager_disc.set_connected.set(false);
         }) as Box<dyn FnMut(_)>);
 
         // Attach listeners
