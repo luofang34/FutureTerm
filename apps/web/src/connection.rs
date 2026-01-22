@@ -66,8 +66,9 @@ impl ConnectionState {
     /// What color should the status indicator be?
     pub fn indicator_color(&self) -> &'static str {
         match self {
-            Self::Connected => "rgb(95, 200, 85)", // Green
-            Self::Disconnected | Self::DeviceLost => "rgb(240, 105, 95)", // Red
+            Self::Connected => "rgb(95, 200, 85)",         // Green
+            Self::Disconnected => "rgb(240, 105, 95)",     // Red
+            Self::DeviceLost => "rgb(245, 190, 80)",       // Orange steady (waiting for device)
             Self::AutoReconnecting => "rgb(245, 190, 80)", // Orange (pulsing)
             Self::Connecting | Self::Probing | Self::Reconfiguring | Self::Disconnecting => {
                 "rgb(245, 190, 80)" // Orange (steady)
@@ -600,8 +601,18 @@ impl ConnectionManager {
         // Mark this as user-initiated disconnect
         *self.user_initiated_disconnect.borrow_mut() = true;
 
-        // Transition to Disconnecting state
-        self.transition_to(ConnectionState::Disconnecting);
+        // Transition to appropriate state based on current state
+        // DeviceLost/AutoReconnecting: Device already gone, skip to Disconnected
+        // Connected: Transition through Disconnecting for proper cleanup
+        let device_already_gone = matches!(
+            current_state,
+            ConnectionState::DeviceLost | ConnectionState::AutoReconnecting
+        );
+
+        if !device_already_gone {
+            // Normal disconnect: transition through Disconnecting state
+            self.transition_to(ConnectionState::Disconnecting);
+        }
 
         // Send stop command to read loop and wait for completion
         let handle = self.connection_handle.borrow_mut().take();
