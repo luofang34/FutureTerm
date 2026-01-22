@@ -45,6 +45,7 @@ macro_rules! warn_log {
 }
 
 /// Error logging - always enabled
+#[allow(unused_macros)]
 macro_rules! error_log {
     ($($arg:tt)*) => {
         web_sys::console::error_1(&format!($($arg)*).into())
