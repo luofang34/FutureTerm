@@ -353,6 +353,84 @@ impl ConnectionManager {
         self.status
     }
 
+    /// Helper: Poll for device re-enumeration after disconnect events
+    /// Uses adaptive polling intervals for optimal performance
+    async fn poll_for_device_reenumeration(&self) -> Result<web_sys::SerialPort, String> {
+        let Some(window) = web_sys::window() else {
+            return Err("Window not available".to_string());
+        };
+        let nav = window.navigator();
+        let serial = nav.serial();
+
+        web_sys::console::log_1(&"DEBUG: Polling for device re-enumeration (max 3.5 seconds)".into());
+
+        // OPTIMIZATION: Adaptive polling intervals
+        // Devices typically re-enumerate within 500-1000ms, so use faster polling initially
+        // First 5 attempts: 100ms (0-500ms)
+        // Next 5 attempts: 200ms (500-1500ms)
+        // Final 5 attempts: 400ms (1500-3500ms)
+        let mut fresh_port: Option<web_sys::SerialPort> = None;
+        let mut elapsed_ms = 0;
+
+        for attempt in 1..=15 {
+            match wasm_bindgen_futures::JsFuture::from(serial.get_ports()).await {
+                Ok(ports_val) => {
+                    let ports: js_sys::Array = ports_val.unchecked_into();
+                    if ports.length() > 0 {
+                        fresh_port = Some(ports.get(0).unchecked_into());
+                        web_sys::console::log_1(
+                            &format!(
+                                "DEBUG: Device re-enumerated after {}ms (attempt {})",
+                                elapsed_ms, attempt
+                            )
+                            .into(),
+                        );
+                        break;
+                    }
+                }
+                Err(e) => {
+                    web_sys::console::log_1(
+                        &format!("DEBUG: Failed to get ports: {:?}", e).into(),
+                    );
+                    return Err("Cannot access ports".to_string());
+                }
+            }
+
+            // Adaptive wait interval based on attempt number
+            let wait_ms = if attempt <= 5 {
+                100 // Fast polling for first 500ms
+            } else if attempt <= 10 {
+                200 // Medium polling for next 1000ms
+            } else {
+                400 // Slow polling for final 2000ms
+            };
+
+            elapsed_ms += wait_ms;
+
+            let _ = wasm_bindgen_futures::JsFuture::from(js_sys::Promise::new(&mut |r, _| {
+                if let Some(window) = web_sys::window() {
+                    let _ = window.set_timeout_with_callback_and_timeout_and_arguments_0(&r, wait_ms);
+                }
+            }))
+            .await;
+        }
+
+        if let Some(port) = fresh_port {
+            // Wait a bit more for port to be fully ready
+            web_sys::console::log_1(&"DEBUG: Waiting 200ms for port to be ready".into());
+            let _ = wasm_bindgen_futures::JsFuture::from(js_sys::Promise::new(&mut |r, _| {
+                if let Some(window) = web_sys::window() {
+                    let _ = window.set_timeout_with_callback_and_timeout_and_arguments_0(&r, 200);
+                }
+            }))
+            .await;
+            Ok(port)
+        } else {
+            web_sys::console::log_1(&"DEBUG: Device not re-enumerated after 3 seconds".into());
+            Err("Device not found after disconnect".to_string())
+        }
+    }
+
     // Async Connect
     pub async fn connect(
         &self,
@@ -382,17 +460,16 @@ impl ConnectionManager {
             return Err("Already connected".to_string());
         }
 
-        // Transition to appropriate state based on whether we're probing
+        // Reset probing interrupt flag if auto-detecting baud rate
         if baud == 0 {
-            // Auto-detect baud rate - transition to Probing state
-            *self.probing_interrupted.borrow_mut() = false; // Reset flag
-            self.transition_to(ConnectionState::Probing);
-        } else {
-            // Specific baud rate - transition to Connecting state
-            self.transition_to(ConnectionState::Connecting);
+            *self.probing_interrupted.borrow_mut() = false;
         }
 
         let result = if baud > 0 && framing == "Auto" {
+            // Smart framing detection with specific baud rate
+            // State transition: Disconnected → Connecting
+            self.transition_to(ConnectionState::Connecting);
+
             let (detect_framing, initial_buf, proto) =
                 self.smart_probe_framing(port.clone(), baud).await;
 
@@ -400,14 +477,16 @@ impl ConnectionManager {
                 self.set_decoder(p);
             }
 
-            // Note: State is already Connecting (set at line 392), so no transition needed here
-
             self.connect_impl(port, baud, &detect_framing, Some(initial_buf))
                 .await
         } else {
-            // Auto-Detect if Baud is 0
+            // Auto-Detect if Baud is 0, or direct connection with specific baud
             let (final_port, final_baud, final_framing_str, initial_buffer, detected_proto) =
                 if baud == 0 {
+                    // Auto-detect baud rate and framing
+                    // State transition: Disconnected → Probing
+                    self.transition_to(ConnectionState::Probing);
+
                     let (b, f, buf, proto) = self.detect_config(port.clone(), framing).await;
 
                     // Check if probing was interrupted by ondisconnect events
@@ -422,104 +501,14 @@ impl ConnectionManager {
 
                         // CRITICAL FIX: When ondisconnect fires during probing, the port reference
                         // becomes invalid. We need to wait for the browser to re-enumerate the
-                        // device and get a fresh port reference. The
-                        // onconnect event may fire with variable timing, so
-                        // we poll get_ports() with retries.
-
-                        let Some(window) = web_sys::window() else {
-                            self.set_status
-                                .set("Connection Failed: window not available".into());
-                            return Err("Window not available".to_string());
-                        };
-                        let nav = window.navigator();
-                        let serial = nav.serial();
-
-                        web_sys::console::log_1(
-                            &"DEBUG: Polling for device re-enumeration (max 3.5 seconds)".into(),
-                        );
-
-                        // OPTIMIZATION: Adaptive polling intervals
-                        // Devices typically re-enumerate within 500-1000ms, so use faster polling
-                        // initially First 5 attempts: 100ms (0-500ms)
-                        // Next 5 attempts: 200ms (500-1500ms)
-                        // Final 5 attempts: 400ms (1500-3500ms)
-                        let mut fresh_port: Option<web_sys::SerialPort> = None;
-                        let mut elapsed_ms = 0;
-                        for attempt in 1..=15 {
-                            match wasm_bindgen_futures::JsFuture::from(serial.get_ports()).await {
-                                Ok(ports_val) => {
-                                    let ports: js_sys::Array = ports_val.unchecked_into();
-                                    if ports.length() > 0 {
-                                        fresh_port = Some(ports.get(0).unchecked_into());
-                                        web_sys::console::log_1(
-                                            &format!(
-                                                "DEBUG: Device re-enumerated after {}ms (attempt \
-                                                 {})",
-                                                elapsed_ms, attempt
-                                            )
-                                            .into(),
-                                        );
-                                        break;
-                                    }
-                                }
-                                Err(e) => {
-                                    web_sys::console::log_1(
-                                        &format!("DEBUG: Failed to get ports: {:?}", e).into(),
-                                    );
-                                    self.set_status
-                                        .set("Connection Failed: Cannot access ports".into());
-                                    return Err("Cannot access ports".to_string());
-                                }
+                        // device and get a fresh port reference.
+                        match self.poll_for_device_reenumeration().await {
+                            Ok(port) => (port, b, f, Some(buf), proto),
+                            Err(e) => {
+                                self.set_status
+                                    .set(format!("Connection Failed: {}", e));
+                                return Err(e);
                             }
-
-                            // Adaptive wait interval based on attempt number
-                            let wait_ms = if attempt <= 5 {
-                                100 // Fast polling for first 500ms
-                            } else if attempt <= 10 {
-                                200 // Medium polling for next 1000ms
-                            } else {
-                                400 // Slow polling for final 2000ms
-                            };
-
-                            elapsed_ms += wait_ms;
-
-                            let _ = wasm_bindgen_futures::JsFuture::from(js_sys::Promise::new(
-                                &mut |r, _| {
-                                    if let Some(window) = web_sys::window() {
-                                        let _ = window
-                                            .set_timeout_with_callback_and_timeout_and_arguments_0(
-                                                &r, wait_ms,
-                                            );
-                                    }
-                                },
-                            ))
-                            .await;
-                        }
-
-                        if let Some(port) = fresh_port {
-                            // Wait a bit more for port to be fully ready
-                            web_sys::console::log_1(
-                                &"DEBUG: Waiting 200ms for port to be ready".into(),
-                            );
-                            let _ = wasm_bindgen_futures::JsFuture::from(js_sys::Promise::new(
-                                &mut |r, _| {
-                                    if let Some(window) = web_sys::window() {
-                                        let _ = window
-                                            .set_timeout_with_callback_and_timeout_and_arguments_0(
-                                                &r, 200,
-                                            );
-                                    }
-                                },
-                            ))
-                            .await;
-                            (port, b, f, Some(buf), proto)
-                        } else {
-                            web_sys::console::log_1(
-                                &"DEBUG: Device not re-enumerated after 3 seconds".into(),
-                            );
-                            self.set_status
-                                .set("Connection Failed: Device not found".into());
-                            return Err("Device not found after disconnect".to_string());
                         }
                     } else {
                         // CRITICAL FIX: Wait for OS to fully release port after probing
@@ -548,103 +537,14 @@ impl ConnectionManager {
                             );
                             *self.probing_interrupted.borrow_mut() = false; // Clear flag
 
-                            // Use the polling logic to get fresh port
-                            let Some(window) = web_sys::window() else {
-                                self.set_status
-                                    .set("Connection Failed: window not available".into());
-                                return Err("Window not available".to_string());
-                            };
-                            let nav = window.navigator();
-                            let serial = nav.serial();
-
-                            web_sys::console::log_1(
-                                &"DEBUG: Polling for device re-enumeration (max 3.5 seconds)"
-                                    .into(),
-                            );
-
-                            // OPTIMIZATION: Adaptive polling intervals
-                            // Devices typically re-enumerate within 500-1000ms, so use faster
-                            // polling initially First 5 attempts: 100ms (0-500ms)
-                            // Next 5 attempts: 200ms (500-1500ms)
-                            // Final 5 attempts: 400ms (1500-3500ms)
-                            let mut fresh_port: Option<web_sys::SerialPort> = None;
-                            let mut elapsed_ms = 0;
-                            for attempt in 1..=15 {
-                                match wasm_bindgen_futures::JsFuture::from(serial.get_ports()).await
-                                {
-                                    Ok(ports_val) => {
-                                        let ports: js_sys::Array = ports_val.unchecked_into();
-                                        if ports.length() > 0 {
-                                            fresh_port = Some(ports.get(0).unchecked_into());
-                                            web_sys::console::log_1(
-                                                &format!(
-                                                    "DEBUG: Device re-enumerated after {}ms \
-                                                     (attempt {})",
-                                                    elapsed_ms, attempt
-                                                )
-                                                .into(),
-                                            );
-                                            break;
-                                        }
-                                    }
-                                    Err(e) => {
-                                        web_sys::console::log_1(
-                                            &format!("DEBUG: Failed to get ports: {:?}", e).into(),
-                                        );
-                                        self.set_status
-                                            .set("Connection Failed: Cannot access ports".into());
-                                        return Err("Cannot access ports".to_string());
-                                    }
+                            // Use helper method to poll for fresh port
+                            match self.poll_for_device_reenumeration().await {
+                                Ok(port_fresh) => (port_fresh, b, f, Some(buf), proto),
+                                Err(e) => {
+                                    self.set_status
+                                        .set(format!("Connection Failed: {}", e));
+                                    return Err(e);
                                 }
-
-                                // Adaptive wait interval based on attempt number
-                                let wait_ms = if attempt <= 5 {
-                                    100 // Fast polling for first 500ms
-                                } else if attempt <= 10 {
-                                    200 // Medium polling for next 1000ms
-                                } else {
-                                    400 // Slow polling for final 2000ms
-                                };
-
-                                elapsed_ms += wait_ms;
-
-                                let _ = wasm_bindgen_futures::JsFuture::from(
-                                    js_sys::Promise::new(&mut |r, _| {
-                                        if let Some(window) = web_sys::window() {
-                                            let _ = window
-                                                .set_timeout_with_callback_and_timeout_and_arguments_0(
-                                                    &r, wait_ms,
-                                                );
-                                        }
-                                    }),
-                                )
-                                .await;
-                            }
-
-                            if let Some(port_fresh) = fresh_port {
-                                // Wait for port to be ready
-                                web_sys::console::log_1(
-                                    &"DEBUG: Waiting 200ms for port to be ready".into(),
-                                );
-                                let _ = wasm_bindgen_futures::JsFuture::from(
-                                    js_sys::Promise::new(&mut |r, _| {
-                                        if let Some(window) = web_sys::window() {
-                                            let _ = window
-                                                .set_timeout_with_callback_and_timeout_and_arguments_0(
-                                                    &r, 200,
-                                                );
-                                        }
-                                    }),
-                                )
-                                .await;
-                                (port_fresh, b, f, Some(buf), proto)
-                            } else {
-                                web_sys::console::log_1(
-                                    &"DEBUG: Device not re-enumerated after 3 seconds".into(),
-                                );
-                                self.set_status
-                                    .set("Connection Failed: Device not found".into());
-                                return Err("Device not found after disconnect".to_string());
                             }
                         } else {
                             // No interrupt - use original port
@@ -660,10 +560,11 @@ impl ConnectionManager {
                 self.set_decoder(p);
             }
 
-            // CRITICAL: Transition from Probing to Connecting before connect_impl()
-            // This ensures proper state machine flow: Probing → Connecting → Connected
-            // Without this, we'd have invalid Probing → Connected transition
-            if self.state.get_untracked() == ConnectionState::Probing {
+            // CRITICAL: Transition to Connecting before connect_impl()
+            // - If we were Probing (baud == 0 path), transition: Probing → Connecting
+            // - If we're still Disconnected (direct connection path), transition: Disconnected → Connecting
+            let current_state = self.state.get_untracked();
+            if current_state == ConnectionState::Probing || current_state == ConnectionState::Disconnected {
                 self.transition_to(ConnectionState::Connecting);
             }
 
