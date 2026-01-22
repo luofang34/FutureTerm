@@ -344,11 +344,16 @@ impl ConnectionManager {
                         let serial = nav.serial();
 
                         web_sys::console::log_1(
-                            &"DEBUG: Polling for device re-enumeration (max 3 seconds)".into(),
+                            &"DEBUG: Polling for device re-enumeration (max 3.5 seconds)".into(),
                         );
 
-                        // Poll get_ports() up to 15 times (200ms interval = 3 seconds total)
+                        // OPTIMIZATION: Adaptive polling intervals
+                        // Devices typically re-enumerate within 500-1000ms, so use faster polling
+                        // initially First 5 attempts: 100ms (0-500ms)
+                        // Next 5 attempts: 200ms (500-1500ms)
+                        // Final 5 attempts: 400ms (1500-3500ms)
                         let mut fresh_port: Option<web_sys::SerialPort> = None;
+                        let mut elapsed_ms = 0;
                         for attempt in 1..=15 {
                             match wasm_bindgen_futures::JsFuture::from(serial.get_ports()).await {
                                 Ok(ports_val) => {
@@ -359,8 +364,7 @@ impl ConnectionManager {
                                             &format!(
                                                 "DEBUG: Device re-enumerated after {}ms (attempt \
                                                  {})",
-                                                attempt * 200,
-                                                attempt
+                                                elapsed_ms, attempt
                                             )
                                             .into(),
                                         );
@@ -377,13 +381,23 @@ impl ConnectionManager {
                                 }
                             }
 
-                            // Wait 200ms before next attempt
+                            // Adaptive wait interval based on attempt number
+                            let wait_ms = if attempt <= 5 {
+                                100 // Fast polling for first 500ms
+                            } else if attempt <= 10 {
+                                200 // Medium polling for next 1000ms
+                            } else {
+                                400 // Slow polling for final 2000ms
+                            };
+
+                            elapsed_ms += wait_ms;
+
                             let _ = wasm_bindgen_futures::JsFuture::from(js_sys::Promise::new(
                                 &mut |r, _| {
                                     if let Some(window) = web_sys::window() {
                                         let _ = window
                                             .set_timeout_with_callback_and_timeout_and_arguments_0(
-                                                &r, 200,
+                                                &r, wait_ms,
                                             );
                                     }
                                 },
@@ -453,11 +467,17 @@ impl ConnectionManager {
                             let serial = nav.serial();
 
                             web_sys::console::log_1(
-                                &"DEBUG: Polling for device re-enumeration (max 3 seconds)".into(),
+                                &"DEBUG: Polling for device re-enumeration (max 3.5 seconds)"
+                                    .into(),
                             );
 
-                            // Poll get_ports() up to 15 times (200ms interval = 3 seconds total)
+                            // OPTIMIZATION: Adaptive polling intervals
+                            // Devices typically re-enumerate within 500-1000ms, so use faster
+                            // polling initially First 5 attempts: 100ms (0-500ms)
+                            // Next 5 attempts: 200ms (500-1500ms)
+                            // Final 5 attempts: 400ms (1500-3500ms)
                             let mut fresh_port: Option<web_sys::SerialPort> = None;
+                            let mut elapsed_ms = 0;
                             for attempt in 1..=15 {
                                 match wasm_bindgen_futures::JsFuture::from(serial.get_ports()).await
                                 {
@@ -469,8 +489,7 @@ impl ConnectionManager {
                                                 &format!(
                                                     "DEBUG: Device re-enumerated after {}ms \
                                                      (attempt {})",
-                                                    attempt * 200,
-                                                    attempt
+                                                    elapsed_ms, attempt
                                                 )
                                                 .into(),
                                             );
@@ -487,13 +506,23 @@ impl ConnectionManager {
                                     }
                                 }
 
-                                // Wait 200ms before next attempt
+                                // Adaptive wait interval based on attempt number
+                                let wait_ms = if attempt <= 5 {
+                                    100 // Fast polling for first 500ms
+                                } else if attempt <= 10 {
+                                    200 // Medium polling for next 1000ms
+                                } else {
+                                    400 // Slow polling for final 2000ms
+                                };
+
+                                elapsed_ms += wait_ms;
+
                                 let _ = wasm_bindgen_futures::JsFuture::from(
                                     js_sys::Promise::new(&mut |r, _| {
                                         if let Some(window) = web_sys::window() {
                                             let _ = window
                                                 .set_timeout_with_callback_and_timeout_and_arguments_0(
-                                                    &r, 200,
+                                                    &r, wait_ms,
                                                 );
                                         }
                                     }),
@@ -1035,6 +1064,16 @@ impl ConnectionManager {
         // Local scoring logic removed in favor of `analysis` crate.
 
         'outer: for rate in baud_candidates {
+            // OPTIMIZATION: Abort probing early if disconnect detected
+            // Once ondisconnect fires, subsequent probes will fail anyway
+            if *self.probing_interrupted.borrow() {
+                web_sys::console::log_1(
+                    &"DEBUG: Probing aborted - disconnect detected, remaining probes skipped"
+                        .into(),
+                );
+                break 'outer;
+            }
+
             self.set_status.set(format!("Scanning {}...", rate));
             web_sys::console::log_1(&format!("AUTO: Probing [v2] {}...", rate).into());
             let probe_start_ts = js_sys::Date::now();
@@ -1532,6 +1571,24 @@ impl ConnectionManager {
             web_sys::console::log_1(
                 &format!("[{}ms] serial.onconnect triggered", t_onconnect as u64).into(),
             );
+
+            // OPTIMIZATION: Ignore auto-reconnect if manual connection already in progress
+            // This prevents noisy state transitions when user manually connects
+            let current_state = manager_conn.state.get_untracked();
+            if matches!(
+                current_state,
+                ConnectionState::Probing | ConnectionState::Connecting
+            ) {
+                web_sys::console::log_1(
+                    &format!(
+                        "[{}ms] Ignoring onconnect - manual connection in progress (state: {:?})",
+                        (js_sys::Date::now() - t_onconnect) as u64,
+                        current_state
+                    )
+                    .into(),
+                );
+                return;
+            }
 
             // Check if it matches our last device
             let vid_opt = last_vid.get_untracked();
