@@ -72,6 +72,10 @@ pub fn HexView(
     // Lock signal for overflow protection: When one side is active, lock the other side.
     let (selection_lock, set_selection_lock) = create_signal::<Option<SelectionOrigin>>(None);
 
+    // Track previous selection range to optimize DOM updates
+    let (prev_selection, set_prev_selection) =
+        create_signal::<Option<(usize, usize, SelectionSource)>>(None);
+
     // Clear lock on global mouseup and mouseleave (handles edge case of mouse leaving window)
     create_effect(move |_| {
         let Some(window) = web_sys::window() else {
@@ -404,22 +408,55 @@ pub fn HexView(
         });
     });
 
-    // Direct DOM manipulation for highlighting (maximum performance)
-    // This bypasses Leptos reactivity and updates classes directly
+    // Optimized DOM manipulation for highlighting
+    // Uses incremental updates instead of full DOM traversal
     create_effect(move |_| {
         let range_opt = global_selection.and_then(|g| g.get());
         let origin = active_origin.get();
+        let prev = prev_selection.get();
 
         // Use requestAnimationFrame to batch DOM updates
+        let set_prev = set_prev_selection;
         let callback = Closure::once(Box::new(move || {
             if let Some(window) = web_sys::window() {
                 if let Some(document) = window.document() {
-                    // Clear all previous highlights efficiently
-                    if let Ok(elements) = document.query_selector_all(".hex-byte") {
-                        for i in 0..elements.length() {
-                            if let Some(el) = elements.get(i) {
-                                if let Some(el) = el.dyn_ref::<web_sys::HtmlElement>() {
-                                    let _ = el.class_list().remove_2("bg-sync", "bg-term");
+                    // Convert current selection to comparable tuple
+                    let current = range_opt
+                        .as_ref()
+                        .map(|r| (r.start_byte_offset, r.end_byte_offset, r.source_view));
+
+                    // Only update if selection actually changed
+                    if prev == current {
+                        return;
+                    }
+
+                    // Clear only previously highlighted elements
+                    if let Some((prev_start, prev_end, _)) = prev {
+                        // Use more specific selector to limit scope
+                        if let Ok(elements) =
+                            document.query_selector_all(".hex-byte.bg-sync, .hex-byte.bg-term")
+                        {
+                            for i in 0..elements.length() {
+                                if let Some(el) = elements.get(i) {
+                                    if let Some(el) = el.dyn_ref::<web_sys::HtmlElement>() {
+                                        if let Some(offset_str) = el.dataset().get("offset") {
+                                            if let Ok(offset) = offset_str.parse::<usize>() {
+                                                // Only clear if outside new range
+                                                let in_new_range = range_opt
+                                                    .as_ref()
+                                                    .map(|r| r.contains_offset(offset))
+                                                    .unwrap_or(false);
+                                                if !in_new_range
+                                                    && offset >= prev_start
+                                                    && offset < prev_end
+                                                {
+                                                    let _ = el
+                                                        .class_list()
+                                                        .remove_2("bg-sync", "bg-term");
+                                                }
+                                            }
+                                        }
+                                    }
                                 }
                             }
                         }
@@ -468,6 +505,9 @@ pub fn HexView(
                             }
                         }
                     }
+
+                    // Update previous selection for next comparison
+                    set_prev.set(current);
                 }
             }
         }) as Box<dyn FnOnce()>);
