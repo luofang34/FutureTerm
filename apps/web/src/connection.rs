@@ -654,19 +654,11 @@ impl ConnectionManager {
         );
 
         // Transition to Disconnected state
+        // The retry loop checks state in addition to flag, so no sleep needed
         self.transition_to(ConnectionState::Disconnected);
 
-        // Wait a tiny bit to ensure retry loop has time to detect the flag before we reset it
-        // This prevents race condition where disconnect() resets flag before retry loop sees it
-        let _ = wasm_bindgen_futures::JsFuture::from(js_sys::Promise::new(&mut |r, _| {
-            if let Some(window) = web_sys::window() {
-                let _ = window.set_timeout_with_callback_and_timeout_and_arguments_0(&r, 10);
-            }
-        }))
-        .await;
-
         // Reset user_initiated_disconnect flag after disconnect is complete
-        // This ensures subsequent ondisconnect events won't be confused
+        // The retry loop checks BOTH this flag AND state machine, so no race condition
         *self.user_initiated_disconnect.borrow_mut() = false;
         web_sys::console::log_1(
             &"DEBUG: Resetting user_initiated_disconnect after disconnect() complete".into(),
@@ -1889,21 +1881,30 @@ impl ConnectionManager {
                             }
 
                             // Exit if user canceled via disconnect button
-                            if *manager_conn.user_initiated_disconnect.borrow() {
+                            // Check BOTH flag AND state to avoid race condition:
+                            // - Flag check: Fast path for immediate detection
+                            // - State check: Reliable check if flag was already reset
+                            let user_canceled = *manager_conn.user_initiated_disconnect.borrow();
+                            let current_state = manager_conn.state.get_untracked();
+
+                            if user_canceled || current_state == ConnectionState::Disconnected {
                                 web_sys::console::log_1(
-                                    &"[Auto-reconnect] Aborted by user disconnect".into(),
+                                    &format!(
+                                        "[Auto-reconnect] Aborted (flag={}, state={:?})",
+                                        user_canceled, current_state
+                                    )
+                                    .into(),
                                 );
-                                // Transition to Disconnected state
-                                manager_conn.transition_to(ConnectionState::Disconnected);
+
+                                // Only transition if not already Disconnected
+                                if current_state != ConnectionState::Disconnected {
+                                    manager_conn.transition_to(ConnectionState::Disconnected);
+                                }
+
                                 // Clear last_vid/last_pid to prevent auto-reconnect on next
-                                // insertion This mimics the
-                                // behavior of ondisconnect handler for user-initiated disconnects
+                                // insertion
                                 set_last_vid.set(None);
                                 set_last_pid.set(None);
-                                // DON'T reset user_initiated_disconnect here!
-                                // ondisconnect handler will reset it after it processes the flag
-                                // If we reset it here, subsequent ondisconnect events (from port
-                                // cleanup) will incorrectly think it's a device loss
                                 web_sys::console::log_1(
                                     &"[Auto-reconnect] Cleared VID/PID to prevent re-triggering"
                                         .into(),
