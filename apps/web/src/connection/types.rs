@@ -48,7 +48,11 @@ impl ConnectionState {
     pub fn can_disconnect(&self) -> bool {
         matches!(
             self,
-            Self::Connected | Self::AutoReconnecting | Self::DeviceLost
+            Self::Probing
+                | Self::Connecting
+                | Self::Connected
+                | Self::AutoReconnecting
+                | Self::DeviceLost
         )
     }
 
@@ -104,11 +108,13 @@ impl ConnectionState {
 
             // From Probing
             (Probing, Connecting) => true, // Probe complete, connecting
+            (Probing, Disconnecting) => true, // User cancels probe
             (Probing, Disconnected) => true, // Probe failed/canceled
             (Probing, AutoReconnecting) => true, // Device found during probe (onconnect race)
 
             // From Connecting
             (Connecting, Connected) => true, // Connection successful
+            (Connecting, Disconnecting) => true, // User cancels connection
             (Connecting, Disconnected) => true, // Connection failed
             (Connecting, DeviceLost) => true, // Device unplugged during connect
 
@@ -524,10 +530,10 @@ mod tests {
         use ConnectionState::*;
 
         let invalid = vec![
-            (Disconnected, Connected),  // Must go through Connecting
-            (Connected, Disconnected),  // Must go through Disconnecting
-            (Disconnecting, Connected), // Disconnecting is one-way
-            (Probing, Disconnecting),   // Must cancel probing first
+            (Disconnected, Connected),      // Must go through Connecting
+            (Connected, Disconnected),      // Must go through Disconnecting
+            (Disconnecting, Connected),     // Disconnecting is one-way
+            (Reconfiguring, Disconnecting), // Cannot interrupt reconfiguration
         ];
 
         for (from, to) in invalid {
@@ -709,8 +715,10 @@ mod tests {
             (Disconnected, Probing),
             (Disconnected, Connecting),
             (Probing, Connecting),
+            (Probing, Disconnecting),
             (Probing, Disconnected),
             (Connecting, Connected),
+            (Connecting, Disconnecting),
             (Connecting, Disconnected),
             (Connecting, DeviceLost),
             (Connected, Reconfiguring),
@@ -755,11 +763,14 @@ mod tests {
         assert!(!Disconnected.indicator_should_pulse());
 
         // Test disconnect button
+        assert!(Probing.can_disconnect());
+        assert!(Connecting.can_disconnect());
         assert!(Connected.can_disconnect());
         assert!(DeviceLost.can_disconnect());
         assert!(AutoReconnecting.can_disconnect());
-        assert!(!Connecting.can_disconnect());
         assert!(!Disconnected.can_disconnect());
+        assert!(!Disconnecting.can_disconnect());
+        assert!(!Reconfiguring.can_disconnect());
 
         // Test status text
         assert_eq!(Connected.status_text(), "Connected");
@@ -933,11 +944,14 @@ mod tests {
 
         // Probing for firmware...
         let state = Probing;
-        assert!(!state.can_disconnect()); // Cannot disconnect while probing
+        assert!(state.can_disconnect()); // User can cancel probing
+        assert!(state.can_transition_to(Disconnecting)); // Cancel via disconnect button
         assert!(state.can_transition_to(Connecting));
 
         // Found firmware, connecting...
         let state = Connecting;
+        assert!(state.can_disconnect()); // User can cancel connecting
+        assert!(state.can_transition_to(Disconnecting)); // Cancel via disconnect button
         assert!(state.can_transition_to(Connected));
 
         // Connected!
@@ -1077,6 +1091,48 @@ mod tests {
         assert!(state.can_transition_to(Connected));
     }
 
+    /// Test user can cancel connection attempts
+    #[test]
+    fn test_user_cancel_connection_flow() {
+        use ConnectionState::*;
+
+        // Scenario 1: User cancels during probing
+        let state = Probing;
+        assert!(
+            state.can_disconnect(),
+            "User should be able to cancel probing"
+        );
+        assert!(
+            state.can_transition_to(Disconnecting),
+            "Probing → Disconnecting should be allowed"
+        );
+        let state = Disconnecting;
+        assert!(state.can_transition_to(Disconnected));
+
+        // Scenario 2: User cancels during connecting
+        let state = Connecting;
+        assert!(
+            state.can_disconnect(),
+            "User should be able to cancel connecting"
+        );
+        assert!(
+            state.can_transition_to(Disconnecting),
+            "Connecting → Disconnecting should be allowed"
+        );
+        let state = Disconnecting;
+        assert!(state.can_transition_to(Disconnected));
+
+        // Verify button UI shows "Disconnect" during these states
+        assert!(
+            Probing.button_shows_disconnect(),
+            "Button should show 'Disconnect' during probing"
+        );
+        assert!(
+            Connecting.button_shows_disconnect(),
+            "Button should show 'Disconnect' during connecting"
+        );
+    }
+
     // ============ Fail-Fast Validation Tests ============
 
     /// Test that invalid state combinations are impossible
@@ -1113,16 +1169,10 @@ mod tests {
         assert!(!Disconnecting.can_transition_to(Connected));
         assert!(!Disconnecting.can_transition_to(Connecting));
 
-        // Connecting can only go to Connected or back to Disconnected
-        // (or DeviceLost if USB unplugged)
-        let valid_connecting_exits = [Connected, Disconnected, DeviceLost];
-        for state in [
-            Probing,
-            Connecting,
-            Reconfiguring,
-            Disconnecting,
-            AutoReconnecting,
-        ] {
+        // Connecting can go to: Connected (success), Disconnecting (user cancel),
+        // Disconnected (failed), or DeviceLost (USB unplugged)
+        let valid_connecting_exits = [Connected, Disconnecting, Disconnected, DeviceLost];
+        for state in [Probing, Connecting, Reconfiguring, AutoReconnecting] {
             if !valid_connecting_exits.contains(&state) {
                 assert!(!Connecting.can_transition_to(state));
             }
@@ -1195,10 +1245,10 @@ mod tests {
         use ConnectionState::*;
 
         let invalid_transitions = vec![
-            (Disconnected, Connected),  // Must go through Connecting
-            (Connected, Disconnected),  // Must go through Disconnecting
-            (Disconnecting, Connected), // Disconnecting is one-way
-            (Probing, Disconnecting),   // Cannot disconnect while probing
+            (Disconnected, Connected),      // Must go through Connecting
+            (Connected, Disconnected),      // Must go through Disconnecting
+            (Disconnecting, Connected),     // Disconnecting is one-way
+            (Reconfiguring, Disconnecting), // Cannot interrupt reconfiguration
         ];
 
         for (from, to) in invalid_transitions {
