@@ -1803,6 +1803,10 @@ impl ConnectionManager {
             flow_control: "none".into(),
         };
 
+        // Transition to Connecting state (required for valid state machine transition)
+        // Valid transitions: Disconnected → Connecting, Probing → Connecting
+        self.transition_to(ConnectionState::Connecting);
+
         let mut t = WebSerialTransport::new();
 
         // Retry Loop for "Port already open" race condition (probe cleanup lag)
@@ -1823,7 +1827,7 @@ impl ConnectionManager {
                     });
                     *self.active_port.borrow_mut() = Some(port);
 
-                    // Transition to Connected state
+                    // Transition from Connecting to Connected (port successfully opened)
                     self.transition_to(ConnectionState::Connected);
 
                     // Update detected config for UI
