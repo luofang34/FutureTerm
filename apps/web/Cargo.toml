@@ -35,6 +35,9 @@ scopeguard = "1.2"
 futures = "0.3"
 
 
+[dev-dependencies]
+wasm-bindgen-test = "0.3"
+
 [features]
 default = ["mavlink"]
 mavlink = ["decoders/mavlink"]

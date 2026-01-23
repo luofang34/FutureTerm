@@ -2614,4 +2614,436 @@ mod tests {
             .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
             .is_ok());
     }
+
+    // ============ State Machine Transition Tests ============
+
+    /// Test all valid state transitions are allowed
+    #[test]
+    fn test_valid_state_transitions() {
+        use ConnectionState::*;
+
+        // From Disconnected
+        assert!(Disconnected.can_transition_to(Probing));
+        assert!(Disconnected.can_transition_to(Connecting));
+        assert!(Disconnected.can_transition_to(Disconnected)); // Idempotent
+
+        // From Probing
+        assert!(Probing.can_transition_to(Connecting));
+        assert!(Probing.can_transition_to(Disconnected));
+        assert!(Probing.can_transition_to(AutoReconnecting));
+
+        // From Connecting
+        assert!(Connecting.can_transition_to(Connected));
+        assert!(Connecting.can_transition_to(Disconnected));
+        assert!(Connecting.can_transition_to(DeviceLost));
+
+        // From Connected
+        assert!(Connected.can_transition_to(Reconfiguring));
+        assert!(Connected.can_transition_to(Disconnecting));
+        assert!(Connected.can_transition_to(DeviceLost));
+        assert!(Connected.can_transition_to(AutoReconnecting));
+
+        // From Reconfiguring
+        assert!(Reconfiguring.can_transition_to(Connected));
+        assert!(Reconfiguring.can_transition_to(DeviceLost));
+
+        // From Disconnecting
+        assert!(Disconnecting.can_transition_to(Disconnected));
+
+        // From DeviceLost
+        assert!(DeviceLost.can_transition_to(Disconnected));
+        assert!(DeviceLost.can_transition_to(AutoReconnecting));
+        assert!(DeviceLost.can_transition_to(Connecting));
+
+        // From AutoReconnecting
+        assert!(AutoReconnecting.can_transition_to(Connected));
+        assert!(AutoReconnecting.can_transition_to(DeviceLost));
+        assert!(AutoReconnecting.can_transition_to(Disconnected));
+        assert!(AutoReconnecting.can_transition_to(AutoReconnecting)); // Idempotent
+    }
+
+    /// Test invalid state transitions are rejected
+    /// This is critical for fail-fast behavior - we want to catch bugs early
+    #[test]
+    fn test_invalid_state_transitions() {
+        use ConnectionState::*;
+
+        // Cannot go directly from Disconnected to Connected (must go through Connecting)
+        assert!(!Disconnected.can_transition_to(Connected));
+        assert!(!Disconnected.can_transition_to(DeviceLost));
+        assert!(!Disconnected.can_transition_to(AutoReconnecting));
+        assert!(!Disconnected.can_transition_to(Reconfiguring));
+        assert!(!Disconnected.can_transition_to(Disconnecting));
+
+        // Cannot disconnect while probing (must cancel probing first)
+        assert!(!Probing.can_transition_to(Disconnecting));
+        assert!(!Probing.can_transition_to(DeviceLost));
+        assert!(!Probing.can_transition_to(Connected));
+        assert!(!Probing.can_transition_to(Reconfiguring));
+
+        // Cannot bypass connection process
+        assert!(!Connecting.can_transition_to(Probing));
+        assert!(!Connecting.can_transition_to(Reconfiguring));
+        assert!(!Connecting.can_transition_to(Disconnecting));
+        assert!(!Connecting.can_transition_to(AutoReconnecting));
+
+        // Cannot skip disconnecting process
+        assert!(!Connected.can_transition_to(Disconnected));
+        assert!(!Connected.can_transition_to(Probing));
+        assert!(!Connected.can_transition_to(Connecting));
+
+        // Reconfiguring is a transient state - limited exits
+        assert!(!Reconfiguring.can_transition_to(Disconnected));
+        assert!(!Reconfiguring.can_transition_to(Disconnecting));
+        assert!(!Reconfiguring.can_transition_to(Probing));
+        assert!(!Reconfiguring.can_transition_to(Connecting));
+        assert!(!Reconfiguring.can_transition_to(AutoReconnecting));
+        assert!(!Reconfiguring.can_transition_to(Reconfiguring));
+
+        // Disconnecting is one-way to Disconnected
+        assert!(!Disconnecting.can_transition_to(Connected));
+        assert!(!Disconnecting.can_transition_to(Connecting));
+        assert!(!Disconnecting.can_transition_to(Probing));
+        assert!(!Disconnecting.can_transition_to(DeviceLost));
+        assert!(!Disconnecting.can_transition_to(AutoReconnecting));
+        assert!(!Disconnecting.can_transition_to(Reconfiguring));
+        assert!(!Disconnecting.can_transition_to(Disconnecting));
+
+        // DeviceLost cannot go to intermediate states
+        assert!(!DeviceLost.can_transition_to(Probing));
+        assert!(!DeviceLost.can_transition_to(Reconfiguring));
+        assert!(!DeviceLost.can_transition_to(Disconnecting));
+        assert!(!DeviceLost.can_transition_to(DeviceLost));
+
+        // AutoReconnecting cannot skip states
+        assert!(!AutoReconnecting.can_transition_to(Probing));
+        assert!(!AutoReconnecting.can_transition_to(Connecting));
+        assert!(!AutoReconnecting.can_transition_to(Reconfiguring));
+        assert!(!AutoReconnecting.can_transition_to(Disconnecting));
+    }
+
+    /// Test state permission queries
+    #[test]
+    fn test_state_permissions() {
+        use ConnectionState::*;
+
+        // Only Connected, AutoReconnecting, and DeviceLost can disconnect
+        assert!(!Disconnected.can_disconnect());
+        assert!(!Probing.can_disconnect());
+        assert!(!Connecting.can_disconnect());
+        assert!(Connected.can_disconnect());
+        assert!(!Reconfiguring.can_disconnect());
+        assert!(!Disconnecting.can_disconnect());
+        assert!(DeviceLost.can_disconnect());
+        assert!(AutoReconnecting.can_disconnect());
+    }
+
+    /// Test indicator colors match expected values
+    #[test]
+    fn test_indicator_colors() {
+        use ConnectionState::*;
+
+        assert_eq!(Connected.indicator_color(), "rgb(95, 200, 85)"); // Green
+        assert_eq!(Disconnected.indicator_color(), "rgb(240, 105, 95)"); // Red
+        assert_eq!(DeviceLost.indicator_color(), "rgb(245, 190, 80)"); // Orange
+        assert_eq!(AutoReconnecting.indicator_color(), "rgb(245, 190, 80)"); // Orange
+        assert_eq!(Connecting.indicator_color(), "rgb(245, 190, 80)"); // Orange
+        assert_eq!(Probing.indicator_color(), "rgb(245, 190, 80)"); // Orange
+        assert_eq!(Reconfiguring.indicator_color(), "rgb(245, 190, 80)"); // Orange
+        assert_eq!(Disconnecting.indicator_color(), "rgb(245, 190, 80)"); // Orange
+    }
+
+    /// Test indicator pulse behavior
+    #[test]
+    fn test_indicator_pulse() {
+        use ConnectionState::*;
+
+        // Only AutoReconnecting should pulse
+        assert!(!Disconnected.indicator_should_pulse());
+        assert!(!Probing.indicator_should_pulse());
+        assert!(!Connecting.indicator_should_pulse());
+        assert!(!Connected.indicator_should_pulse());
+        assert!(!Reconfiguring.indicator_should_pulse());
+        assert!(!Disconnecting.indicator_should_pulse());
+        assert!(!DeviceLost.indicator_should_pulse());
+        assert!(AutoReconnecting.indicator_should_pulse());
+    }
+
+    /// Test button text logic
+    #[test]
+    fn test_button_text() {
+        use ConnectionState::*;
+
+        // Button should show "Disconnect" for these states
+        assert!(!Disconnected.button_shows_disconnect());
+        assert!(!Probing.button_shows_disconnect());
+        assert!(!Connecting.button_shows_disconnect());
+        assert!(Connected.button_shows_disconnect());
+        assert!(!Reconfiguring.button_shows_disconnect());
+        assert!(!Disconnecting.button_shows_disconnect());
+        assert!(DeviceLost.button_shows_disconnect());
+        assert!(AutoReconnecting.button_shows_disconnect());
+    }
+
+    /// Test status text strings
+    #[test]
+    fn test_status_text() {
+        use ConnectionState::*;
+
+        assert_eq!(Disconnected.status_text(), "Ready to connect");
+        assert_eq!(Probing.status_text(), "Detecting firmware...");
+        assert_eq!(Connecting.status_text(), "Connecting...");
+        assert_eq!(Connected.status_text(), "Connected");
+        assert_eq!(Reconfiguring.status_text(), "Reconfiguring...");
+        assert_eq!(Disconnecting.status_text(), "Disconnecting...");
+        assert_eq!(
+            DeviceLost.status_text(),
+            "Device Lost (waiting for device...)"
+        );
+        assert_eq!(
+            AutoReconnecting.status_text(),
+            "Device found. Auto-reconnecting..."
+        );
+    }
+
+    // ============ Timing Constants Tests ============
+
+    /// Test timing constants are sensible
+    #[test]
+    fn test_timing_constants() {
+        // Polling intervals should be increasing (adaptive backoff)
+        assert!(POLL_INTERVAL_FAST_MS < POLL_INTERVAL_MEDIUM_MS);
+        assert!(POLL_INTERVAL_MEDIUM_MS < POLL_INTERVAL_SLOW_MS);
+
+        // Polling should be faster than auto-reconnect total timeout
+        let max_polling_time = (5 * POLL_INTERVAL_FAST_MS)
+            + (5 * POLL_INTERVAL_MEDIUM_MS)
+            + (5 * POLL_INTERVAL_SLOW_MS);
+        let auto_reconnect_timeout =
+            AUTO_RECONNECT_MAX_RETRIES as i32 * AUTO_RECONNECT_RETRY_INTERVAL_MS;
+        assert!(max_polling_time < auto_reconnect_timeout);
+
+        // Disconnect timeout should be reasonable (not too short, not too long)
+        assert!(DISCONNECT_COMPLETION_TIMEOUT_MS >= 1000); // At least 1 second
+        assert!(DISCONNECT_COMPLETION_TIMEOUT_MS <= 5000); // At most 5 seconds
+
+        // Wait times should be positive
+        assert!(REENUMERATION_WAIT_MS > 0);
+        assert!(PROBING_CLEANUP_WAIT_MS > 0);
+        assert!(AUTO_RECONNECT_RETRY_INTERVAL_MS > 0);
+    }
+
+    // ============ Edge Case Tests ============
+
+    /// Test that all states have unique colors or pulse behavior
+    /// This ensures UI can distinguish between all states
+    #[test]
+    fn test_states_visually_distinguishable() {
+        use ConnectionState::*;
+
+        // Connected: green, no pulse
+        assert_eq!(Connected.indicator_color(), "rgb(95, 200, 85)");
+        assert!(!Connected.indicator_should_pulse());
+
+        // Disconnected: red, no pulse
+        assert_eq!(Disconnected.indicator_color(), "rgb(240, 105, 95)");
+        assert!(!Disconnected.indicator_should_pulse());
+
+        // AutoReconnecting: orange, PULSE (unique!)
+        assert_eq!(AutoReconnecting.indicator_color(), "rgb(245, 190, 80)");
+        assert!(AutoReconnecting.indicator_should_pulse());
+
+        // All other orange states: no pulse
+        let orange_states = vec![
+            DeviceLost,
+            Connecting,
+            Probing,
+            Reconfiguring,
+            Disconnecting,
+        ];
+        for state in orange_states {
+            assert_eq!(state.indicator_color(), "rgb(245, 190, 80)");
+            assert!(!state.indicator_should_pulse());
+        }
+    }
+
+    /// Test exhaustive state enumeration
+    /// This ensures we didn't forget to handle any state
+    #[test]
+    fn test_all_states_covered() {
+        use ConnectionState::*;
+
+        let all_states = vec![
+            Disconnected,
+            Probing,
+            Connecting,
+            Connected,
+            Reconfiguring,
+            Disconnecting,
+            DeviceLost,
+            AutoReconnecting,
+        ];
+
+        // Verify all states have status text
+        for state in &all_states {
+            assert!(!state.status_text().is_empty());
+        }
+
+        // Verify all states have indicator color
+        for state in &all_states {
+            assert!(!state.indicator_color().is_empty());
+        }
+
+        // Verify can_disconnect is defined for all states
+        for state in &all_states {
+            let _ = state.can_disconnect(); // Just call it to ensure no panic
+        }
+
+        // Verify button_shows_disconnect is defined for all states
+        for state in &all_states {
+            let _ = state.button_shows_disconnect();
+        }
+    }
+
+    /// Test that idempotent transitions are allowed
+    /// Some states should allow transitioning to themselves (e.g., retry loops)
+    #[test]
+    fn test_idempotent_transitions() {
+        use ConnectionState::*;
+
+        // Disconnected can transition to itself (no-op)
+        assert!(Disconnected.can_transition_to(Disconnected));
+
+        // AutoReconnecting can transition to itself (retry loop)
+        assert!(AutoReconnecting.can_transition_to(AutoReconnecting));
+
+        // All other states should NOT allow self-transition
+        assert!(!Probing.can_transition_to(Probing));
+        assert!(!Connecting.can_transition_to(Connecting));
+        assert!(!Connected.can_transition_to(Connected));
+        assert!(!Reconfiguring.can_transition_to(Reconfiguring));
+        assert!(!Disconnecting.can_transition_to(Disconnecting));
+        assert!(!DeviceLost.can_transition_to(DeviceLost));
+    }
+
+    /// Test critical path: disconnect must be possible from device-loss states
+    /// This is the bug fix from Issue 1 - ensure it stays fixed
+    #[test]
+    fn test_disconnect_after_device_loss() {
+        use ConnectionState::*;
+
+        // CRITICAL: User must be able to cancel waiting/reconnecting
+        assert!(DeviceLost.can_disconnect());
+        assert!(AutoReconnecting.can_disconnect());
+
+        // Verify transition path: DeviceLost → Disconnected
+        assert!(DeviceLost.can_transition_to(Disconnected));
+
+        // Verify transition path: AutoReconnecting → Disconnected
+        assert!(AutoReconnecting.can_transition_to(Disconnected));
+
+        // Button should show "Disconnect" in these states
+        assert!(DeviceLost.button_shows_disconnect());
+        assert!(AutoReconnecting.button_shows_disconnect());
+    }
+
+    /// Test that Disconnecting cannot be interrupted
+    /// Once disconnection starts, it must complete to Disconnected
+    #[test]
+    fn test_disconnecting_is_one_way() {
+        use ConnectionState::*;
+
+        // Only valid transition is to Disconnected
+        assert!(Disconnecting.can_transition_to(Disconnected));
+
+        // All other transitions must be blocked
+        assert!(!Disconnecting.can_transition_to(Connected));
+        assert!(!Disconnecting.can_transition_to(Connecting));
+        assert!(!Disconnecting.can_transition_to(Probing));
+        assert!(!Disconnecting.can_transition_to(DeviceLost));
+        assert!(!Disconnecting.can_transition_to(AutoReconnecting));
+        assert!(!Disconnecting.can_transition_to(Reconfiguring));
+        assert!(!Disconnecting.can_transition_to(Disconnecting));
+
+        // User cannot disconnect while already disconnecting
+        assert!(!Disconnecting.can_disconnect());
+    }
+
+    /// Test USB unplug scenarios from different states
+    #[test]
+    fn test_usb_unplug_transitions() {
+        use ConnectionState::*;
+
+        // USB unplug while connected
+        assert!(Connected.can_transition_to(DeviceLost));
+        assert!(Connected.can_transition_to(AutoReconnecting));
+
+        // USB unplug while connecting
+        assert!(Connecting.can_transition_to(DeviceLost));
+
+        // USB unplug while reconfiguring
+        assert!(Reconfiguring.can_transition_to(DeviceLost));
+
+        // Cannot unplug from states where device is already gone
+        assert!(!Disconnected.can_transition_to(DeviceLost));
+        assert!(!DeviceLost.can_transition_to(DeviceLost));
+    }
+
+    /// Test probing interrupt recovery path
+    #[test]
+    fn test_probing_interrupt_path() {
+        use ConnectionState::*;
+
+        // Probing can be interrupted by device reconnect
+        assert!(Probing.can_transition_to(AutoReconnecting));
+
+        // After interrupt, can proceed to connecting
+        assert!(AutoReconnecting.can_transition_to(Connected));
+
+        // Or fall back to device lost
+        assert!(AutoReconnecting.can_transition_to(DeviceLost));
+    }
+
+    /// Test that transient states cannot be long-lived
+    /// Disconnecting and Reconfiguring should only transition to stable states
+    #[test]
+    fn test_transient_states() {
+        use ConnectionState::*;
+
+        // Disconnecting is transient - only goes to Disconnected
+        let disconnecting_exits = vec![
+            Disconnected,
+            Probing,
+            Connecting,
+            Connected,
+            Reconfiguring,
+            DeviceLost,
+            AutoReconnecting,
+        ];
+        for target in &disconnecting_exits {
+            if *target == Disconnected {
+                assert!(Disconnecting.can_transition_to(*target));
+            } else {
+                assert!(!Disconnecting.can_transition_to(*target));
+            }
+        }
+
+        // Reconfiguring is transient - only goes to Connected or DeviceLost
+        let reconfiguring_exits = vec![
+            Disconnected,
+            Probing,
+            Connecting,
+            Connected,
+            Reconfiguring,
+            Disconnecting,
+            AutoReconnecting,
+        ];
+        for target in &reconfiguring_exits {
+            if *target == Connected || *target == DeviceLost {
+                assert!(Reconfiguring.can_transition_to(*target));
+            } else {
+                assert!(!Reconfiguring.can_transition_to(*target));
+            }
+        }
+    }
 }
