@@ -244,6 +244,11 @@ impl ConnectionManager {
 
         self.user_initiated_disconnect.set(true);
 
+        // If disconnecting during probing, signal the probe loop to abort
+        if current_state == ConnectionState::Probing {
+            self.probing_interrupted.set(true);
+        }
+
         let handle = self.connection_handle.borrow_mut().take();
         if let Some(h) = handle {
             let _ = h.cmd_tx.unbounded_send(ConnectionCommand::Stop);
