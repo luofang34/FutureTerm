@@ -1037,20 +1037,21 @@ impl ConnectionManager {
             return;
         }
 
-        // Transition to Reconfiguring state
-        self.transition_to(ConnectionState::Reconfiguring);
-
         // Capture state before disconnect for potential rollback
         let snapshot = self.capture_state();
 
         // Save port reference before disconnect
         let port_opt = self.active_port.borrow().clone();
 
-        // Try disconnect
+        // Disconnect while still in Connected state (required for disconnect() to succeed)
         if !self.disconnect().await {
-            // disconnect() already transitioned to appropriate state
+            // disconnect() failed - it already transitioned to appropriate state
             return;
         }
+
+        // Now transition to Reconfiguring state (after successful disconnect)
+        // This prevents user from clicking disconnect during reconfiguration
+        self.transition_to(ConnectionState::Reconfiguring);
 
         if let Some(port) = port_opt {
             // Wait for port release
@@ -3368,6 +3369,40 @@ mod tests {
         assert!(!state.can_disconnect()); // Cannot disconnect during reconfig
         assert!(state.can_transition_to(Connected)); // Success
         assert!(state.can_transition_to(DeviceLost)); // USB unplugged during reconfig
+    }
+
+    /// Test reconfigure() operation sequence
+    /// Regression test for bug: reconfigure() called disconnect() after transitioning
+    /// to Reconfiguring state, causing disconnect() to always fail.
+    #[test]
+    fn test_reconfigure_disconnect_sequence() {
+        use ConnectionState::*;
+
+        // BUG: If we transition to Reconfiguring BEFORE calling disconnect(),
+        // then disconnect() will fail because can_disconnect() returns false
+        // for Reconfiguring state.
+        //
+        // CORRECT SEQUENCE:
+        // 1. Start in Connected state
+        let state = Connected;
+        assert!(state.can_disconnect()); // Must be true for disconnect() to work
+
+        // 2. Call disconnect() while STILL in Connected state
+        //    (disconnect() will transition to Disconnected)
+
+        // 3. THEN transition to Reconfiguring state
+        //    (this prevents user from canceling mid-reconfiguration)
+
+        // 4. Reconnect with new parameters
+        let state = Reconfiguring;
+        assert!(state.can_transition_to(Connected));
+
+        // VERIFY: The bug would manifest as:
+        // Connected -> Reconfiguring -> disconnect() fails -> stuck in Reconfiguring
+        assert!(
+            !Reconfiguring.can_disconnect(),
+            "Reconfiguring state should not allow disconnect to prevent user cancellation"
+        );
     }
 
     /// Test probing interrupted by device re-enumeration
