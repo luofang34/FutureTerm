@@ -52,6 +52,14 @@ pub async fn detect_config(
             .into(),
         );
 
+        // Check if user disconnected while we were probing this rate
+        if probing_interrupted.get() {
+            web_sys::console::log_1(
+                &"DEBUG: Probing aborted - disconnect detected after probe completed".into(),
+            );
+            break 'outer;
+        }
+
         if buffer.is_empty() {
             continue;
         }
