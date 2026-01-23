@@ -1044,14 +1044,17 @@ impl ConnectionManager {
         let port_opt = self.active_port.borrow().clone();
 
         // Disconnect while still in Connected state (required for disconnect() to succeed)
+        // After disconnect(), we'll be in Disconnected state
         if !self.disconnect().await {
             // disconnect() failed - it already transitioned to appropriate state
             return;
         }
 
-        // Now transition to Reconfiguring state (after successful disconnect)
-        // This prevents user from clicking disconnect during reconfiguration
-        self.transition_to(ConnectionState::Reconfiguring);
+        // Note: We're now in Disconnected state. We skip transitioning to Reconfiguring
+        // because Disconnected → Reconfiguring is not a valid transition. Instead, we'll
+        // reconnect directly (Disconnected → Connecting → Connected). The reconfigure
+        // operation is atomic from the user's perspective since we don't return until
+        // reconnection completes or fails.
 
         if let Some(port) = port_opt {
             // Wait for port release
