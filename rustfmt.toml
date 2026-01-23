@@ -1,4 +1,5 @@
 # Rust formatting configuration
+# Only stable features to avoid warnings on stable Rust
 edition = "2021"
 max_width = 100
 hard_tabs = false
@@ -8,10 +9,12 @@ use_small_heuristics = "Default"
 reorder_imports = true
 reorder_modules = true
 remove_nested_parens = true
-format_strings = true
-format_macro_bodies = true
-format_macro_matchers = true
-normalize_comments = true
-normalize_doc_attributes = true
-wrap_comments = true
-comment_width = 100
+
+# Unstable features (require nightly):
+# format_strings = true
+# format_macro_bodies = true
+# format_macro_matchers = true
+# normalize_comments = true
+# normalize_doc_attributes = true
+# wrap_comments = true
+# comment_width = 100

@@ -2,12 +2,15 @@ name: CI
 
 on: [push, pull_request]
 
+env:
+  RUSTFLAGS: "--cfg=web_sys_unstable_apis"
+
 jobs:
   test:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@1.83.0
         with:
           targets: wasm32-unknown-unknown
 
@@ -18,7 +21,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@1.83.0
         with:
           targets: wasm32-unknown-unknown
 
