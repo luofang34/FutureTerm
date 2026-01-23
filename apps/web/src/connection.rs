@@ -1177,17 +1177,16 @@ impl ConnectionManager {
                             }
                             _ => {
                                 // Empty read - yield to prevent CPU spinning
-                                // Without this, continuous empty reads can cause 100% CPU usage
-                                // This small delay allows browser to process other events
+                                //
+                                // Without this, continuous empty reads cause 100% CPU usage.
+                                // We use Promise.resolve() (microtask) instead of setTimeout (macrotask)
+                                // because microtasks run at the end of the current event loop iteration,
+                                // providing the fastest possible yield while still allowing the browser
+                                // to process other events.
+                                //
+                                // This is the standard JavaScript async/await yield pattern.
                                 let _ = wasm_bindgen_futures::JsFuture::from(
-                                    js_sys::Promise::new(&mut |r, _| {
-                                        if let Some(window) = web_sys::window() {
-                                            let _ = window
-                                                .set_timeout_with_callback_and_timeout_and_arguments_0(
-                                                    &r, 1, // 1ms yield
-                                                );
-                                        }
-                                    }),
+                                    js_sys::Promise::resolve(&wasm_bindgen::JsValue::UNDEFINED),
                                 )
                                 .await;
                             }
