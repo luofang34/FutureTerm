@@ -1,5 +1,5 @@
 use leptos::*;
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::rc::Rc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -437,8 +437,12 @@ pub struct ConnectionManager {
     is_connecting: Arc<AtomicBool>,
     is_disconnecting: Arc<AtomicBool>,
 
-    // User-initiated disconnect flag (to distinguish from device loss)
-    user_initiated_disconnect: Rc<RefCell<bool>>,
+    /// User-initiated disconnect flag (to distinguish from device loss)
+    ///
+    /// Using `Cell<bool>` instead of `RefCell<bool>` for consistency with atomics.
+    /// Cell provides interior mutability without runtime borrowing checks (simpler).
+    /// Safe in WASM single-threaded environment.
+    user_initiated_disconnect: Rc<Cell<bool>>,
 
     // Auto-reconnect device tracking (to clear on user disconnect)
     set_last_vid: Rc<RefCell<Option<WriteSignal<Option<u16>>>>>,
@@ -470,7 +474,9 @@ pub struct ConnectionManager {
     ///
     /// **Related**: See `handle_probing_with_interrupt_recovery()` and
     /// `poll_for_device_reenumeration()`
-    probing_interrupted: Rc<RefCell<bool>>,
+    ///
+    /// Using `Cell<bool>` for consistency with other boolean flags.
+    probing_interrupted: Rc<Cell<bool>>,
 
     // Event handler closures (to prevent memory leaks on re-initialization)
     event_closures: Rc<RefCell<Option<EventClosures>>>,
@@ -511,10 +517,10 @@ impl ConnectionManager {
             set_tx_active,
             decoder_id: decoder_id.into(),
             set_decoder_id,
-            user_initiated_disconnect: Rc::new(RefCell::new(false)),
+            user_initiated_disconnect: Rc::new(Cell::new(false)),
             set_last_vid: Rc::new(RefCell::new(None)),
             set_last_pid: Rc::new(RefCell::new(None)),
-            probing_interrupted: Rc::new(RefCell::new(false)),
+            probing_interrupted: Rc::new(Cell::new(false)),
             event_closures: Rc::new(RefCell::new(None)),
         }
     }
@@ -629,10 +635,10 @@ impl ConnectionManager {
         String,
     > {
         // Check if probing was interrupted by ondisconnect events
-        let was_interrupted = *self.probing_interrupted.borrow();
+        let was_interrupted = self.probing_interrupted.get();
         if was_interrupted {
             warn_log!("Probing was interrupted by ondisconnect event - port reference is stale");
-            *self.probing_interrupted.borrow_mut() = false; // Clear flag
+            self.probing_interrupted.set(false); // Clear flag
 
             // When ondisconnect fires during probing, port reference becomes invalid
             // Wait for browser to re-enumerate device and get fresh port reference
@@ -661,9 +667,9 @@ impl ConnectionManager {
 
             // Check interrupt flag AGAIN after cleanup wait
             // ondisconnect event may fire DURING the cleanup wait
-            if *self.probing_interrupted.borrow() {
+            if self.probing_interrupted.get() {
                 warn_log!("Disconnect occurred during cleanup wait - port is stale");
-                *self.probing_interrupted.borrow_mut() = false;
+                self.probing_interrupted.set(false);
 
                 // Use helper method to poll for fresh port
                 match self.poll_for_device_reenumeration().await {
@@ -855,7 +861,7 @@ impl ConnectionManager {
 
         // Reset probing interrupt flag if auto-detecting baud rate
         if baud == 0 {
-            *self.probing_interrupted.borrow_mut() = false;
+            self.probing_interrupted.set(false);
         }
 
         // Route to appropriate connection method
@@ -898,7 +904,7 @@ impl ConnectionManager {
         }
 
         // Mark this as user-initiated disconnect
-        *self.user_initiated_disconnect.borrow_mut() = true;
+        self.user_initiated_disconnect.set(true);
 
         // Transition to appropriate state based on current state
         // DeviceLost/AutoReconnecting: Device already gone, skip to Disconnected
@@ -979,7 +985,7 @@ impl ConnectionManager {
 
         // Reset user_initiated_disconnect flag after disconnect is complete
         // The retry loop checks BOTH this flag AND state machine, so no race condition
-        *self.user_initiated_disconnect.borrow_mut() = false;
+        self.user_initiated_disconnect.set(false);
         web_sys::console::log_1(
             &"DEBUG: Resetting user_initiated_disconnect after disconnect() complete".into(),
         );
@@ -1415,7 +1421,7 @@ impl ConnectionManager {
         'outer: for rate in baud_candidates {
             // OPTIMIZATION: Abort probing early if disconnect detected
             // Once ondisconnect fires, subsequent probes will fail anyway
-            if *self.probing_interrupted.borrow() {
+            if self.probing_interrupted.get() {
                 web_sys::console::log_1(
                     &"DEBUG: Probing aborted - disconnect detected, remaining probes skipped"
                         .into(),
@@ -2087,7 +2093,7 @@ impl ConnectionManager {
                                     // disconnect will be
                                     // incorrectly treated as user-initiated, disabling
                                     // auto-reconnect
-                                    *manager_conn.user_initiated_disconnect.borrow_mut() = false;
+                                    manager_conn.user_initiated_disconnect.set(false);
                                     web_sys::console::log_1(
                                         &"DEBUG: Auto-reconnect - reset user_initiated flag to \
                                           false"
@@ -2224,7 +2230,7 @@ impl ConnectionManager {
                             // Check BOTH flag AND state to avoid race condition:
                             // - Flag check: Fast path for immediate detection
                             // - State check: Reliable check if flag was already reset
-                            let user_canceled = *manager_conn.user_initiated_disconnect.borrow();
+                            let user_canceled = manager_conn.user_initiated_disconnect.get();
                             let current_state = manager_conn.state.get_untracked();
 
                             if user_canceled || current_state == ConnectionState::Disconnected {
@@ -2365,9 +2371,7 @@ impl ConnectionManager {
                                                 return; // Exit entire reconnection task
                                             }
 
-                                            *manager_conn_clone
-                                                .user_initiated_disconnect
-                                                .borrow_mut() = false;
+                                            manager_conn_clone.user_initiated_disconnect.set(false);
                                             web_sys::console::log_1(
                                                 &"DEBUG: Auto-reconnect - reset user_initiated \
                                                   flag to false"
@@ -2493,7 +2497,7 @@ impl ConnectionManager {
                     &"DEBUG: ondisconnect fired during Probing - marking probe as interrupted"
                         .into(),
                 );
-                *manager_disc.probing_interrupted.borrow_mut() = true;
+                manager_disc.probing_interrupted.set(true);
                 return;
             }
 
@@ -2511,7 +2515,7 @@ impl ConnectionManager {
             }
 
             // Check if this was a user-initiated disconnect
-            let user_initiated = *manager_disc.user_initiated_disconnect.borrow();
+            let user_initiated = manager_disc.user_initiated_disconnect.get();
 
             if user_initiated {
                 web_sys::console::log_1(
@@ -2522,7 +2526,7 @@ impl ConnectionManager {
                 // Transition to Disconnected state
                 manager_disc.transition_to(ConnectionState::Disconnected);
                 // Reset the flag for next time
-                *manager_disc.user_initiated_disconnect.borrow_mut() = false;
+                manager_disc.user_initiated_disconnect.set(false);
             } else {
                 web_sys::console::log_1(
                     &"DEBUG: Device disconnected (not user-initiated) - will auto-reconnect".into(),
@@ -3108,28 +3112,25 @@ mod tests {
     #[test]
     fn test_user_initiated_disconnect_flag() {
         // Flag should distinguish user action from device loss
-        let user_flag = Rc::new(RefCell::new(false));
+        let user_flag = Rc::new(Cell::new(false));
 
         // User clicks disconnect
-        *user_flag.borrow_mut() = true;
-        assert!(*user_flag.borrow(), "Flag should be set on user action");
+        user_flag.set(true);
+        assert!(user_flag.get(), "Flag should be set on user action");
 
         // Flag should be checked before auto-reconnect
-        let should_auto_reconnect = !*user_flag.borrow();
+        let should_auto_reconnect = !user_flag.get();
         assert!(
             !should_auto_reconnect,
             "Should not auto-reconnect if user initiated"
         );
 
         // Flag should be cleared after disconnect completes
-        *user_flag.borrow_mut() = false;
-        assert!(
-            !*user_flag.borrow(),
-            "Flag should be cleared after disconnect"
-        );
+        user_flag.set(false);
+        assert!(!user_flag.get(), "Flag should be cleared after disconnect");
 
         // Device loss (not user initiated)
-        let should_auto_reconnect2 = !*user_flag.borrow();
+        let should_auto_reconnect2 = !user_flag.get();
         assert!(
             should_auto_reconnect2,
             "Should auto-reconnect on device loss"
@@ -3139,30 +3140,30 @@ mod tests {
     /// Test probing_interrupted flag logic
     #[test]
     fn test_probing_interrupted_flag() {
-        let probing_interrupted = Rc::new(RefCell::new(false));
+        let probing_interrupted = Rc::new(Cell::new(false));
 
         // Initial state: not interrupted
-        assert!(!*probing_interrupted.borrow());
+        assert!(!probing_interrupted.get());
 
         // Probing starts with auto-detect (baud == 0)
         // Flag is cleared
-        *probing_interrupted.borrow_mut() = false;
-        assert!(!*probing_interrupted.borrow());
+        probing_interrupted.set(false);
+        assert!(!probing_interrupted.get());
 
         // ondisconnect fires during probing
-        *probing_interrupted.borrow_mut() = true;
+        probing_interrupted.set(true);
         assert!(
-            *probing_interrupted.borrow(),
+            probing_interrupted.get(),
             "Flag should be set on disconnect"
         );
 
         // Polling code checks flag
-        let skip_polling = *probing_interrupted.borrow();
+        let skip_polling = probing_interrupted.get();
         assert!(skip_polling, "Should skip polling if interrupted");
 
         // Next auto-detect attempt clears flag
-        *probing_interrupted.borrow_mut() = false;
-        assert!(!*probing_interrupted.borrow());
+        probing_interrupted.set(false);
+        assert!(!probing_interrupted.get());
     }
 
     // ============ Parse Framing Edge Cases ============
