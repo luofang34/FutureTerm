@@ -99,6 +99,8 @@ impl ConnectionState {
             (Disconnected, Probing) => true, // User starts auto-detect
             (Disconnected, Connecting) => true, // User connects with specific baud
             (Disconnected, Disconnected) => true, // Idempotent (no-op)
+            (Disconnected, DeviceLost) => true, // ondisconnect fires after cleanup
+            (Disconnected, AutoReconnecting) => true, // auto-reconnect fires after cleanup
 
             // From Probing
             (Probing, Connecting) => true, // Probe complete, connecting
@@ -124,10 +126,11 @@ impl ConnectionState {
             (Disconnecting, Disconnected) => true, // Disconnect complete
 
             // From DeviceLost
-            (DeviceLost, Disconnected) => true, // User gives up
+            (DeviceLost, Disconnected) => true,  // User gives up
             (DeviceLost, Disconnecting) => true, // User initiates disconnect
             (DeviceLost, AutoReconnecting) => true, // Device replugged
-            (DeviceLost, Connecting) => true,   // Manual reconnect attempt
+            (DeviceLost, Connecting) => true,    // Manual reconnect attempt
+            (DeviceLost, DeviceLost) => true,    // Idempotent (race condition safety)
 
             // From AutoReconnecting
             (AutoReconnecting, Connected) => true, // Reconnect successful
@@ -221,6 +224,101 @@ pub fn parse_framing(s: &str) -> (u8, String, u8) {
     (d, p, s_bits)
 }
 
+/// RAII guard that ensures atomic state is unlocked and signal is synced
+///
+/// This guard is returned by `begin_exclusive_transition()` and ensures that:
+/// 1. The atomic state is always unlocked (either explicitly via `finish()` or on Drop)
+/// 2. The signal is always synchronized with the atomic state
+/// 3. Both atomic and signal are updated together atomically
+///
+/// # Usage
+/// ```
+/// let guard = manager.begin_exclusive_transition(current, Connecting)?;
+/// // ... do work ...
+/// guard.finish(Connected); // Success: unlock to Connected + sync signal
+/// // Or: drop(guard); // Error: auto-unlock to Disconnected + sync signal
+/// ```
+pub struct ExclusiveTransitionGuard {
+    pub(crate) atomic_state: Arc<AtomicConnectionState>,
+    pub(crate) set_state: WriteSignal<ConnectionState>,
+    pub(crate) set_status: WriteSignal<String>,
+}
+
+impl ExclusiveTransitionGuard {
+    /// Finish transition successfully (unlock + sync signal)
+    ///
+    /// This unlocks the atomic state to the specified final state and updates
+    /// the signal to match. The guard is consumed and Drop will not run.
+    pub fn finish(self, final_state: ConnectionState) {
+        // Unlock atomic
+        self.atomic_state.unlock_and_set(final_state);
+
+        // Update signal to match
+        self.set_state.set(final_state);
+        self.set_status.set(final_state.status_text().to_string());
+
+        // Don't run Drop (we handled cleanup)
+        std::mem::forget(self);
+    }
+}
+
+impl Drop for ExclusiveTransitionGuard {
+    fn drop(&mut self) {
+        // Panic/error path: unlock to Disconnected and sync signal
+        // This ensures BOTH atomic and signal are always synchronized
+        self.atomic_state
+            .unlock_and_set(ConnectionState::Disconnected);
+        self.set_state.set(ConnectionState::Disconnected);
+        self.set_status.set("Ready to connect".to_string());
+
+        #[cfg(debug_assertions)]
+        web_sys::console::warn_1(
+            &"ExclusiveTransitionGuard dropped without finish() - unlocking to Disconnected".into(),
+        );
+    }
+}
+
+/// RAII guard that only manages the lock bit (for orchestrator methods)
+///
+/// This simpler guard is for orchestrator methods like `connect()` that need to
+/// prevent concurrent operations but delegate state management to sub-methods.
+///
+/// Unlike ExclusiveTransitionGuard, this guard:
+/// - Does NOT set state when acquired (sub-methods call transition_to())
+/// - Only clears the lock bit on Drop (does NOT change state to Disconnected)
+///
+/// # Usage
+/// ```
+/// let _lock = manager.acquire_operation_lock()?;
+/// // Sub-methods can call transition_to() freely
+/// manager.connect_with_auto_detect(port, framing).await?;
+/// // Lock automatically released on Drop (state unchanged)
+/// ```
+pub struct OperationLockGuard {
+    pub(crate) atomic_state: Arc<AtomicConnectionState>,
+}
+
+impl ConnectionManager {
+    /// Securely finalize a connection state transition (update both signal and atomic)
+    /// This helper prevents desynchronization bugs where signal is updated but atomic isn't.
+    /// It preserves the atomic lock bit if present.
+    pub fn finalize_connection(&self, state: ConnectionState) {
+        self.atomic_state.set_preserving_lock(state);
+        self.set_state.set(state);
+    }
+}
+
+impl Drop for OperationLockGuard {
+    fn drop(&mut self) {
+        // Just clear the lock bit, don't change state
+        // Sub-methods have already set the correct state via transition_to()
+        self.atomic_state.unlock();
+
+        #[cfg(debug_assertions)]
+        web_sys::console::log_1(&"OperationLockGuard dropped - unlocking".into());
+    }
+}
+
 #[derive(Clone)]
 pub struct ConnectionManager {
     // ============ Public State Signals (for UI) ============
@@ -294,6 +392,64 @@ impl AtomicConnectionState {
     pub fn is_locked(&self) -> bool {
         let raw = self.state.load(Ordering::SeqCst);
         (raw & LOCK_FLAG) != 0
+    }
+
+    /// Try to acquire lock without changing state
+    ///
+    /// This is for orchestrator methods (like connect()) that need to prevent
+    /// concurrent operations but delegate state management to sub-methods.
+    ///
+    /// Returns Ok(current_state) if lock acquired, Err(current_state) if already locked.
+    pub fn try_lock(&self) -> Result<ConnectionState, ConnectionState> {
+        let current = self.state.load(Ordering::SeqCst);
+
+        // If already locked, fail
+        if (current & LOCK_FLAG) != 0 {
+            let state = ConnectionState::from_u8(current & STATE_MASK)
+                .unwrap_or(ConnectionState::Disconnected);
+            return Err(state);
+        }
+
+        // Try to set lock bit without changing state
+        let locked = current | LOCK_FLAG;
+        match self
+            .state
+            .compare_exchange(current, locked, Ordering::SeqCst, Ordering::SeqCst)
+        {
+            Ok(_) => {
+                let state = ConnectionState::from_u8(current & STATE_MASK)
+                    .unwrap_or(ConnectionState::Disconnected);
+                Ok(state)
+            }
+            Err(actual) => {
+                let state = ConnectionState::from_u8(actual & STATE_MASK)
+                    .unwrap_or(ConnectionState::Disconnected);
+                Err(state)
+            }
+        }
+    }
+
+    /// Unlock without changing state
+    /// Must only be called by the task that holds the lock.
+    pub fn unlock(&self) {
+        let current = self.state.load(Ordering::SeqCst);
+        let unlocked = current & STATE_MASK; // Clear lock bit, keep state
+        self.state.store(unlocked, Ordering::SeqCst);
+    }
+
+    /// Set state value while preserving lock status
+    /// This is used by transition_to() to update state during locked operations
+    pub fn set_preserving_lock(&self, new_state: ConnectionState) {
+        let current = self.state.load(Ordering::SeqCst);
+        let is_locked = (current & LOCK_FLAG) != 0;
+
+        let new_value = if is_locked {
+            new_state.to_u8() | LOCK_FLAG
+        } else {
+            new_state.to_u8()
+        };
+
+        self.state.store(new_value, Ordering::SeqCst);
     }
 
     /// Try to transition from expected state to new state with lock
@@ -971,5 +1127,217 @@ mod tests {
                 assert!(!Connecting.can_transition_to(state));
             }
         }
+    }
+
+    // ============ Synchronization and Guard Tests ============
+
+    /// Test that try_transition enforces single-lock semantics
+    /// Critical: Only one transition can hold the lock at a time
+    #[test]
+    fn test_synchronization_single_lock() {
+        let state = Arc::new(AtomicConnectionState::new(ConnectionState::Disconnected));
+
+        // First transition acquires lock
+        let r1 = state.try_transition(ConnectionState::Disconnected, ConnectionState::Connecting);
+        assert!(r1.is_ok(), "First transition should succeed");
+        assert_eq!(state.get(), ConnectionState::Connecting);
+        assert!(state.is_locked(), "State should be locked");
+
+        // Second transition fails (still locked)
+        let r2 = state.try_transition(ConnectionState::Connecting, ConnectionState::Connected);
+        assert!(r2.is_err(), "Second transition should fail while locked");
+        assert_eq!(
+            state.get(),
+            ConnectionState::Connecting,
+            "State should not change"
+        );
+
+        // After unlock, new transition succeeds
+        state.unlock_and_set(ConnectionState::Connected);
+        assert!(!state.is_locked(), "State should be unlocked");
+
+        let r3 = state.try_transition(ConnectionState::Connected, ConnectionState::Disconnecting);
+        assert!(r3.is_ok(), "Transition after unlock should succeed");
+        assert!(state.is_locked(), "State should be locked again");
+    }
+
+    /// Test that unlock_and_set clears lock bit correctly
+    #[test]
+    fn test_synchronization_unlock_clears_lock() {
+        let state = AtomicConnectionState::new(ConnectionState::Disconnected);
+
+        // Lock by transitioning
+        state
+            .try_transition(ConnectionState::Disconnected, ConnectionState::Connecting)
+            .unwrap();
+        assert!(state.is_locked());
+
+        // Unlock to different state
+        state.unlock_and_set(ConnectionState::Connected);
+
+        // Verify: state changed AND lock cleared
+        assert_eq!(state.get(), ConnectionState::Connected);
+        assert!(
+            !state.is_locked(),
+            "Lock should be cleared after unlock_and_set"
+        );
+
+        // Verify: can transition again (not locked)
+        let result =
+            state.try_transition(ConnectionState::Connected, ConnectionState::Disconnecting);
+        assert!(result.is_ok(), "Should be able to transition after unlock");
+    }
+
+    /// Test that try_transition validates state machine rules
+    /// Critical: Prevents invalid transitions at atomic level
+    #[test]
+    fn test_synchronization_validates_transitions() {
+        use ConnectionState::*;
+
+        let invalid_transitions = vec![
+            (Disconnected, Connected),  // Must go through Connecting
+            (Connected, Disconnected),  // Must go through Disconnecting
+            (Disconnecting, Connected), // Disconnecting is one-way
+            (Probing, Disconnecting),   // Cannot disconnect while probing
+        ];
+
+        for (from, to) in invalid_transitions {
+            let state = AtomicConnectionState::new(from);
+            let result = state.try_transition(from, to);
+
+            assert!(
+                result.is_err(),
+                "try_transition should reject invalid transition {:?} → {:?}",
+                from,
+                to
+            );
+            assert_eq!(
+                state.get(),
+                from,
+                "State should not change on invalid transition"
+            );
+            assert!(
+                !state.is_locked(),
+                "State should not be locked after failed transition"
+            );
+        }
+    }
+
+    /// Test concurrent access patterns
+    /// Verifies that multiple tasks cannot acquire lock simultaneously
+    #[test]
+    fn test_synchronization_concurrent_access() {
+        let state = Arc::new(AtomicConnectionState::new(ConnectionState::Disconnected));
+
+        // Task 1: Acquires lock for Connecting
+        let r1 = state.try_transition(ConnectionState::Disconnected, ConnectionState::Connecting);
+        assert!(r1.is_ok());
+
+        // Task 2: Tries to acquire lock for different transition
+        let r2 = state.try_transition(ConnectionState::Disconnected, ConnectionState::Probing);
+        assert!(r2.is_err(), "Concurrent transition should fail");
+
+        // Task 3: Tries to transition from current state (still locked)
+        let r3 = state.try_transition(ConnectionState::Connecting, ConnectionState::Connected);
+        assert!(r3.is_err(), "Cannot transition while locked");
+
+        // Task 1 completes: unlocks
+        state.unlock_and_set(ConnectionState::Connected);
+
+        // Task 2 retries: succeeds now
+        let r4 = state.try_transition(ConnectionState::Connected, ConnectionState::Disconnecting);
+        assert!(r4.is_ok(), "Should succeed after unlock");
+    }
+
+    /// Test lock/unlock cycle integrity
+    /// Verifies that lock bit is managed correctly through full cycle
+    #[test]
+    fn test_synchronization_lock_cycle_integrity() {
+        let state = AtomicConnectionState::new(ConnectionState::Disconnected);
+
+        // Cycle: Disconnected → Connecting (locked) → Connected (unlocked)
+        //                     → Disconnecting (locked) → Disconnected (unlocked)
+
+        // Phase 1: Lock for Connecting
+        assert!(!state.is_locked());
+        state
+            .try_transition(ConnectionState::Disconnected, ConnectionState::Connecting)
+            .unwrap();
+        assert!(state.is_locked());
+        assert_eq!(state.get(), ConnectionState::Connecting);
+
+        // Phase 2: Unlock to Connected
+        state.unlock_and_set(ConnectionState::Connected);
+        assert!(!state.is_locked());
+        assert_eq!(state.get(), ConnectionState::Connected);
+
+        // Phase 3: Lock for Disconnecting
+        state
+            .try_transition(ConnectionState::Connected, ConnectionState::Disconnecting)
+            .unwrap();
+        assert!(state.is_locked());
+        assert_eq!(state.get(), ConnectionState::Disconnecting);
+
+        // Phase 4: Unlock to Disconnected
+        state.unlock_and_set(ConnectionState::Disconnected);
+        assert!(!state.is_locked());
+        assert_eq!(state.get(), ConnectionState::Disconnected);
+
+        // Verify: Can start new cycle
+        let result =
+            state.try_transition(ConnectionState::Disconnected, ConnectionState::Connecting);
+        assert!(result.is_ok(), "Should be able to start new cycle");
+    }
+
+    /// Test that get() always returns current state regardless of lock
+    /// Lock bit should be transparent to state queries
+    #[test]
+    fn test_synchronization_get_ignores_lock() {
+        let state = AtomicConnectionState::new(ConnectionState::Disconnected);
+
+        // Unlocked: get() returns Disconnected
+        assert_eq!(state.get(), ConnectionState::Disconnected);
+        assert!(!state.is_locked());
+
+        // Locked: get() still returns current state (ignores lock bit)
+        state
+            .try_transition(ConnectionState::Disconnected, ConnectionState::Connecting)
+            .unwrap();
+        assert_eq!(
+            state.get(),
+            ConnectionState::Connecting,
+            "get() should return state regardless of lock"
+        );
+        assert!(state.is_locked());
+
+        // Verify lock bit doesn't affect state value
+        let state_value = state.get();
+        assert!(matches!(state_value, ConnectionState::Connecting));
+    }
+
+    // Safety Test against regression
+    #[test]
+    fn test_finalize_connection_synchronizes_states() {
+        // Mock logic: Verify set_preserving_lock works as intended for finalize_connection
+        let atomic = AtomicConnectionState::new(ConnectionState::Connecting);
+
+        // 1. Simulate locked operation (like connect_impl)
+        atomic.try_lock().unwrap();
+        assert!(atomic.is_locked());
+        assert_eq!(atomic.get(), ConnectionState::Connecting);
+
+        // 2. "Finalize" connection (transition to Connected while locked)
+        atomic.set_preserving_lock(ConnectionState::Connected);
+
+        // 3. Verify INVARIANTS:
+        assert_eq!(
+            atomic.get(),
+            ConnectionState::Connected,
+            "Atomic state must update"
+        );
+        assert!(
+            atomic.is_locked(),
+            "Lock must be preserved (for OperationLockGuard to unlock)"
+        );
     }
 }

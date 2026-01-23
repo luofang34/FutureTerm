@@ -68,56 +68,12 @@ impl ConnectionManager {
 
                             if vid == Some(target_vid) && pid == Some(target_pid) {
                                 // Match found
-                                manager_conn.transition_to(ConnectionState::AutoReconnecting);
-
-                                let user_pref_baud = baud_signal.get_untracked();
-                                let last_known_baud = detected_baud.get_untracked();
-                                let target_baud = if user_pref_baud == 0 && last_known_baud > 0 {
-                                    last_known_baud
-                                } else if user_pref_baud == 0 {
-                                    115200
-                                } else {
-                                    user_pref_baud
-                                };
-
-                                let current_framing = framing_signal.get_untracked();
-                                let final_framing_str = if current_framing == "Auto" {
-                                    "8N1".to_string()
-                                } else {
-                                    current_framing
-                                };
-
-                                spawn_local(async move {
-                                    if manager_conn.atomic_state.is_locked() {
-                                        return;
-                                    }
-
-                                    // Force disconnect cleanup
-                                    if !manager_conn.disconnect().await {
-                                        return;
-                                    }
-
-                                    manager_conn.user_initiated_disconnect.set(false);
-
-                                    let _ = wasm_bindgen_futures::JsFuture::from(
-                                            js_sys::Promise::new(&mut |r, _| {
-                                                if let Some(window) = web_sys::window() {
-                                                    let _ = window.set_timeout_with_callback_and_timeout_and_arguments_0(&r, 100);
-                                                }
-                                            })
-                                        ).await;
-
-                                    if let Err(e) = manager_conn
-                                        .connect(p, target_baud, &final_framing_str)
-                                        .await
-                                    {
-                                        web_sys::console::log_1(
-                                            &format!("Auto-reconnect failed: {}", e).into(),
-                                        );
-                                    } else {
-                                        manager_conn.set_status.set("Restored Connection".into());
-                                    }
-                                });
+                                manager_conn.trigger_auto_reconnect(
+                                    p,
+                                    baud_signal,
+                                    detected_baud,
+                                    framing_signal,
+                                );
                                 return; // Stop checking
                             }
                         }
@@ -179,55 +135,13 @@ impl ConnectionManager {
                                         .map(|v| v as u16);
 
                                     if vid == Some(target_vid) && pid == Some(target_pid) {
-                                        // Same reconnection logic
-                                        manager_conn
-                                            .transition_to(ConnectionState::AutoReconnecting);
-                                        // Duplicate logic block - could be refactored but keeping minimal change for now
-                                        let user_pref_baud = baud_signal.get_untracked();
-                                        let last_known_baud = detected_baud.get_untracked();
-                                        let target_baud =
-                                            if user_pref_baud == 0 && last_known_baud > 0 {
-                                                last_known_baud
-                                            } else if user_pref_baud == 0 {
-                                                115200
-                                            } else {
-                                                user_pref_baud
-                                            };
-                                        let current_framing = framing_signal.get_untracked();
-                                        let final_framing_str = if current_framing == "Auto" {
-                                            "8N1".to_string()
-                                        } else {
-                                            current_framing
-                                        };
-
-                                        let manager_clone = manager_conn.clone();
-                                        spawn_local(async move {
-                                            if manager_clone.atomic_state.is_locked() {
-                                                return;
-                                            }
-                                            if !manager_clone.disconnect().await {
-                                                return;
-                                            }
-                                            manager_clone.user_initiated_disconnect.set(false);
-                                            let _ = wasm_bindgen_futures::JsFuture::from(
-                                                    js_sys::Promise::new(&mut |r, _| {
-                                                        if let Some(window) = web_sys::window() {
-                                                            let _ = window.set_timeout_with_callback_and_timeout_and_arguments_0(&r, 100);
-                                                        }
-                                                    })
-                                                ).await;
-                                            if manager_clone
-                                                .connect(p, target_baud, &final_framing_str)
-                                                .await
-                                                .is_err()
-                                            {
-                                                // Log error
-                                            } else {
-                                                manager_clone
-                                                    .set_status
-                                                    .set("Restored Connection".into());
-                                            }
-                                        });
+                                        // Match found in retry
+                                        manager_conn.trigger_auto_reconnect(
+                                            p,
+                                            baud_signal,
+                                            detected_baud,
+                                            framing_signal,
+                                        );
                                         return;
                                     }
                                 }
@@ -255,9 +169,8 @@ impl ConnectionManager {
 
             let user_initiated = manager_disc.user_initiated_disconnect.get();
             if user_initiated {
-                manager_disc.clear_auto_reconnect_device();
-                manager_disc.transition_to(ConnectionState::Disconnected);
-                manager_disc.user_initiated_disconnect.set(false);
+                // User clicked disconnect. The disconnect() method is running and owns the lifecycle.
+                // We should NOT interfere or try to transition state here.
             } else {
                 manager_disc.transition_to(ConnectionState::DeviceLost);
             }
@@ -277,5 +190,104 @@ impl ConnectionManager {
                 .borrow_mut()
                 .replace((on_connect_closure, on_disconnect_closure));
         }
+    }
+
+    fn trigger_auto_reconnect(
+        &self,
+        port: web_sys::SerialPort,
+        baud_signal: Signal<u32>,
+        detected_baud: Signal<u32>,
+        framing_signal: Signal<String>,
+    ) {
+        self.transition_to(ConnectionState::AutoReconnecting);
+
+        let (target_baud, final_framing_str) = Self::calculate_reconnect_target(
+            baud_signal.get_untracked(),
+            detected_baud.get_untracked(),
+            &framing_signal.get_untracked(),
+        );
+
+        let manager = self.clone();
+        spawn_local(async move {
+            Self::execute_reconnect(manager, port, target_baud, final_framing_str).await;
+        });
+    }
+
+    async fn execute_reconnect(
+        manager: ConnectionManager,
+        port: web_sys::SerialPort,
+        target_baud: u32,
+        framing: String,
+    ) {
+        if manager.atomic_state.is_locked() {
+            return;
+        }
+
+        // Force disconnect cleanup
+        if !manager.disconnect().await {
+            return;
+        }
+
+        manager.user_initiated_disconnect.set(false);
+
+        let _ = wasm_bindgen_futures::JsFuture::from(js_sys::Promise::new(&mut |r, _| {
+            if let Some(window) = web_sys::window() {
+                let _ = window.set_timeout_with_callback_and_timeout_and_arguments_0(&r, 100);
+            }
+        }))
+        .await;
+
+        if let Err(e) = manager.connect(port, target_baud, &framing).await {
+            web_sys::console::log_1(&format!("Auto-reconnect failed: {}", e).into());
+        } else {
+            manager.set_status.set("Restored Connection".into());
+        }
+    }
+    fn calculate_reconnect_target(
+        user_pref_baud: u32,
+        last_known_baud: u32,
+        current_framing: &str,
+    ) -> (u32, String) {
+        let target_baud = if user_pref_baud == 0 && last_known_baud > 0 {
+            last_known_baud
+        } else if user_pref_baud == 0 {
+            115200
+        } else {
+            user_pref_baud
+        };
+
+        let final_framing = if current_framing == "Auto" {
+            "8N1".to_string()
+        } else {
+            current_framing.to_string()
+        };
+
+        (target_baud, final_framing)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_calculate_reconnect_target() {
+        // Case 1: All zeroes
+        let (baud, framing) = ConnectionManager::calculate_reconnect_target(0, 0, "Auto");
+        assert_eq!(baud, 115200);
+        assert_eq!(framing, "8N1");
+
+        // Case 2: Last known baud
+        let (baud, framing) = ConnectionManager::calculate_reconnect_target(0, 9600, "Auto");
+        assert_eq!(baud, 9600);
+        assert_eq!(framing, "8N1");
+
+        // Case 3: User pref takes precedence
+        let (baud, _framing) = ConnectionManager::calculate_reconnect_target(57600, 9600, "Auto");
+        assert_eq!(baud, 57600);
+
+        // Case 4: Explicit framing
+        let (_baud, framing) = ConnectionManager::calculate_reconnect_target(0, 0, "7E1");
+        assert_eq!(framing, "7E1");
     }
 }

@@ -1,6 +1,7 @@
 use super::types::parse_framing;
 use core_types::SerialConfig;
 use core_types::Transport;
+use futures::future::{select, Either};
 use leptos::*;
 use std::cell::{Cell, RefCell};
 use std::rc::Rc;
@@ -209,33 +210,64 @@ async fn gather_probe_data(
 
     if success {
         if send_wakeup {
-            let _ = t.write(b"\r\n\r\n").await;
+            let _ = t.write(b"\r").await;
         }
 
         let start = js_sys::Date::now();
-        let mut max_time = 150.0; // reduced timeout
+        let mut max_time = 150.0;
 
-        while let Ok((bytes, _ts)) = t.read_chunk().await {
-            if !bytes.is_empty() {
-                buffer.extend_from_slice(&bytes);
-                if buffer.len() > 200 {
-                    // Got enough data
-                    break;
-                }
-                // Extend timeout if we are getting data
-                max_time = 250.0;
+        loop {
+            let elapsed = js_sys::Date::now() - start;
+            if elapsed > max_time {
+                break;
             }
-            if (js_sys::Date::now() - start) > max_time {
-                if buffer.len() > 10 {
-                    // Got something, good enough
+
+            let remaining = (max_time - elapsed).max(10.0) as i32;
+
+            // Timeout Future
+            let timeout_fut = async {
+                let promise = js_sys::Promise::new(&mut |r, _| {
+                    if let Some(window) = web_sys::window() {
+                        let _ = window
+                            .set_timeout_with_callback_and_timeout_and_arguments_0(&r, remaining);
+                    }
+                });
+                let _ = wasm_bindgen_futures::JsFuture::from(promise).await;
+                None
+            };
+
+            // Read Future
+            let read_fut = async { t.read_chunk().await.ok() };
+
+            // Race: Read vs Timeout
+            // We use Box::pin to ensure safety with select
+            let result = match select(Box::pin(read_fut), Box::pin(timeout_fut)).await {
+                Either::Left((res, _)) => res,
+                Either::Right((res, _)) => res,
+            };
+
+            match result {
+                Some((bytes, _ts)) => {
+                    if !bytes.is_empty() {
+                        buffer.extend_from_slice(&bytes);
+
+                        // Adaptive strategy: If we find data, extend the probe window slightly
+                        // to capture the full message, but don't hang forever.
+                        if buffer.len() > 200 {
+                            break; // Enough data
+                        }
+                        max_time = 250.0;
+                    }
+                }
+                None => {
+                    // Timeout occurred
                     break;
                 }
-                if max_time < 300.0 {
-                    max_time = 250.0;
-                }
-                if buffer.len() > 64 && analysis::calculate_score_8n1(&buffer) > 0.90 {
-                    break;
-                }
+            }
+
+            // Extra safety exit
+            if buffer.len() > 64 && analysis::calculate_score_8n1(&buffer) > 0.90 {
+                break;
             }
         }
 
@@ -282,18 +314,10 @@ fn verify_mavlink_integrity(buffer: &[u8]) -> bool {
             };
 
             if res.is_ok() {
-                web_sys::console::log_1(
-                    &format!("DEBUG: MAVLink VERIFIED. Magic: {:02X}", magic).into(),
-                );
+                log::debug!("MAVLink VERIFIED. Magic: {:02X}", magic);
                 return true;
             } else {
-                web_sys::console::log_1(
-                    &format!(
-                        "DEBUG: MAVLink Magic found but parse failed ({:?}).",
-                        res.err()
-                    )
-                    .into(),
-                );
+                log::debug!("MAVLink Magic found but parse failed ({:?}).", res.err());
             }
 
             let Some(next_reader) = reader.get(idx + 1..) else {
@@ -338,4 +362,35 @@ pub async fn smart_probe_framing(
     }
 
     ("8N1".to_string(), buf_8n1, None)
+}
+
+#[cfg(test)]
+#[cfg(feature = "mavlink")]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_mavlink_verification_valid_v1() {
+        // MAVLink v1 HEARTBEAT (fe 09 4e 01 01 00 00 00 00 00 02 03 51 04 03 1c 7f)
+        let msg = vec![
+            0xfe, 0x09, 0x4e, 0x01, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x02, 0x03, 0x51, 0x04,
+            0x03, 0x1c, 0x7f,
+        ];
+        assert!(verify_mavlink_integrity(&msg));
+    }
+
+    #[test]
+    fn test_mavlink_verification_invalid_magic() {
+        let msg = vec![
+            0xff, 0x09, 0x4e, 0x01, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x02, 0x03, 0x51, 0x04,
+            0x03, 0x1c, 0x7f,
+        ];
+        assert!(!verify_mavlink_integrity(&msg));
+    }
+
+    #[test]
+    fn test_mavlink_verification_too_short() {
+        let msg = vec![0xfe, 0x09, 0x4e];
+        assert!(!verify_mavlink_integrity(&msg));
+    }
 }

@@ -12,7 +12,6 @@ use futures::stream::StreamExt;
 use futures::FutureExt;
 use futures_channel::{mpsc, oneshot};
 use leptos::*;
-use std::sync::Arc;
 use transport_webserial::WebSerialTransport;
 use wasm_bindgen_futures::spawn_local;
 
@@ -82,10 +81,9 @@ impl ConnectionManager {
                     );
 
                     // Transition from Connecting to Connected
-                    self.set_state.set(ConnectionState::Connected); // Update signal
-                                                                    // We don't need transition_to here because atomic state connection logic handles the lock?
-                                                                    // Wait, connect() wrapper handles the lock.
-                                                                    // So here we assume lock is held.
+                    // Transition from Connecting to Connected
+                    // Use helper to ensure atomic state is synchronized with signal
+                    self.finalize_connection(ConnectionState::Connected);
 
                     // Update detected config for UI
                     self.set_detected_baud.set(baud);
@@ -97,18 +95,9 @@ impl ConnectionManager {
                     // Notify Worker
                     self.send_worker_config(baud);
 
-                    // Replay Initial Buffer
                     if let Some(buf) = initial_buffer {
                         if !buf.is_empty() {
-                            let start_idx = buf
-                                .iter()
-                                .position(|&x| x != b'\r' && x != b'\n')
-                                .unwrap_or(0);
-                            let clean_buf = if let Some(slice) = buf.get(start_idx..) {
-                                slice.to_vec()
-                            } else {
-                                Vec::new()
-                            };
+                            let clean_buf = ConnectionManager::sanitize_initial_buffer(&buf);
 
                             if !clean_buf.is_empty() {
                                 if let Some(w) = self.worker.get_untracked() {
@@ -229,7 +218,13 @@ impl ConnectionManager {
             web_sys::console::log_1(&"DEBUG: Transport closed".into());
 
             let current_state = manager.state.get_untracked();
-            if current_state == ConnectionState::Connected {
+
+            // Fix: Check if disconnect was user-initiated to prevent race condition
+            // If user clicked disconnect, we expect the loop to break, but we shouldn't
+            // transition to DeviceLost. The disconnect() method handles the transition to Disconnected.
+            let user_initiated = manager.user_initiated_disconnect.get();
+
+            if !user_initiated && current_state == ConnectionState::Connected {
                 manager.transition_to(ConnectionState::DeviceLost);
             }
 
@@ -239,34 +234,15 @@ impl ConnectionManager {
 
     pub async fn disconnect(&self) -> bool {
         let current_state = self.atomic_state.get();
-        if !current_state.can_disconnect() {
-            return false;
-        }
 
-        if self
-            .atomic_state
-            .try_transition(current_state, ConnectionState::Disconnecting)
-            .is_err()
-        {
-            return false;
-        }
-
-        let atomic_state = Arc::clone(&self.atomic_state);
-        let _guard = scopeguard::guard((), move |_| {
-            atomic_state.unlock_and_set(ConnectionState::Disconnected);
-        });
+        // Single atomic operation: lock + sync signal
+        let guard =
+            match self.begin_exclusive_transition(current_state, ConnectionState::Disconnecting) {
+                Ok(g) => g,
+                Err(_) => return false,
+            };
 
         self.user_initiated_disconnect.set(true);
-
-        // CRITICAL: Always update signal to match atomic state
-        // This keeps atomic_state and Leptos signal synchronized
-        //
-        // Background: try_transition() at line 248 updated atomic_state
-        // to Disconnecting, but did NOT update the Leptos signal.
-        //
-        // If we skip this call, transition_to(Disconnected) at line 294
-        // will validate using stale signal state, causing panic.
-        self.transition_to(ConnectionState::Disconnecting);
 
         let handle = self.connection_handle.borrow_mut().take();
         if let Some(h) = handle {
@@ -292,12 +268,11 @@ impl ConnectionManager {
 
         self.active_port.borrow_mut().take();
         self.clear_auto_reconnect_device();
-        self.transition_to(ConnectionState::Disconnected);
         self.user_initiated_disconnect.set(false);
 
-        drop(_guard);
-        self.atomic_state
-            .unlock_and_set(ConnectionState::Disconnected);
+        // Success: finish with Disconnected state (unlocks + syncs signal)
+        guard.finish(ConnectionState::Disconnected);
+        // Error path: guard Drop automatically handles cleanup
 
         true
     }
@@ -388,5 +363,55 @@ impl ConnectionManager {
         } else {
             self.transition_to(ConnectionState::Disconnected);
         }
+    }
+
+    // Helper to clean initial buffer junk
+    pub(crate) fn sanitize_initial_buffer(buf: &[u8]) -> Vec<u8> {
+        // SKIP leading CR/LF/NULL/Junk
+        let start_idx = buf
+            .iter()
+            .position(|&x| x != b'\r' && x != b'\n' && x != 0)
+            .unwrap_or(buf.len());
+
+        if let Some(slice) = buf.get(start_idx..) {
+            slice.to_vec()
+        } else {
+            Vec::new()
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::ConnectionManager;
+
+    #[test]
+    fn test_sanitize_initial_buffer() {
+        // Wrapper for convenience
+        let sanitize = |buf: &[u8]| -> Vec<u8> { ConnectionManager::sanitize_initial_buffer(buf) };
+
+        // 1. Clean buffer (no change)
+        assert_eq!(sanitize(b"Hello"), b"Hello");
+        assert_eq!(sanitize(b"(prompt)"), b"(prompt)");
+
+        // 2. Leading newlines (strip)
+        assert_eq!(sanitize(b"\r\nHello"), b"Hello");
+        assert_eq!(sanitize(b"\nHello"), b"Hello");
+        assert_eq!(sanitize(b"\rHello"), b"Hello");
+
+        // 3. Leading Nulls (strip)
+        assert_eq!(sanitize(&[0, 0, b'H', b'i']), b"Hi");
+
+        // 4. Mixed junk
+        assert_eq!(sanitize(&[0, b'\r', b'\n', 0, b'A']), b"A");
+
+        // 5. Embedded newlines (keep)
+        assert_eq!(sanitize(b"Line1\r\nLine2"), b"Line1\r\nLine2");
+
+        // 6. Empty buffer
+        assert_eq!(sanitize(b""), b"");
+
+        // 7. All junk
+        assert_eq!(sanitize(b"\r\n\0\0\r"), b"");
     }
 }

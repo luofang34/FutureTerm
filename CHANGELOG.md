@@ -5,30 +5,28 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [0.1.1] - 2026-01-23
 
 ### Added
-- **Modular Architecture**: Split monolithic `connection.rs` (3,700+ lines) into maintainable storage modules:
-  - `types.rs`: Core data structures and Active FSM.
-  - `prober.rs`: Intelligent auto-detection and smart framing logic.
-  - `driver.rs`: Low-level I/O and loop management.
-  - `reconnect.rs`: Robust auto-reconnection with exponential backoff.
-  - `connection.rs`: Facade for orchestration.
-- **Active FSM Driver**: Replaced "Passive Observer" FSM with "Active Driver" FSM.
-  - **Thread Safety**: Unified `state` and `lock` into a single `AtomicU8` (`AtomicConnectionState`).
-  - **Correctness**: Transitions acts as locks (Compare-and-Swap), eliminating race conditions between flags and state.
-  - **Maintainability**: Centralized state transition logic; impossible to be in an invalid state.
-- **Helper methods**: added `to_u8`/`from_u8` serialization for atomic state storage.
+- **Active FSM Driver**: Replaced passive state observation with an "Active Driver" FSM:
+  - **Atomic Safety**: Unified state and lock into `AtomicConnectionState` (AtomicU8).
+  - **CAS Transitions**: State transitions now act as explicit locks, preventing race conditions.
+  - **Safety Helpers**: Added `finalize_connection` to prevent state/signal desynchronization.
+- **Smart Probing v2**:
+  - **Timeout Protection**: Added per-baud-rate timeouts to prevent hanging on silent devices.
+  - **Clean Wakeup**: Reduced wakeup signal to single `\r` to prevent double prompts.
+- **Buffer Hygiene**:
+  - **Sanitization**: Added logic to strip leading junk/control characters from initial connection output, ensuring prompt alignment.
 
 ### Fixed
-- **State Transition Bug**: Allowed `AutoReconnecting -> Disconnecting` transition.
-  - User can now cancel an auto-reconnect loop by clicking Disconnect.
-- **Compilation**: Fixed missing constants and async logic in probe recovery.
-- **Test Coverage**: Restored comprehensive integration test suite for connection flows.
+- **Probing Hang**: Fixed infinite loop when probing silent devices by implementing a robust race-safe timeout.
+- **Double Prompt**: Fixed duplicate command prompts caused by aggressive `\r\n\r\n` wakeup signals.
+- **State Desync**: Fixed "Signal Lagging" error where atomic state and signals drifted apart during connection.
+- **Disconnect Loop**: Fixed invalid `DeviceLost` state handling by allowing idempotent transitions.
+- **UI Responsiveness**: Fixed "Disconnect" button being unresponsive during auto-reconnect loops.
 
 ### Changed
-- Refactored `ConnectionManager` to use `AtomicConnectionState` instead of scattered `AtomicBool` flags (`is_connecting`, `is_disconnecting`).
-- Widened exports in `connection.rs` to ensure all auxiliary types are available to the application.
+- **Modular Architecture**: Split `connection.rs` (3,700+ lines) into `types.rs`, `prober.rs`, `driver.rs`, and `reconnect.rs`.
 
 ---
 

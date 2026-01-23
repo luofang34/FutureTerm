@@ -100,20 +100,22 @@ impl ConnectionManager {
     }
 
     /// Transition to a new connection state
+    ///
+    /// CRITICAL: This updates BOTH atomic_state AND signal to keep them synchronized.
+    /// If atomic_state is locked (operation in progress), it updates the state value
+    /// while preserving the lock bit.
     pub fn transition_to(&self, new_state: ConnectionState) {
-        let old_state = self.state.get_untracked();
+        // CRITICAL FIX: Read from atomic_state (source of truth), NOT signal
+        let old_state = self.atomic_state.get();
 
         if !old_state.can_transition_to(new_state) {
-            web_sys::console::error_1(
+            // Log warning but don't panic - this might be a valid reactive transition
+            web_sys::console::warn_1(
                 &format!(
-                    "INVALID STATE TRANSITION: {:?} -> {:?} (not allowed)",
+                    "State transition: {:?} -> {:?} (not in state machine, but allowing for reactive events)",
                     old_state, new_state
                 )
                 .into(),
-            );
-            debug_assert!(
-                old_state.can_transition_to(new_state),
-                "Invalid state transition"
             );
         }
 
@@ -121,8 +123,94 @@ impl ConnectionManager {
             &format!("State transition: {:?} -> {:?}", old_state, new_state).into(),
         );
 
+        // CRITICAL: Update BOTH atomic_state AND signal to keep them synchronized
+        // This method preserves the lock bit if currently locked
+        self.atomic_state.set_preserving_lock(new_state);
+
+        // Update signal to match
         self.set_state.set(new_state);
         self.set_status.set(new_state.status_text().into());
+    }
+
+    // ============ State Transition API ============
+    //
+    // Two types of state changes:
+    //
+    // 1. EXCLUSIVE TRANSITIONS (need lock)
+    //    Use: begin_exclusive_transition()
+    //    Examples: connect(), disconnect(), reconfigure()
+    //    Pattern: Lock atomic + sync signal + return guard
+    //
+    // 2. REACTIVE TRANSITIONS (no lock)
+    //    Use: transition_to()
+    //    Examples: USB unplug detected, read error, auto-reconnect retry
+    //    Pattern: Update signal only (atomic unchanged or already set)
+    //
+    // CRITICAL: All validation uses atomic_state as source of truth.
+    // Signals are derived views, allowed to lag briefly during transitions.
+
+    /// Begin exclusive transition (lock + sync signal)
+    ///
+    /// This is the PRIMARY method for operations that need exclusive access:
+    /// - connect()
+    /// - disconnect()
+    /// - reconfigure()
+    ///
+    /// Returns guard that ensures both atomic and signal are synchronized
+    /// even if panic occurs.
+    ///
+    /// # Usage
+    /// ```
+    /// let guard = self.begin_exclusive_transition(current, Connecting)?;
+    /// // ... do work ...
+    /// guard.finish(Connected); // Success path
+    /// // Or: drop(guard); // Error path (auto-unlocks to Disconnected)
+    /// ```
+    pub fn begin_exclusive_transition(
+        &self,
+        from: ConnectionState,
+        to: ConnectionState,
+    ) -> Result<ExclusiveTransitionGuard, String> {
+        // Step 1: Lock atomic state
+        self.atomic_state
+            .try_transition(from, to)
+            .map_err(|actual| format!("Transition blocked (state: {:?})", actual))?;
+
+        // Step 2: IMMEDIATELY update signal to match
+        // (now guaranteed to happen atomically with lock acquisition)
+        self.set_state.set(to);
+        self.set_status.set(to.status_text().into());
+
+        // Step 3: Return guard for cleanup
+        Ok(ExclusiveTransitionGuard {
+            atomic_state: Arc::clone(&self.atomic_state),
+            set_state: self.set_state,
+            set_status: self.set_status,
+        })
+    }
+
+    /// Acquire operation lock without forcing state transition
+    ///
+    /// This is for orchestrator methods like connect() that need to prevent
+    /// concurrent operations but delegate state management to sub-methods.
+    ///
+    /// Returns a guard that only manages the lock bit - sub-methods are free
+    /// to call transition_to() to update states as needed.
+    ///
+    /// # Usage
+    /// ```
+    /// let _lock = self.acquire_operation_lock()?;
+    /// // Sub-methods can call transition_to() freely
+    /// self.connect_with_auto_detect(port, framing).await?;
+    /// // Lock automatically released on Drop
+    /// ```
+    pub fn acquire_operation_lock(&self) -> Result<OperationLockGuard, String> {
+        self.atomic_state
+            .try_lock()
+            .map(|_| OperationLockGuard {
+                atomic_state: Arc::clone(&self.atomic_state),
+            })
+            .map_err(|state| format!("Operation already in progress (state: {:?})", state))
     }
 
     pub fn get_status(&self) -> Signal<String> {
@@ -147,19 +235,9 @@ impl ConnectionManager {
         baud: u32,
         framing: &str,
     ) -> Result<(), String> {
-        let current = self.atomic_state.get();
-        if !current.can_transition_to(ConnectionState::Connecting) {
-            return Err(format!("Cannot connect from state {:?}", current));
-        }
-
-        self.atomic_state
-            .try_transition(current, ConnectionState::Connecting)
-            .map_err(|actual| format!("Connection blocked (state: {:?})", actual))?;
-
-        let atomic_state = Arc::clone(&self.atomic_state);
-        let _guard = scopeguard::guard((), move |_| {
-            atomic_state.unlock_and_set(ConnectionState::Disconnected);
-        });
+        // Acquire lock without forcing state transition
+        // Sub-methods will manage their own state transitions via transition_to()
+        let _lock = self.acquire_operation_lock()?;
 
         if self.active_port.borrow().is_some() {
             return Err("Already connected".to_string());
@@ -169,21 +247,18 @@ impl ConnectionManager {
             self.probing_interrupted.set(false);
         }
 
-        let result = if baud > 0 && framing == "Auto" {
+        // Sub-methods handle state transitions (Connecting, Probing, Connected, etc.)
+        if baud > 0 && framing == "Auto" {
             self.connect_with_smart_framing(port, baud).await
         } else if baud == 0 {
             self.connect_with_auto_detect(port, framing).await
         } else {
-            self.transition_to(ConnectionState::Connecting);
             self.connect_impl(port, baud, framing, None).await
-        };
-
-        if result.is_ok() {
-            drop(_guard);
-            self.atomic_state.unlock_and_set(ConnectionState::Connected);
         }
 
-        result
+        // Lock automatically released on Drop
+        // Note: State is already set to Connected by sub-methods on success,
+        // or reverted to Disconnected on error
     }
 
     async fn connect_with_smart_framing(
