@@ -1803,9 +1803,14 @@ impl ConnectionManager {
             flow_control: "none".into(),
         };
 
-        // Transition to Connecting state (required for valid state machine transition)
+        // Transition to Connecting state if not already there
+        // Some callers (connect_with_auto_detect, connect_with_smart_framing) already
+        // transition to Connecting before calling us. Only transition if needed.
         // Valid transitions: Disconnected → Connecting, Probing → Connecting
-        self.transition_to(ConnectionState::Connecting);
+        let current_state = self.state.get_untracked();
+        if current_state != ConnectionState::Connecting {
+            self.transition_to(ConnectionState::Connecting);
+        }
 
         let mut t = WebSerialTransport::new();
 
@@ -1825,7 +1830,29 @@ impl ConnectionManager {
                         cmd_tx: cmd_tx.clone(),
                         completion_rx,
                     });
-                    *self.active_port.borrow_mut() = Some(port);
+                    *self.active_port.borrow_mut() = Some(port.clone());
+
+                    // Save VID/PID for auto-reconnect
+                    let info = port.get_info();
+                    let vid = js_sys::Reflect::get(&info, &"usbVendorId".into())
+                        .ok()
+                        .and_then(|v| v.as_f64())
+                        .map(|v| v as u16);
+                    let pid = js_sys::Reflect::get(&info, &"usbProductId".into())
+                        .ok()
+                        .and_then(|v| v.as_f64())
+                        .map(|v| v as u16);
+
+                    if let Some(set_vid) = *self.set_last_vid.borrow() {
+                        set_vid.set(vid);
+                    }
+                    if let Some(set_pid) = *self.set_last_pid.borrow() {
+                        set_pid.set(pid);
+                    }
+
+                    web_sys::console::log_1(
+                        &format!("DEBUG: Saved VID/PID for auto-reconnect: {:?}/{:?}", vid, pid).into()
+                    );
 
                     // Transition from Connecting to Connected (port successfully opened)
                     self.transition_to(ConnectionState::Connected);
