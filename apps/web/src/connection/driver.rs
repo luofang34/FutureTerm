@@ -235,19 +235,23 @@ impl ConnectionManager {
     pub async fn disconnect(&self) -> bool {
         let current_state = self.atomic_state.get();
 
+        // Set coordination flags BEFORE acquiring guard
+        // These flags signal async tasks to abort, and must be set even if guard acquisition fails
+        self.user_initiated_disconnect.set(true);
+        if current_state == ConnectionState::Probing {
+            self.probing_interrupted.set(true);
+        }
+
         // Single atomic operation: lock + sync signal
         let guard =
             match self.begin_exclusive_transition(current_state, ConnectionState::Disconnecting) {
                 Ok(g) => g,
-                Err(_) => return false,
+                Err(_) => {
+                    // Guard acquisition failed, but flags are already set to abort ongoing operations
+                    // The async task will see the flags and clean up
+                    return false;
+                }
             };
-
-        self.user_initiated_disconnect.set(true);
-
-        // If disconnecting during probing, signal the probe loop to abort
-        if current_state == ConnectionState::Probing {
-            self.probing_interrupted.set(true);
-        }
 
         let handle = self.connection_handle.borrow_mut().take();
         if let Some(h) = handle {
