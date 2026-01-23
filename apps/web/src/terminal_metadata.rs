@@ -8,50 +8,57 @@ fn count_visible_chars(s: &str) -> usize {
 
     while idx < bytes.len() {
         // Skip ANSI escape sequences
-        if bytes.get(idx) == Some(&0x1B) && idx + 1 < bytes.len() {
-            if bytes.get(idx + 1) == Some(&b'[') {
-                // CSI sequence
-                idx += 2;
-                while idx < bytes.len() {
-                    if let Some(&b) = bytes.get(idx) {
-                        if b.is_ascii_alphabetic() {
-                            break;
-                        }
-                    }
-                    idx += 1;
-                }
-                idx += 1; // Skip the terminating letter
-                continue;
-            } else if bytes.get(idx + 1) == Some(&b']') {
-                // OSC sequence
-                idx += 2;
-                while idx < bytes.len() {
-                    if bytes.get(idx) == Some(&0x07) {
-                        idx += 1;
-                        break;
-                    } else if idx + 1 < bytes.len()
-                        && bytes.get(idx) == Some(&0x1B)
-                        && bytes.get(idx + 1) == Some(&b'\\')
-                    {
+        if let Some(&byte) = bytes.get(idx) {
+            if byte == 0x1B && idx + 1 < bytes.len() {
+                if let Some(&next_byte) = bytes.get(idx + 1) {
+                    if next_byte == b'[' {
+                        // CSI sequence
                         idx += 2;
-                        break;
+                        while idx < bytes.len() {
+                            if let Some(&b) = bytes.get(idx) {
+                                if b.is_ascii_alphabetic() {
+                                    break;
+                                }
+                            }
+                            idx += 1;
+                        }
+                        idx += 1; // Skip the terminating letter
+                        continue;
+                    } else if next_byte == b']' {
+                        // OSC sequence
+                        idx += 2;
+                        while idx < bytes.len() {
+                            if let Some(&b) = bytes.get(idx) {
+                                if b == 0x07 {
+                                    idx += 1;
+                                    break;
+                                } else if idx + 1 < bytes.len() {
+                                    if let (Some(&b1), Some(&b2)) =
+                                        (bytes.get(idx), bytes.get(idx + 1))
+                                    {
+                                        if b1 == 0x1B && b2 == b'\\' {
+                                            idx += 2;
+                                            break;
+                                        }
+                                    }
+                                }
+                            }
+                            idx += 1;
+                        }
+                        continue;
                     }
-                    idx += 1;
                 }
-                continue;
             }
-        }
 
-        // Skip carriage return and newline (they're not visible column positions)
-        if let Some(&b) = bytes.get(idx) {
-            if b == b'\r' || b == b'\n' {
+            // Skip carriage return and newline (they're not visible column positions)
+            if byte == b'\r' || byte == b'\n' {
                 idx += 1;
                 continue;
             }
-        }
 
-        // Count visible character
-        count += 1;
+            // Count visible character
+            count += 1;
+        }
         idx += 1;
     }
 
@@ -160,42 +167,51 @@ impl TerminalMetadata {
 
         while byte_idx < raw_bytes.len() {
             // Check for ANSI escape sequence: ESC [ ... (letter)
-            if raw_bytes.get(byte_idx) == Some(&0x1B) && byte_idx + 1 < raw_bytes.len() {
-                if raw_bytes.get(byte_idx + 1) == Some(&b'[') {
-                    // ANSI CSI sequence: ESC [ ... (letter)
-                    byte_idx += 2;
-                    while byte_idx < raw_bytes.len() {
-                        if let Some(&c) = raw_bytes.get(byte_idx) {
-                            byte_idx += 1;
-                            // CSI sequences end with a letter (0x40-0x7E range)
-                            if (0x40..=0x7E).contains(&c) {
-                                break;
-                            }
-                        } else {
-                            break;
-                        }
-                    }
-                    // Skip ANSI sequences (don't add to map, don't increment column)
-                    continue;
-                } else if raw_bytes.get(byte_idx + 1) == Some(&b']') {
-                    // OSC sequence: ESC ] ... ST (ESC \ or BEL)
-                    byte_idx += 2;
-                    while byte_idx < raw_bytes.len() {
-                        if raw_bytes.get(byte_idx) == Some(&0x07) {
-                            // BEL terminator
-                            byte_idx += 1;
-                            break;
-                        } else if byte_idx + 1 < raw_bytes.len()
-                            && raw_bytes.get(byte_idx) == Some(&0x1B)
-                            && raw_bytes.get(byte_idx + 1) == Some(&b'\\')
-                        {
-                            // ESC \ terminator
+            if let Some(&byte) = raw_bytes.get(byte_idx) {
+                if byte == 0x1B && byte_idx + 1 < raw_bytes.len() {
+                    if let Some(&next_byte) = raw_bytes.get(byte_idx + 1) {
+                        if next_byte == b'[' {
+                            // ANSI CSI sequence: ESC [ ... (letter)
                             byte_idx += 2;
-                            break;
+                            while byte_idx < raw_bytes.len() {
+                                if let Some(&c) = raw_bytes.get(byte_idx) {
+                                    byte_idx += 1;
+                                    // CSI sequences end with a letter (0x40-0x7E range)
+                                    if (0x40..=0x7E).contains(&c) {
+                                        break;
+                                    }
+                                } else {
+                                    break;
+                                }
+                            }
+                            // Skip ANSI sequences (don't add to map, don't increment column)
+                            continue;
+                        } else if next_byte == b']' {
+                            // OSC sequence: ESC ] ... ST (ESC \ or BEL)
+                            byte_idx += 2;
+                            while byte_idx < raw_bytes.len() {
+                                if let Some(&b) = raw_bytes.get(byte_idx) {
+                                    if b == 0x07 {
+                                        // BEL terminator
+                                        byte_idx += 1;
+                                        break;
+                                    } else if byte_idx + 1 < raw_bytes.len() {
+                                        if let (Some(&b1), Some(&b2)) =
+                                            (raw_bytes.get(byte_idx), raw_bytes.get(byte_idx + 1))
+                                        {
+                                            if b1 == 0x1B && b2 == b'\\' {
+                                                // ESC \ terminator
+                                                byte_idx += 2;
+                                                break;
+                                            }
+                                        }
+                                    }
+                                }
+                                byte_idx += 1;
+                            }
+                            continue;
                         }
-                        byte_idx += 1;
                     }
-                    continue;
                 }
             }
 
@@ -223,20 +239,20 @@ impl TerminalMetadata {
 
             // Regular character (UTF-8)
             let char_start = byte_idx;
-            let char_len = if let Some(&b) = raw_bytes.get(byte_idx) {
-                if b & 0x80 == 0 {
+            let char_len = if let Some(&byte) = raw_bytes.get(byte_idx) {
+                if byte & 0x80 == 0 {
                     1 // ASCII (0xxxxxxx)
-                } else if b & 0xE0 == 0xC0 {
+                } else if byte & 0xE0 == 0xC0 {
                     2 // 2-byte UTF-8 (110xxxxx)
-                } else if b & 0xF0 == 0xE0 {
+                } else if byte & 0xF0 == 0xE0 {
                     3 // 3-byte UTF-8 (1110xxxx)
-                } else if b & 0xF8 == 0xF0 {
+                } else if byte & 0xF8 == 0xF0 {
                     4 // 4-byte UTF-8 (11110xxx)
                 } else {
                     1 // Invalid, treat as single byte
                 }
             } else {
-                break; // End of buffer
+                1 // Out of bounds, treat as single byte
             };
 
             map.push(CharByteMapping {
@@ -780,19 +796,20 @@ mod tests {
 
         let bytes1 = b"Line1\nLine2";
         let bytes2 = b"Line3";
-        meta.record_write(bytes1, "Line1\nLine2", 1000); // Lines 0-1
-        meta.record_write(bytes2, "Line3", 2000); // Line 2
+        // Note: "Line2" has no trailing newline, so "Line3" continues on same line
+        meta.record_write(bytes1, "Line1\nLine2", 1000); // span1: Lines 0-1 (covers 0-2 exclusive)
+        meta.record_write(bytes2, "Line3", 2000); // span2: Line 1 continuation (covers 1-2 exclusive)
 
-        // Query lines 0-1 (first span)
-        let result = meta.terminal_lines_to_bytes(0, 2);
+        // Query line 0 only - should return only span1
+        let result = meta.terminal_lines_to_bytes(0, 1);
         assert_eq!(result, Some((0, 11)));
 
-        // Query line 2 (second span)
-        let result = meta.terminal_lines_to_bytes(2, 3);
-        assert_eq!(result, Some((11, 16)));
+        // Query lines 0-2 - both spans overlap this range
+        let result = meta.terminal_lines_to_bytes(0, 2);
+        assert_eq!(result, Some((0, 16)));
 
-        // Query all lines
-        let result = meta.terminal_lines_to_bytes(0, 3);
+        // Query line 1 only - both spans cover line 1
+        let result = meta.terminal_lines_to_bytes(1, 2);
         assert_eq!(result, Some((0, 16)));
     }
 
@@ -802,20 +819,21 @@ mod tests {
 
         let bytes1 = b"Line1\nLine2";
         let bytes2 = b"Line3";
-        meta.record_write(bytes1, "Line1\nLine2", 1000); // Lines 0-1, bytes 0-11
-        meta.record_write(bytes2, "Line3", 2000); // Line 2, bytes 11-16
+        // Note: "Line2" has no trailing newline, so "Line3" continues on same line
+        meta.record_write(bytes1, "Line1\nLine2", 1000); // span1: Lines 0-1, bytes 0-11
+        meta.record_write(bytes2, "Line3", 2000); // span2: Line 1 continuation, bytes 11-16
 
-        // Query bytes 0-11 (first span)
+        // Query bytes 0-11 (span1 only)
         let result = meta.bytes_to_terminal_lines(0, 11);
-        assert_eq!(result, Some((0, 2)));
+        assert_eq!(result, Some((0, 2))); // span1 covers lines 0-2 (exclusive)
 
-        // Query bytes 11-16 (second span)
+        // Query bytes 11-16 (span2 only)
         let result = meta.bytes_to_terminal_lines(11, 16);
-        assert_eq!(result, Some((2, 3)));
+        assert_eq!(result, Some((1, 2))); // span2 covers lines 1-2 (exclusive)
 
-        // Query all bytes
+        // Query all bytes (both spans)
         let result = meta.bytes_to_terminal_lines(0, 16);
-        assert_eq!(result, Some((0, 3)));
+        assert_eq!(result, Some((0, 2))); // Combined: lines 0-2 (exclusive)
     }
 
     #[test]
