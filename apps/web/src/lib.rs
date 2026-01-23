@@ -8,7 +8,7 @@ use web_sys::{MessageEvent, Worker};
 // Imports Cleaned
 
 mod connection;
-use connection::ConnectionManager;
+use connection::{ConnectionManager, ConnectionState};
 
 mod hex_view;
 // mod mavlink_view; // Removed duplicate
@@ -47,7 +47,10 @@ pub fn App() -> impl IntoView {
     // Connection Manager encapsulates Status, Connected, Transport, Port
     let manager = ConnectionManager::new(worker.into());
     let status = manager.get_status();
-    let connected = manager.get_connected();
+
+    // Derive connected signal from state machine
+    let state_signal = manager.state;
+    let connected = Signal::derive(move || state_signal.get() == ConnectionState::Connected);
 
     let detected_baud = manager.detected_baud;
     let detected_framing = manager.detected_framing;
@@ -273,16 +276,38 @@ pub fn App() -> impl IntoView {
 
     let on_connect = move |force_picker: bool| {
         let shift_held = force_picker;
-        // Toggle Logic
-        if connected.get() && !force_picker {
-            // Disconnect Logic
+        // Use state machine to determine button behavior
+        let current_state = manager_disc.state.get();
+
+        web_sys::console::log_1(
+            &format!(
+                "DEBUG: Button clicked - state={:?}, force_picker={}, can_disconnect={}",
+                current_state,
+                force_picker,
+                current_state.can_disconnect()
+            )
+            .into(),
+        );
+
+        // Allow disconnect if state allows it (Connected, AutoReconnecting, or DeviceLost)
+        if current_state.can_disconnect() && !force_picker {
+            // Disconnect Logic - cancels auto-reconnect OR disconnects active connection
+            web_sys::console::log_1(&"DEBUG: Executing disconnect logic".into());
             let manager_d = manager_disc.clone();
             spawn_local(async move {
                 manager_d.disconnect().await;
-                manager_d.set_status.set("Disconnected".into());
             });
             return;
         }
+
+        web_sys::console::log_1(
+            &format!(
+                "DEBUG: Executing connect logic (can_disconnect={}, force_picker={})",
+                current_state.can_disconnect(),
+                force_picker
+            )
+            .into(),
+        );
 
         // Reset detected info
         manager.set_detected_baud.set(0);
@@ -339,8 +364,7 @@ pub fn App() -> impl IntoView {
 
             if let Some(port) = final_port {
                 // Hot-Swap: If already connected, close the old connection first!
-                // Hot-Swap: If already connected, close the old connection first!
-                if manager.connected.get_untracked() {
+                if manager.state.get_untracked() == ConnectionState::Connected {
                     manager.set_status.set("Switching Port...".into());
                     manager.disconnect().await;
                 }
@@ -590,20 +614,16 @@ pub fn App() -> impl IntoView {
 
                 // Status Light
                 <div style=move || {
-                    let is_conn = connected.get();
-                     // Use status text as proxy for "Connecting..." since is_reconfiguring might not cover initial connection
-                    let s = status.get();
-                    let is_busy = s.to_lowercase().contains("connecting") || s.to_lowercase().contains("scanning") || s.to_lowercase().contains("reconfiguring");
-
-                    let color = if is_conn && !is_busy {
-                        "rgb(95, 200, 85)" // Connected (Green)
-                    } else if is_busy {
-                        "rgb(245, 190, 80)" // Connecting/Busy (Orange)
+                    // Use state machine to determine indicator color and animation
+                    let current_state = manager.state.get();
+                    let color = current_state.indicator_color();
+                    let animation = if current_state.indicator_should_pulse() {
+                        "animation: pulse 0.3s ease-in-out infinite;"
                     } else {
-                        "rgb(240, 105, 95)" // Disconnected (Red)
+                        ""
                     };
 
-                    format!("width: 12px; height: 12px; border-radius: 50%; background: {}; transition: background 0.3s ease;", color)
+                    format!("width: 12px; height: 12px; border-radius: 50%; background: {}; transition: background 0.3s ease; {}", color, animation)
                 }></div>
 
                 // RX/TX Indicators (Compact Stack)
@@ -638,7 +658,11 @@ pub fn App() -> impl IntoView {
 
                 <style>
                     {
-                    ".split-btn { transition: background-color 0.2s; }
+                    "@keyframes pulse {
+                        0%, 100% { opacity: 1; }
+                        50% { opacity: 0.4; }
+                    }
+                    .split-btn { transition: background-color 0.2s; }
                     .split-btn:hover { background-color: #0062a3 !important; }
                     .split-btn:active { background-color: #005a96 !important; }"
                     }
@@ -650,11 +674,12 @@ pub fn App() -> impl IntoView {
                         title="Smart Connect (Auto-detects USB-Serial)"
                         on:click=move |_| on_connect(false)>
                         {move || {
-                            let is_connected = connected.get();
-                            let s = status.get();
-                            let is_auto_reconnecting = s.contains("Auto-reconnecting") || s.contains("Device Lost");
-                            // Show "Disconnect" if connected OR if auto-reconnecting (yellow light state)
-                            if is_connected || is_auto_reconnecting { "Disconnect" } else { "Connect" }
+                            // Use state machine to determine button text
+                            if manager.state.get().button_shows_disconnect() {
+                                "Disconnect"
+                            } else {
+                                "Connect"
+                            }
                         }}
                     </button>
                     <button

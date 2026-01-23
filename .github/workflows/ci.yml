@@ -2,14 +2,18 @@ name: CI
 
 on: [push, pull_request]
 
+env:
+  RUSTFLAGS: "--cfg=web_sys_unstable_apis"
+
 jobs:
   test:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@1.93.0
         with:
           targets: wasm32-unknown-unknown
+          components: rustfmt, clippy
 
       - name: Run quality checks and tests
         run: ./dev.sh test
@@ -18,9 +22,10 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@1.93.0
         with:
           targets: wasm32-unknown-unknown
+          components: rustfmt, clippy
 
       - name: Install Trunk
         uses: jetli/trunk-action@v0.5.0

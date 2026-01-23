@@ -116,9 +116,16 @@ run_tests() {
     echo -e "${BLUE}================================================${NC}"
     echo ""
 
+    # Run non-WASM tests (excluding WASM-only packages)
     cargo test --workspace \
         --exclude transport-webserial \
         --exclude app-web
+
+    # Run app-web tests (lib tests, not requiring browser)
+    # These tests run in native mode (not WASM), testing core logic
+    echo ""
+    echo -e "${YELLOW}▶ Running app-web lib tests${NC}"
+    cargo test --package app-web --lib
 
     echo ""
     echo -e "${GREEN}✅ All tests passed${NC}"

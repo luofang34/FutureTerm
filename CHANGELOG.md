@@ -5,46 +5,28 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [0.1.1] - 2026-01-23
 
 ### Added
-- **Quality Enforcement**: Unified `dev.sh` script for all development tasks
-  - `./dev.sh check` - Run format + clippy checks
-  - `./dev.sh test` - Run checks + unit tests
-  - `./dev.sh build` - Run checks + tests + release build
-  - `./dev.sh serve` - Run checks + start dev server
-- **Strict Clippy Rules**: Deny unwrap/panic/unsafe/indexing in WASM code
-- **Clippy Configuration**: `clippy.toml` with strict safety rules
-- **Format Configuration**: `rustfmt.toml` for consistent code style
+- **Active FSM Driver**: Replaced passive state observation with an "Active Driver" FSM:
+  - **Atomic Safety**: Unified state and lock into `AtomicConnectionState` (AtomicU8).
+  - **CAS Transitions**: State transitions now act as explicit locks, preventing race conditions.
+  - **Safety Helpers**: Added `finalize_connection` to prevent state/signal desynchronization.
+- **Smart Probing v2**:
+  - **Timeout Protection**: Added per-baud-rate timeouts to prevent hanging on silent devices.
+  - **Clean Wakeup**: Reduced wakeup signal to single `\r` to prevent double prompts.
+- **Buffer Hygiene**:
+  - **Sanitization**: Added logic to strip leading junk/control characters from initial connection output, ensuring prompt alignment.
 
 ### Fixed
-- **Safety**: Removed all 21 `.unwrap()` calls from WASM code
-  - Replaced with safe Option/Result handling
-  - All `web_sys::window()` calls now use proper error handling
-- **Safety**: Replaced all 31 unsafe array indexing operations
-  - Changed `arr[i]` to `arr.get(i)` with Option handling
-  - No more panic risk from out-of-bounds access
-- **Performance**: Optimized hex view DOM query performance
-  - Incremental updates instead of full DOM traversal
-  - Track previous selection state to skip redundant updates
-  - 10x+ faster selection updates for large files (10K+ bytes)
-- **Performance**: Replaced O(N) byte counting with cumulative counter
-  - Eliminated per-batch iteration over entire log
-  - 100x+ faster batch processing for large logs (10K+ events)
-  - Memory overhead: single usize (8 bytes)
-- **Memory**: Documented event handler cleanup limitations
-  - Properly remove event listeners from DOM
-  - Documented wasm-bindgen memory constraints
+- **Probing Hang**: Fixed infinite loop when probing silent devices by implementing a robust race-safe timeout.
+- **Double Prompt**: Fixed duplicate command prompts caused by aggressive `\r\n\r\n` wakeup signals.
+- **State Desync**: Fixed "Signal Lagging" error where atomic state and signals drifted apart during connection.
+- **Disconnect Loop**: Fixed invalid `DeviceLost` state handling by allowing idempotent transitions.
+- **UI Responsiveness**: Fixed "Disconnect" button being unresponsive during auto-reconnect loops.
 
 ### Changed
-- **CI/CD**: Updated GitHub Actions to use `./dev.sh` script
-- **Development**: Removed unused Python verification scripts
-- **Development**: Simplified dev server (removed socat/serial_generator dependency)
-- **Documentation**: Updated `gemini.md` with modern development workflow
-
-### Removed
-- Dead code in `terminal_metadata.rs` (unused helper functions)
-- Unused verification scripts (`run_python_verify.sh`, `verify_native.sh`)
+- **Modular Architecture**: Split `connection.rs` (3,700+ lines) into `types.rs`, `prober.rs`, `driver.rs`, and `reconnect.rs`.
 
 ---
 
