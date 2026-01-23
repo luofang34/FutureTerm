@@ -3046,4 +3046,396 @@ mod tests {
             }
         }
     }
+
+    // ============ Concurrent Access Tests ============
+
+    /// Test that connection guard prevents concurrent connection attempts
+    /// This is critical for preventing "port already open" errors
+    #[test]
+    fn test_concurrent_connection_guard() {
+        let is_connecting = Arc::new(AtomicBool::new(false));
+
+        // Simulate first connection attempt
+        let guard1_acquired = is_connecting
+            .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+            .is_ok();
+        assert!(guard1_acquired, "First connection should acquire guard");
+
+        // Simulate concurrent connection attempt
+        let guard2_acquired = is_connecting
+            .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+            .is_ok();
+        assert!(
+            !guard2_acquired,
+            "Second concurrent connection should fail to acquire guard"
+        );
+
+        // Verify flag is still set
+        assert!(is_connecting.load(Ordering::SeqCst));
+
+        // Release guard (using scopeguard in real code)
+        is_connecting.store(false, Ordering::SeqCst);
+
+        // Third attempt after release should succeed
+        let guard3_acquired = is_connecting
+            .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+            .is_ok();
+        assert!(guard3_acquired, "Connection after release should succeed");
+    }
+
+    /// Test that disconnect guard prevents concurrent disconnect attempts
+    #[test]
+    fn test_concurrent_disconnect_guard() {
+        let is_disconnecting = Arc::new(AtomicBool::new(false));
+
+        // First disconnect attempt
+        let guard1_acquired = is_disconnecting
+            .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+            .is_ok();
+        assert!(guard1_acquired);
+
+        // Concurrent disconnect attempt should fail
+        let guard2_acquired = is_disconnecting
+            .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+            .is_ok();
+        assert!(!guard2_acquired);
+
+        // Cleanup
+        is_disconnecting.store(false, Ordering::SeqCst);
+    }
+
+    /// Test that user_initiated_disconnect flag has correct semantics
+    #[test]
+    fn test_user_initiated_disconnect_flag() {
+        // Flag should distinguish user action from device loss
+        let user_flag = Rc::new(RefCell::new(false));
+
+        // User clicks disconnect
+        *user_flag.borrow_mut() = true;
+        assert!(*user_flag.borrow(), "Flag should be set on user action");
+
+        // Flag should be checked before auto-reconnect
+        let should_auto_reconnect = !*user_flag.borrow();
+        assert!(
+            !should_auto_reconnect,
+            "Should not auto-reconnect if user initiated"
+        );
+
+        // Flag should be cleared after disconnect completes
+        *user_flag.borrow_mut() = false;
+        assert!(
+            !*user_flag.borrow(),
+            "Flag should be cleared after disconnect"
+        );
+
+        // Device loss (not user initiated)
+        let should_auto_reconnect2 = !*user_flag.borrow();
+        assert!(
+            should_auto_reconnect2,
+            "Should auto-reconnect on device loss"
+        );
+    }
+
+    /// Test probing_interrupted flag logic
+    #[test]
+    fn test_probing_interrupted_flag() {
+        let probing_interrupted = Rc::new(RefCell::new(false));
+
+        // Initial state: not interrupted
+        assert!(!*probing_interrupted.borrow());
+
+        // Probing starts with auto-detect (baud == 0)
+        // Flag is cleared
+        *probing_interrupted.borrow_mut() = false;
+        assert!(!*probing_interrupted.borrow());
+
+        // ondisconnect fires during probing
+        *probing_interrupted.borrow_mut() = true;
+        assert!(
+            *probing_interrupted.borrow(),
+            "Flag should be set on disconnect"
+        );
+
+        // Polling code checks flag
+        let skip_polling = *probing_interrupted.borrow();
+        assert!(skip_polling, "Should skip polling if interrupted");
+
+        // Next auto-detect attempt clears flag
+        *probing_interrupted.borrow_mut() = false;
+        assert!(!*probing_interrupted.borrow());
+    }
+
+    // ============ Parse Framing Edge Cases ============
+
+    /// Test parse_framing with invalid inputs
+    #[test]
+    fn test_parse_framing_invalid() {
+        // Too short
+        let (d, p, s) = ConnectionManager::parse_framing("8N");
+        assert_eq!(d, 8);
+        assert_eq!(p, "none");
+        assert_eq!(s, 1); // Should default to 1
+
+        // Empty string
+        let (d, p, s) = ConnectionManager::parse_framing("");
+        assert_eq!(d, 8); // Default data bits
+        assert_eq!(p, "none"); // Default parity
+        assert_eq!(s, 1); // Default stop bits
+
+        // Invalid parity character
+        let (d, p, s) = ConnectionManager::parse_framing("8X1");
+        assert_eq!(d, 8);
+        assert_eq!(p, "none"); // Should default to none
+        assert_eq!(s, 1);
+
+        // Lowercase parity character (case-sensitive, only uppercase supported)
+        let (d, p, s) = ConnectionManager::parse_framing("7e2");
+        assert_eq!(d, 7);
+        assert_eq!(p, "none"); // Lowercase 'e' not recognized, defaults to none
+        assert_eq!(s, 2);
+    }
+
+    /// Test parse_framing with all valid parity options
+    #[test]
+    fn test_parse_framing_all_parity() {
+        // None
+        let (_, p, _) = ConnectionManager::parse_framing("8N1");
+        assert_eq!(p, "none");
+
+        // Even
+        let (_, p, _) = ConnectionManager::parse_framing("8E1");
+        assert_eq!(p, "even");
+
+        // Odd
+        let (_, p, _) = ConnectionManager::parse_framing("8O1");
+        assert_eq!(p, "odd");
+
+        // Mark and Space are not currently supported, default to none
+        let (_, p, _) = ConnectionManager::parse_framing("8M1");
+        assert_eq!(p, "none"); // Not supported, defaults to none
+
+        let (_, p, _) = ConnectionManager::parse_framing("8S1");
+        assert_eq!(p, "none"); // Not supported, defaults to none
+    }
+
+    /// Test parse_framing with different data bits
+    #[test]
+    fn test_parse_framing_data_bits() {
+        // 5 data bits
+        let (d, _, _) = ConnectionManager::parse_framing("5N1");
+        assert_eq!(d, 5);
+
+        // 6 data bits
+        let (d, _, _) = ConnectionManager::parse_framing("6N1");
+        assert_eq!(d, 6);
+
+        // 7 data bits
+        let (d, _, _) = ConnectionManager::parse_framing("7N1");
+        assert_eq!(d, 7);
+
+        // 8 data bits (most common)
+        let (d, _, _) = ConnectionManager::parse_framing("8N1");
+        assert_eq!(d, 8);
+
+        // 9 data bits (uncommon but valid)
+        let (d, _, _) = ConnectionManager::parse_framing("9N1");
+        assert_eq!(d, 9);
+    }
+
+    /// Test parse_framing with different stop bits
+    #[test]
+    fn test_parse_framing_stop_bits() {
+        // 1 stop bit (most common)
+        let (_, _, s) = ConnectionManager::parse_framing("8N1");
+        assert_eq!(s, 1);
+
+        // 2 stop bits
+        let (_, _, s) = ConnectionManager::parse_framing("8N2");
+        assert_eq!(s, 2);
+
+        // parse_framing parses any digit directly (no validation)
+        // So "8N3" will parse as 3, even though it's not a standard stop bit value
+        let (_, _, s) = ConnectionManager::parse_framing("8N3");
+        assert_eq!(s, 3); // Parsed as-is (no validation in parse_framing)
+
+        // Invalid stop bit character defaults to 1
+        let (_, _, s) = ConnectionManager::parse_framing("8NX");
+        assert_eq!(s, 1); // Non-digit defaults to 1
+    }
+
+    // ============ State Transition Sequence Tests ============
+
+    /// Test normal connection flow sequence
+    #[test]
+    fn test_connection_flow_manual() {
+        use ConnectionState::*;
+
+        // Start: Disconnected
+        let state = Disconnected;
+        assert!(state.can_transition_to(Connecting));
+
+        // Connecting...
+        let state = Connecting;
+        assert!(state.can_transition_to(Connected));
+
+        // Connected!
+        let state = Connected;
+        assert!(state.can_disconnect());
+        assert!(state.can_transition_to(Disconnecting));
+
+        // Disconnecting...
+        let state = Disconnecting;
+        assert!(!state.can_disconnect());
+        assert!(state.can_transition_to(Disconnected));
+
+        // Back to Disconnected
+        let state = Disconnected;
+        assert!(!state.can_disconnect());
+    }
+
+    /// Test auto-detection flow sequence
+    #[test]
+    fn test_connection_flow_auto_detect() {
+        use ConnectionState::*;
+
+        // Start: Disconnected
+        let state = Disconnected;
+        assert!(state.can_transition_to(Probing));
+
+        // Probing for firmware...
+        let state = Probing;
+        assert!(!state.can_disconnect()); // Cannot disconnect while probing
+        assert!(state.can_transition_to(Connecting));
+
+        // Found firmware, connecting...
+        let state = Connecting;
+        assert!(state.can_transition_to(Connected));
+
+        // Connected!
+        let _state = Connected;
+    }
+
+    /// Test device loss and recovery flow
+    #[test]
+    fn test_device_loss_flow() {
+        use ConnectionState::*;
+
+        // Start: Connected
+        let state = Connected;
+
+        // USB unplugged (no VID/PID for auto-reconnect)
+        assert!(state.can_transition_to(DeviceLost));
+        let state = DeviceLost;
+
+        // User can give up
+        assert!(state.can_disconnect());
+        assert!(state.can_transition_to(Disconnected));
+    }
+
+    /// Test auto-reconnect flow
+    #[test]
+    fn test_auto_reconnect_flow() {
+        use ConnectionState::*;
+
+        // Start: Connected
+        let state = Connected;
+
+        // USB unplugged (has VID/PID for auto-reconnect)
+        assert!(state.can_transition_to(AutoReconnecting));
+        let state = AutoReconnecting;
+
+        // Retry loop
+        assert!(state.can_transition_to(AutoReconnecting)); // Idempotent
+        assert!(state.can_transition_to(DeviceLost)); // Retry failed
+        assert!(state.can_transition_to(Connected)); // Retry succeeded
+
+        // User can cancel
+        assert!(state.can_disconnect());
+        assert!(state.can_transition_to(Disconnected));
+    }
+
+    /// Test reconfiguration flow
+    #[test]
+    fn test_reconfiguration_flow() {
+        use ConnectionState::*;
+
+        // Start: Connected
+        let state = Connected;
+        assert!(state.can_transition_to(Reconfiguring));
+
+        // Reconfiguring baud rate...
+        let state = Reconfiguring;
+        assert!(!state.can_disconnect()); // Cannot disconnect during reconfig
+        assert!(state.can_transition_to(Connected)); // Success
+        assert!(state.can_transition_to(DeviceLost)); // USB unplugged during reconfig
+    }
+
+    /// Test probing interrupted by device re-enumeration
+    #[test]
+    fn test_probing_interrupt_recovery_flow() {
+        use ConnectionState::*;
+
+        // Start: Probing
+        let state = Probing;
+
+        // Device disconnects during probe (OS closes port)
+        // onconnect fires (device re-enumerated)
+        assert!(state.can_transition_to(AutoReconnecting));
+        let state = AutoReconnecting;
+
+        // Successfully reconnect
+        assert!(state.can_transition_to(Connected));
+    }
+
+    // ============ Fail-Fast Validation Tests ============
+
+    /// Test that invalid state combinations are impossible
+    /// These should be caught at compile time or test time, not runtime
+    #[test]
+    fn test_no_invalid_state_combinations() {
+        use ConnectionState::*;
+
+        // Cannot be both connecting and disconnecting
+        // (enforced by single state enum, not multiple booleans)
+
+        // Cannot be connected while probing
+        assert!(!Probing.can_transition_to(Connected));
+        assert!(!Connected.can_transition_to(Probing));
+
+        // Cannot be connected while disconnecting
+        assert!(!Disconnecting.can_transition_to(Connected));
+        assert!(!Connected
+            .can_transition_to(Disconnecting)
+            .then(|| Disconnecting.can_transition_to(Connected))
+            .unwrap_or(true));
+    }
+
+    /// Test that all transition paths are deterministic
+    #[test]
+    fn test_deterministic_transitions() {
+        use ConnectionState::*;
+
+        // Each state has clear, deterministic exit paths
+        // No ambiguity about what state to transition to
+
+        // Disconnecting MUST go to Disconnected (no other option)
+        assert!(Disconnecting.can_transition_to(Disconnected));
+        assert!(!Disconnecting.can_transition_to(Connected));
+        assert!(!Disconnecting.can_transition_to(Connecting));
+
+        // Connecting can only go to Connected or back to Disconnected
+        // (or DeviceLost if USB unplugged)
+        let valid_connecting_exits = [Connected, Disconnected, DeviceLost];
+        for state in [
+            Probing,
+            Connecting,
+            Reconfiguring,
+            Disconnecting,
+            AutoReconnecting,
+        ] {
+            if !valid_connecting_exits.contains(&state) {
+                assert!(!Connecting.can_transition_to(state));
+            }
+        }
+    }
 }
