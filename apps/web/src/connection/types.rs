@@ -831,7 +831,7 @@ mod tests {
 
         // Test each state has at least one valid transition
         for state in all_states {
-            let has_valid_transition = vec![
+            let has_valid_transition = [
                 Disconnected,
                 Probing,
                 Connecting,
@@ -857,7 +857,7 @@ mod tests {
         use ConnectionState::*;
 
         // Each state should have unique visual representation
-        let states = vec![
+        let states = [
             Disconnected,
             Probing,
             Connecting,
@@ -1152,10 +1152,9 @@ mod tests {
 
         // Cannot be connected while disconnecting
         assert!(!Disconnecting.can_transition_to(Connected));
-        assert!(!Connected
-            .can_transition_to(Disconnecting)
-            .then(|| Disconnecting.can_transition_to(Connected))
-            .unwrap_or(true));
+        let can_disconnect = Connected.can_transition_to(Disconnecting);
+        let can_reconnect = Disconnecting.can_transition_to(Connected);
+        assert!(!(can_disconnect && can_reconnect));
     }
 
     /// Test that all transition paths are deterministic

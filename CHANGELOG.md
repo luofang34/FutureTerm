@@ -17,6 +17,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - **Clean Wakeup**: Reduced wakeup signal to single `\r` to prevent double prompts.
 - **Buffer Hygiene**:
   - **Sanitization**: Added logic to strip leading junk/control characters from initial connection output, ensuring prompt alignment.
+- **Property-Based Testing**: Added comprehensive property-based tests using `proptest` to verify FSM invariants:
+  - State encoding round-trip verification
+  - Lock bit preservation across operations
+  - Transition validity under arbitrary sequences
+  - Idempotence and determinism properties
 
 ### Fixed
 - **Probing Hang**: Fixed infinite loop when probing silent devices by implementing a robust race-safe timeout.
@@ -24,6 +29,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **State Desync**: Fixed "Signal Lagging" error where atomic state and signals drifted apart during connection.
 - **Disconnect Loop**: Fixed invalid `DeviceLost` state handling by allowing idempotent transitions.
 - **UI Responsiveness**: Fixed "Disconnect" button being unresponsive during auto-reconnect loops.
+- **Status Text Synchronization**: Ensured status text always reflects current FSM state:
+  - Fixed status remaining "Connecting..." after successful connection
+  - Removed all manual status overrides throughout codebase
+  - FSM is now the single source of truth for all UI state
+- **User Cancellation Flow**: Fixed invalid state transitions during user-initiated disconnect:
+  - Added `Connecting` state to ensure proper transition sequence before port open
+  - Removed invalid `Disconnected → Reconfiguring` transition
 
 ### Changed
 - **Modular Architecture**: Split `connection.rs` (3,700+ lines) into `types.rs`, `prober.rs`, `driver.rs`, and `reconnect.rs`.

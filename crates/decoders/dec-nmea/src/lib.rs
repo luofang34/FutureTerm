@@ -107,7 +107,7 @@ mod tests {
 
         let mut results = Vec::new();
         decoder.ingest(&frame, &mut results);
-        let event = results.get(0).expect("Should parse GPGGA");
+        let event = results.first().expect("Should parse GPGGA");
 
         assert_eq!(event.protocol, "NMEA");
         // Check dynamic fields (simplified check, real usage would check lat/lon values)

@@ -84,7 +84,6 @@ pub async fn detect_config(
         // MAVLink Priority Check (Robust)
         #[cfg(feature = "mavlink")]
         if verify_mavlink_integrity(&buffer) {
-            best_score = 1.0;
             best_rate = rate;
             best_framing = "8N1".to_string(); // MAVLink is 8N1
             best_buffer = buffer.clone();
@@ -97,7 +96,6 @@ pub async fn detect_config(
 
         // Fallback to statistical score if verification inconclusive but score high
         if score_mav >= 0.99 {
-            best_score = 1.0;
             best_rate = rate;
             best_framing = "8N1".to_string(); // MAVLink is 8N1
             best_buffer = buffer.clone();

@@ -339,7 +339,7 @@ mod tests {
         });
 
         let mut writer = Vec::new();
-        mavlink::write_v1_msg(&mut writer, header.clone(), &msg).expect("Write 1 failed");
+        mavlink::write_v1_msg(&mut writer, header, &msg).expect("Write 1 failed");
         let mut second_packet = Vec::new();
         let header2 = mavlink::MavHeader {
             system_id: 1,
