@@ -1453,7 +1453,10 @@ mod tests {
         }
 
         // Verify flag is cleared
-        assert!(!flag.get(), "Flag should be false after both disconnects complete");
+        assert!(
+            !flag.get(),
+            "Flag should be false after both disconnects complete"
+        );
     }
 
     #[test]
@@ -1501,8 +1504,7 @@ mod tests {
         for scenario in scenarios {
             let vid_pid_preserved = !scenario.clear_auto_reconnect;
             assert_eq!(
-                vid_pid_preserved,
-                scenario.should_preserve_vid_pid,
+                vid_pid_preserved, scenario.should_preserve_vid_pid,
                 "{}: VID/PID preservation mismatch",
                 scenario.name
             );

@@ -347,19 +347,6 @@ impl ConnectionManager {
         }
 
         if let Some(port) = port_opt {
-            // Validate port is still usable
-            if port.readable().is_null() || port.writable().is_null() {
-                web_sys::console::warn_1(
-                    &"Stored port reference is invalid - port was closed".into(),
-                );
-                self.active_port.borrow_mut().take(); // Clear stale reference
-
-                if !self.atomic_state.is_locked() {
-                    self.transition_to(ConnectionState::Disconnected);
-                }
-                return;
-            }
-
             let _ = wasm_bindgen_futures::JsFuture::from(js_sys::Promise::new(&mut |r, _| {
                 if let Some(window) = web_sys::window() {
                     let _ = window.set_timeout_with_callback_and_timeout_and_arguments_0(&r, 100);
@@ -512,7 +499,7 @@ mod tests {
         };
 
         // Document the two use cases
-        _signature_check(true);  // User-initiated disconnect
+        _signature_check(true); // User-initiated disconnect
         _signature_check(false); // Reconfigure/auto-reconnect
     }
 
