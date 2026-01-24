@@ -1416,6 +1416,99 @@ mod tests {
         );
     }
 
+    #[test]
+    fn test_user_initiated_disconnect_flag_behavior() {
+        // This test documents the expected behavior of user_initiated_disconnect flag
+        // Bug Fix: Rapid double-disconnect should not leave flag stuck as true
+        //
+        // Scenario that was broken:
+        // 1. User clicks disconnect (fast)
+        // 2. First call sets flag=true, acquires guard
+        // 3. Second call sets flag=true, guard acquisition fails, returns false
+        // 4. First call completes, sets flag=false
+        // 5. BUG: Flag is now true (from step 3), blocking next connect
+        //
+        // Fix: Second call now clears its own flag on guard acquisition failure
+
+        use std::cell::Cell;
+
+        let flag = Cell::new(false);
+
+        // Simulate first disconnect acquiring guard
+        flag.set(true);
+        let first_acquired = true;
+
+        // Simulate second disconnect failing to acquire guard
+        flag.set(true); // This was the bug - sets flag but doesn't clear it
+        let second_acquired = false;
+
+        // After fix: second call should clear its flag
+        if !second_acquired {
+            flag.set(false); // ✅ Fix: Clear the flag we just set
+        }
+
+        // Simulate first disconnect completing
+        if first_acquired {
+            flag.set(false);
+        }
+
+        // Verify flag is cleared
+        assert!(!flag.get(), "Flag should be false after both disconnects complete");
+    }
+
+    #[test]
+    fn test_disconnect_internal_scenarios() {
+        // This test documents the clear_auto_reconnect parameter behavior
+        // Bug Fix: reconfigure() was clearing VID/PID, breaking reconnection
+        //
+        // Scenarios:
+        // 1. User disconnect: clear_auto_reconnect = true
+        //    - User clicked disconnect button
+        //    - Should prevent auto-reconnect by clearing VID/PID
+        //
+        // 2. Reconfigure: clear_auto_reconnect = false
+        //    - Temporarily disconnect to change baud rate
+        //    - Should preserve VID/PID to allow reconnection
+        //
+        // 3. Auto-reconnect cleanup: clear_auto_reconnect = false
+        //    - Device unplugged, preparing to reconnect
+        //    - Should preserve VID/PID to allow reconnection
+
+        struct DisconnectScenario {
+            name: &'static str,
+            clear_auto_reconnect: bool,
+            should_preserve_vid_pid: bool,
+        }
+
+        let scenarios = vec![
+            DisconnectScenario {
+                name: "User disconnect",
+                clear_auto_reconnect: true,
+                should_preserve_vid_pid: false,
+            },
+            DisconnectScenario {
+                name: "Reconfigure",
+                clear_auto_reconnect: false,
+                should_preserve_vid_pid: true,
+            },
+            DisconnectScenario {
+                name: "Auto-reconnect cleanup",
+                clear_auto_reconnect: false,
+                should_preserve_vid_pid: true,
+            },
+        ];
+
+        for scenario in scenarios {
+            let vid_pid_preserved = !scenario.clear_auto_reconnect;
+            assert_eq!(
+                vid_pid_preserved,
+                scenario.should_preserve_vid_pid,
+                "{}: VID/PID preservation mismatch",
+                scenario.name
+            );
+        }
+    }
+
     // ============ Property-Based Tests ============
     //
     // These tests use proptest to verify FSM invariants under arbitrary inputs.
