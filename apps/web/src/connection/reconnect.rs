@@ -248,8 +248,8 @@ impl ConnectionManager {
             return;
         }
 
-        // Force disconnect cleanup
-        if !manager.disconnect().await {
+        // Force disconnect cleanup, preserving auto-reconnect device info
+        if !manager.disconnect_internal(false).await {
             return;
         }
 

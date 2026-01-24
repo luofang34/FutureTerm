@@ -241,6 +241,10 @@ impl ConnectionManager {
     }
 
     pub async fn disconnect(&self) -> bool {
+        self.disconnect_internal(true).await
+    }
+
+    pub(crate) async fn disconnect_internal(&self, clear_auto_reconnect: bool) -> bool {
         let current_state = self.atomic_state.get();
 
         // Set coordination flags BEFORE acquiring guard
@@ -255,8 +259,15 @@ impl ConnectionManager {
             match self.begin_exclusive_transition(current_state, ConnectionState::Disconnecting) {
                 Ok(g) => g,
                 Err(_) => {
-                    // Guard acquisition failed, but flags are already set to abort ongoing operations
-                    // The async task will see the flags and clean up
+                    // Guard acquisition failed - another disconnect is already in progress
+                    // Clear the flag we just set to avoid interfering with next connect attempt
+                    self.user_initiated_disconnect.set(false);
+                    #[cfg(debug_assertions)]
+                    {
+                        web_sys::console::log_1(
+                            &"Disconnect skipped - already disconnecting, flag cleared".into(),
+                        );
+                    }
                     return false;
                 }
             };
@@ -294,7 +305,11 @@ impl ConnectionManager {
         }
 
         self.active_port.borrow_mut().take();
-        self.clear_auto_reconnect_device();
+
+        if clear_auto_reconnect {
+            self.clear_auto_reconnect_device();
+        }
+
         self.user_initiated_disconnect.set(false);
 
         // Success: finish with Disconnected state (unlocks + syncs signal)
@@ -326,7 +341,8 @@ impl ConnectionManager {
         let snapshot = self.capture_state();
         let port_opt = self.active_port.borrow().clone();
 
-        if !self.disconnect().await {
+        // Disconnect but preserve auto-reconnect device info for reconfiguration
+        if !self.disconnect_internal(false).await {
             return;
         }
 
