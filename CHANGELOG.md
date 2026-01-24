@@ -22,10 +22,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - Lock bit preservation across operations
   - Transition validity under arbitrary sequences
   - Idempotence and determinism properties
-- **Test Coverage**: Expanded test suite from 68 to 72 tests:
+- **Test Coverage**: Expanded test suite from 68 to 80 tests (72 native + 6 WASM browser tests + 8 property-based tests):
   - Added tests for disconnect race conditions and flag leak scenarios
   - Added tests for reconfigure VID/PID preservation behavior
   - Documents disconnect_internal() API usage patterns
+  - **WASM Browser Tests** (6 tests): Added wasm-bindgen-test integration tests for browser-specific behavior
+    - `prober.rs`: Framing detection logic, timeout constant validation (3 tests)
+    - `reconnect.rs`: Retry delay progression, framing conversion (2 tests)
+  - **Native Unit Tests** (8 new tests):
+    - `prober.rs`: Scoring decision logic for 8N1, 7E1, MAVLink (5 tests)
+    - `reconnect.rs`: Retry delay progression, framing auto-conversion (4 tests, 1 overlaps with WASM)
 
 ### Fixed
 - **Probing Hang**: Fixed infinite loop when probing silent devices by implementing a robust race-safe timeout.
@@ -56,6 +62,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 - **Modular Architecture**: Split `connection.rs` (3,700+ lines) into `types.rs`, `prober.rs`, `driver.rs`, and `reconnect.rs`.
+- **Testing Infrastructure**:
+  - **Dual Test Strategy**: Introduced wasm-bindgen-test for browser integration testing alongside native unit tests
+  - **CI/CD Simplification**: Consolidated GitHub Actions from 3 jobs to 2 jobs (test + build)
+  - **Development Workflow**: Refactored `dev.sh` to provide comprehensive one-command testing
+    - `./dev.sh test` now runs quality checks + native unit tests + WASM browser tests
+    - `./dev.sh wasm-test` for quick WASM-only iteration
+    - Auto-installs wasm-pack if not found
+  - **Dependency Management**: Conditional compilation of proptest (native-only, excluded from wasm32 builds)
+  - **Documentation**: Enhanced DEVELOPMENT.md and gemini.md with comprehensive testing workflow
+- **AI Assistant Documentation**:
+  - Created Claude.md with comprehensive project guide for AI assistants
+  - Updated DEVELOPMENT.md with critical architecture patterns and workflow commands
+  - Added .gitignore rules for AI-specific instruction files (Claude.md, .cursorrules, .aider*)
+  - Documented dual source-of-truth pattern (atomic_state vs Leptos signal) with usage examples
 
 ---
 

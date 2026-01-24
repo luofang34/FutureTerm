@@ -225,7 +225,7 @@ pub fn parse_framing(s: &str) -> (u8, String, u8) {
         Some('O') => "odd",
         _ => "none",
     }
-    .to_string();
+    .into();
     let s_bits = chars.get(2).and_then(|c| c.to_digit(10)).unwrap_or(1) as u8;
     (d, p, s_bits)
 }
@@ -238,10 +238,17 @@ pub fn parse_framing(s: &str) -> (u8, String, u8) {
 /// 3. Both atomic and signal are updated together atomically
 ///
 /// # Usage
-/// ```
-/// let guard = manager.begin_exclusive_transition(current, Connecting)?;
-/// // ... do work ...
-/// guard.finish(Connected); // Success: unlock to Connected + sync signal
+/// ```ignore
+/// // This is a simplified example showing guard usage pattern.
+/// // Actual usage requires ConnectionManager context and async runtime.
+/// use app_web::connection::types::ConnectionState;
+///
+/// let guard = manager.begin_exclusive_transition(
+///     ConnectionState::Disconnected,
+///     ConnectionState::Connecting
+/// )?;
+/// // ... perform operations (port.open, etc.) ...
+/// guard.finish(ConnectionState::Connected); // Success: unlock to Connected + sync signal
 /// // Or: drop(guard); // Error: auto-unlock to Disconnected + sync signal
 /// ```
 pub struct ExclusiveTransitionGuard {
@@ -318,10 +325,12 @@ impl Drop for ExclusiveTransitionGuard {
 /// - Only clears the lock bit on Drop (does NOT change state to Disconnected)
 ///
 /// # Usage
-/// ```
+/// ```ignore
+/// // This is a simplified example showing lock guard usage pattern.
+/// // Actual usage requires ConnectionManager, SerialPort, and async runtime.
 /// let _lock = manager.acquire_operation_lock()?;
-/// // Sub-methods can call transition_to() freely
-/// manager.connect_with_auto_detect(port, framing).await?;
+/// // Sub-methods can call transition_to() freely without re-acquiring locks
+/// manager.connect_with_auto_detect(port, "Auto").await?;
 /// // Lock automatically released on Drop (state unchanged)
 /// ```
 pub struct OperationLockGuard {
@@ -1515,7 +1524,9 @@ mod tests {
     //
     // These tests use proptest to verify FSM invariants under arbitrary inputs.
     // They catch edge cases that manual tests might miss.
+    // Note: proptest is not available on wasm32, so these tests only run on native platforms.
 
+    #[cfg(not(target_arch = "wasm32"))]
     mod property_tests {
         use super::*;
         use proptest::prelude::*;

@@ -30,8 +30,13 @@ build/target/
 # General
 tmp/
 *.log
-gemini.md
 *.txt
+
+# AI Assistant Instructions (project-specific, not version controlled)
+Claude.md
+gemini.md
+.cursorrules
+.aider*
 
 # Shell scripts - ignore generated logs/temp scripts but keep dev/build scripts
 socat.log

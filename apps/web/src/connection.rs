@@ -42,13 +42,13 @@ impl ConnectionManager {
         // Initialize state machine with Disconnected state
         let (state, set_state) = create_signal(ConnectionState::Disconnected);
 
-        let (status, set_status) = create_signal("Ready to connect".to_string());
+        let (status, set_status) = create_signal("Ready to connect".into());
         let (detected_baud, set_detected_baud) = create_signal(0);
-        let (detected_framing, set_detected_framing) = create_signal("".to_string());
+        let (detected_framing, set_detected_framing) = create_signal("".into());
 
         let (rx_active, set_rx_active) = create_signal(false);
         let (tx_active, set_tx_active) = create_signal(false);
-        let (decoder_id, set_decoder_id) = create_signal("utf8".to_string());
+        let (decoder_id, set_decoder_id) = create_signal("utf8".into());
 
         Self {
             state: state.into(),
@@ -174,10 +174,17 @@ impl ConnectionManager {
     /// even if panic occurs.
     ///
     /// # Usage
-    /// ```
-    /// let guard = self.begin_exclusive_transition(current, Connecting)?;
-    /// // ... do work ...
-    /// guard.finish(Connected); // Success path
+    /// ```ignore
+    /// // This is a simplified example showing the API usage pattern.
+    /// // Actual usage requires ConnectionManager context and async runtime.
+    /// use app_web::connection::types::ConnectionState;
+    ///
+    /// let guard = manager.begin_exclusive_transition(
+    ///     ConnectionState::Disconnected,
+    ///     ConnectionState::Connecting
+    /// )?;
+    /// // ... perform async operations ...
+    /// guard.finish(ConnectionState::Connected); // Success path
     /// // Or: drop(guard); // Error path (auto-unlocks to Disconnected)
     /// ```
     pub fn begin_exclusive_transition(
@@ -212,10 +219,12 @@ impl ConnectionManager {
     /// to call transition_to() to update states as needed.
     ///
     /// # Usage
-    /// ```
-    /// let _lock = self.acquire_operation_lock()?;
-    /// // Sub-methods can call transition_to() freely
-    /// self.connect_with_auto_detect(port, framing).await?;
+    /// ```ignore
+    /// // This is a simplified example showing the API usage pattern.
+    /// // Actual usage requires ConnectionManager context, SerialPort, and async runtime.
+    /// let _lock = manager.acquire_operation_lock()?;
+    /// // Sub-methods can call transition_to() freely without re-acquiring locks
+    /// manager.connect_with_auto_detect(port, "Auto").await?;
     /// // Lock automatically released on Drop
     /// ```
     pub fn acquire_operation_lock(&self) -> Result<OperationLockGuard, String> {
@@ -255,7 +264,7 @@ impl ConnectionManager {
         let _lock = self.acquire_operation_lock()?;
 
         if self.active_port.borrow().is_some() {
-            return Err("Already connected".to_string());
+            return Err("Already connected".into());
         }
 
         if baud == 0 {
@@ -410,7 +419,7 @@ impl ConnectionManager {
                     &"DEBUG: Probing interrupted by user disconnect - aborting connection".into(),
                 );
                 self.probing_interrupted.set(false);
-                return Err("User cancelled".to_string());
+                return Err("User cancelled".into());
             }
 
             web_sys::console::warn_1(
@@ -445,7 +454,7 @@ impl ConnectionManager {
                             .into(),
                     );
                     self.probing_interrupted.set(false);
-                    return Err("User cancelled".to_string());
+                    return Err("User cancelled".into());
                 }
 
                 self.probing_interrupted.set(false);
@@ -464,7 +473,7 @@ impl ConnectionManager {
 
     async fn poll_for_device_reenumeration(&self) -> Result<web_sys::SerialPort, String> {
         let Some(window) = web_sys::window() else {
-            return Err("Window not available".to_string());
+            return Err("Window not available".into());
         };
         let nav = window.navigator();
         let serial = nav.serial();
@@ -481,7 +490,7 @@ impl ConnectionManager {
                         break;
                     }
                 }
-                Err(_) => return Err("Cannot access ports".to_string()),
+                Err(_) => return Err("Cannot access ports".into()),
             }
 
             let wait_ms = if attempt <= 5 {
@@ -513,7 +522,7 @@ impl ConnectionManager {
             .await;
             Ok(port)
         } else {
-            Err("Device not found after disconnect".to_string())
+            Err("Device not found after disconnect".into())
         }
     }
 
@@ -542,15 +551,15 @@ impl ConnectionManager {
                 })
                 .is_err()
             {
-                return Err("Connection closed".to_string());
+                return Err("Connection closed".into());
             }
 
             match rx.await {
                 Ok(result) => result,
-                Err(_) => Err("Write timeout".to_string()),
+                Err(_) => Err("Write timeout".into()),
             }
         } else {
-            Err("Not connected".to_string())
+            Err("Not connected".into())
         }
     }
 

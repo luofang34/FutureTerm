@@ -87,7 +87,7 @@ impl ConnectionManager {
 
                     // Update detected config for UI
                     self.set_detected_baud.set(baud);
-                    self.set_detected_framing.set(framing.to_string());
+                    self.set_detected_framing.set(framing.into());
 
                     // Spawn read loop
                     self.spawn_read_loop(t, cmd_rx, completion_tx);
@@ -358,7 +358,7 @@ impl ConnectionManager {
                 let cached_auto = *self.last_auto_baud.borrow();
                 if let Some(cached) = cached_auto {
                     let effective_framing = if framing == "Auto" { "8N1" } else { framing };
-                    (cached, effective_framing.to_string(), None, None)
+                    (cached, effective_framing.into(), None, None)
                 } else {
                     let (b, f, buf, proto) = detect_config(
                         port.clone(),
@@ -389,7 +389,7 @@ impl ConnectionManager {
                 }
                 (baud, detect_f, Some(buf), proto)
             } else {
-                (baud, framing.to_string(), None, None)
+                (baud, framing.into(), None, None)
             };
 
             if let Some(p) = proto {

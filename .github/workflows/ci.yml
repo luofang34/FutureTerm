@@ -15,10 +15,10 @@ jobs:
           targets: wasm32-unknown-unknown
           components: rustfmt, clippy
 
-      - name: Run quality checks and tests
+      - name: Run comprehensive test suite
         run: ./dev.sh test
 
-  wasm-build:
+  build:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -30,5 +30,5 @@ jobs:
       - name: Install Trunk
         uses: jetli/trunk-action@v0.5.0
 
-      - name: Build WASM
+      - name: Run tests and build release
         run: ./dev.sh build
