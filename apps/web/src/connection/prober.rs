@@ -29,6 +29,7 @@ pub async fn detect_config(
     'outer: for rate in baud_candidates {
         // OPTIMIZATION: Abort probing early if disconnect detected
         if probing_interrupted.get() {
+            #[cfg(debug_assertions)]
             web_sys::console::log_1(
                 &"DEBUG: Probing aborted - disconnect detected, remaining probes skipped".into(),
             );
@@ -54,6 +55,7 @@ pub async fn detect_config(
 
         // Check if user disconnected while we were probing this rate
         if probing_interrupted.get() {
+            #[cfg(debug_assertions)]
             web_sys::console::log_1(
                 &"DEBUG: Probing aborted - disconnect detected after probe completed".into(),
             );
@@ -192,6 +194,9 @@ async fn gather_probe_data(
             Ok(_) => break true,
             Err(e) => {
                 let err_str = format!("{:?}", e);
+                // NOTE: Error string matching is fragile and may break with library updates.
+                // Ideally we'd match on error types, but WebSerial errors are opaque JsValue.
+                // These specific strings have been stable across WebSerial implementations.
                 if (err_str.contains("already open") || err_str.contains("InvalidStateError"))
                     && attempts < 3
                 {

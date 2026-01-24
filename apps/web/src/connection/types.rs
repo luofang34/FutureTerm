@@ -261,7 +261,7 @@ impl ExclusiveTransitionGuard {
 
         // Update signal to match
         self.set_state.set(final_state);
-        self.set_status.set(final_state.status_text().to_string());
+        self.set_status.set(final_state.status_text().into());
 
         // Don't run Drop (we handled cleanup)
         std::mem::forget(self);
@@ -270,17 +270,41 @@ impl ExclusiveTransitionGuard {
 
 impl Drop for ExclusiveTransitionGuard {
     fn drop(&mut self) {
-        // Panic/error path: unlock to Disconnected and sync signal
-        // This ensures BOTH atomic and signal are always synchronized
-        self.atomic_state
-            .unlock_and_set(ConnectionState::Disconnected);
-        self.set_state.set(ConnectionState::Disconnected);
-        self.set_status.set("Ready to connect".to_string());
+        // Check current state to avoid overwriting user-initiated states
+        let current = self.atomic_state.get();
+
+        // Preserve states that have specific cleanup semantics
+        let target = match current {
+            ConnectionState::Disconnecting => {
+                // User initiated disconnect is running, let it complete
+                #[cfg(debug_assertions)]
+                {
+                    web_sys::console::log_1(
+                        &"Guard dropped during Disconnecting - preserving state".into(),
+                    );
+                }
+                current
+            }
+            _ => {
+                // Default error path: go to Disconnected
+                ConnectionState::Disconnected
+            }
+        };
+
+        self.atomic_state.unlock_and_set(target);
+        self.set_state.set(target);
+        self.set_status.set(target.status_text().into());
 
         #[cfg(debug_assertions)]
-        web_sys::console::warn_1(
-            &"ExclusiveTransitionGuard dropped without finish() - unlocking to Disconnected".into(),
-        );
+        {
+            web_sys::console::warn_1(
+                &format!(
+                    "ExclusiveTransitionGuard dropped - unlocking to {:?}",
+                    target
+                )
+                .into(),
+            );
+        }
     }
 }
 

@@ -17,10 +17,24 @@ use wasm_bindgen::JsCast;
 use wasm_bindgen_futures::spawn_local;
 use web_sys::Worker;
 
+/// USB device re-enumeration typically takes 100-300ms on most operating systems
+/// after physical disconnect. We wait 200ms to ensure the device has completed
+/// its re-initialization before attempting to access it.
 const REENUMERATION_WAIT_MS: i32 = 200;
+
+/// After probing interruption, wait for probe buffers and event handlers to drain
+/// before checking the probing_interrupted flag. This prevents race conditions
+/// where the flag is checked before the ondisconnect handler sets it.
 const PROBING_CLEANUP_WAIT_MS: i32 = 150;
+
+/// Polling intervals for device re-enumeration detection.
+/// Fast interval (first 2 attempts): 100ms for responsive user experience
 const POLL_INTERVAL_FAST_MS: i32 = 100;
+
+/// Medium interval (next 5 attempts): 200ms balances responsiveness with CPU usage
 const POLL_INTERVAL_MEDIUM_MS: i32 = 200;
+
+/// Slow interval (remaining attempts): 400ms reduces CPU usage for extended waits
 const POLL_INTERVAL_SLOW_MS: i32 = 400;
 
 impl ConnectionManager {
@@ -224,6 +238,7 @@ impl ConnectionManager {
         if let Some(set_pid) = *self.set_last_pid.borrow() {
             set_pid.set(None);
         }
+        #[cfg(debug_assertions)]
         web_sys::console::log_1(&"DEBUG: Cleared VID/PID to prevent auto-reconnect".into());
     }
 
@@ -323,15 +338,43 @@ impl ConnectionManager {
                     self.set_decoder(p);
                 }
 
-                let current_state = self.state.get_untracked();
+                // Check user intent FIRST (before any state transitions)
+                if self.user_initiated_disconnect.get() {
+                    #[cfg(debug_assertions)]
+                    {
+                        web_sys::console::log_1(
+                            &"Connection aborted - user initiated disconnect".into(),
+                        );
+                    }
+                    self.transition_to(ConnectionState::Disconnected);
+                    return Err("User cancelled".into());
+                }
+
+                let current_state = self.atomic_state.get();
                 if current_state == ConnectionState::Probing
                     || current_state == ConnectionState::Disconnected
                 {
-                    self.transition_to(ConnectionState::Connecting);
-                }
+                    // Double-check user intent (TOCTOU protection)
+                    if self.user_initiated_disconnect.get() {
+                        self.transition_to(ConnectionState::Disconnected);
+                        return Err("User cancelled".into());
+                    }
 
-                self.connect_impl(final_port, final_baud, &final_framing, initial_buffer)
-                    .await
+                    self.transition_to(ConnectionState::Connecting);
+                    match self
+                        .connect_impl(final_port, final_baud, &final_framing, initial_buffer)
+                        .await
+                    {
+                        Ok(()) => Ok(()),
+                        Err(e) => {
+                            self.transition_to(ConnectionState::Disconnected);
+                            Err(e)
+                        }
+                    }
+                } else {
+                    self.transition_to(ConnectionState::Disconnected);
+                    Err("Connection aborted".into())
+                }
             }
             Err(e) => {
                 // Transition to Disconnected when user cancels or error occurs
@@ -362,6 +405,7 @@ impl ConnectionManager {
         if was_interrupted {
             // Check if this was user-initiated disconnect vs device unplug
             if self.user_initiated_disconnect.get() {
+                #[cfg(debug_assertions)]
                 web_sys::console::log_1(
                     &"DEBUG: Probing interrupted by user disconnect - aborting connection".into(),
                 );
@@ -395,6 +439,7 @@ impl ConnectionManager {
             if self.probing_interrupted.get() {
                 // Check if this was user-initiated disconnect vs device unplug
                 if self.user_initiated_disconnect.get() {
+                    #[cfg(debug_assertions)]
                     web_sys::console::log_1(
                         &"DEBUG: Probing interrupted by user disconnect - aborting connection"
                             .into(),

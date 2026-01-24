@@ -27,10 +27,8 @@ impl ConnectionManager {
         let manager_disc = self.clone();
 
         let on_connect_closure = Closure::wrap(Box::new(move |_e: web_sys::Event| {
-            let _t_onconnect = js_sys::Date::now();
-
             // OPTIMIZATION: Ignore auto-reconnect if manual connection already in progress
-            let current_state = manager_conn.state.get_untracked();
+            let current_state = manager_conn.atomic_state.get();
             if matches!(
                 current_state,
                 ConnectionState::Probing | ConnectionState::Connecting
@@ -44,7 +42,32 @@ impl ConnectionManager {
             if let (Some(target_vid), Some(target_pid)) = (vid_opt, pid_opt) {
                 let manager_conn = manager_conn.clone();
                 spawn_local(async move {
-                    let _t0 = js_sys::Date::now();
+                    // TOCTOU Protection: Check if user disconnected while we were setting up
+                    if manager_conn.user_initiated_disconnect.get() {
+                        #[cfg(debug_assertions)]
+                        {
+                            web_sys::console::log_1(
+                                &"Auto-reconnect aborted - user initiated disconnect".into(),
+                            );
+                        }
+                        return;
+                    }
+
+                    // Re-validate atomic state (may have changed since initial check)
+                    let current = manager_conn.atomic_state.get();
+                    if !matches!(
+                        current,
+                        ConnectionState::DeviceLost | ConnectionState::AutoReconnecting
+                    ) {
+                        #[cfg(debug_assertions)]
+                        {
+                            web_sys::console::log_1(
+                                &format!("Auto-reconnect skipped - state is {:?}", current).into(),
+                            );
+                        }
+                        return;
+                    }
+
                     let Some(window) = web_sys::window() else {
                         return;
                     };
@@ -83,7 +106,7 @@ impl ConnectionManager {
                         // Retry loop logic
                         for _retry_attempt in 1..=AUTO_RECONNECT_MAX_RETRIES {
                             if manager_conn.atomic_state.is_locked() {
-                                let current_state = manager_conn.state.get_untracked();
+                                let current_state = manager_conn.atomic_state.get();
                                 if current_state == ConnectionState::AutoReconnecting {
                                     manager_conn.transition_to(ConnectionState::DeviceLost);
                                 }
@@ -91,7 +114,7 @@ impl ConnectionManager {
                             }
 
                             let user_canceled = manager_conn.user_initiated_disconnect.get();
-                            let current_state = manager_conn.state.get_untracked();
+                            let current_state = manager_conn.atomic_state.get();
 
                             if user_canceled || current_state == ConnectionState::Disconnected {
                                 if current_state != ConnectionState::Disconnected {
@@ -155,7 +178,10 @@ impl ConnectionManager {
         }) as Box<dyn FnMut(_)>);
 
         let on_disconnect_closure = Closure::wrap(Box::new(move |_e: web_sys::Event| {
-            let current_state = manager_disc.state.get_untracked();
+            // Read all state atomically at start to create consistent snapshot
+            let current_state = manager_disc.atomic_state.get();
+            let user_initiated = manager_disc.user_initiated_disconnect.get();
+
             if current_state == ConnectionState::Reconfiguring {
                 return;
             }
@@ -167,7 +193,6 @@ impl ConnectionManager {
                 return;
             }
 
-            let user_initiated = manager_disc.user_initiated_disconnect.get();
             if user_initiated {
                 // User clicked disconnect. The disconnect() method is running and owns the lifecycle.
                 // We should NOT interfere or try to transition state here.

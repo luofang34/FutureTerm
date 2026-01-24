@@ -72,6 +72,7 @@ impl ConnectionManager {
                         set_pid.set(pid);
                     }
 
+                    #[cfg(debug_assertions)]
                     web_sys::console::log_1(
                         &format!(
                             "DEBUG: Saved VID/PID for auto-reconnect: {:?}/{:?}",
@@ -80,7 +81,6 @@ impl ConnectionManager {
                         .into(),
                     );
 
-                    // Transition from Connecting to Connected
                     // Transition from Connecting to Connected
                     // Use helper to ensure atomic state is synchronized with signal
                     self.finalize_connection(ConnectionState::Connected);
@@ -117,6 +117,9 @@ impl ConnectionManager {
                 }
                 Err(e) => {
                     let err_str = format!("{:?}", e);
+                    // NOTE: Error string matching is fragile and may break with library updates.
+                    // Ideally we'd match on error types, but WebSerial errors are opaque JsValue.
+                    // These specific strings have been stable across WebSerial implementations.
                     if (err_str.contains("already open") || err_str.contains("InvalidStateError"))
                         && attempts < 10
                     {
@@ -159,6 +162,7 @@ impl ConnectionManager {
         let manager = self.clone();
 
         spawn_local(async move {
+            #[cfg(debug_assertions)]
             web_sys::console::log_1(&"DEBUG: Read Loop STARTED".into());
 
             loop {
@@ -166,6 +170,7 @@ impl ConnectionManager {
                     cmd = cmd_rx.next() => {
                         match cmd {
                             Some(ConnectionCommand::Stop) => {
+                                #[cfg(debug_assertions)]
                                 web_sys::console::log_1(&"DEBUG: Read Loop received STOP".into());
                                 break;
                             }
@@ -197,6 +202,7 @@ impl ConnectionManager {
                                 manager.trigger_rx();
                             }
                             Err(e) => {
+                                #[cfg(debug_assertions)]
                                 web_sys::console::log_1(
                                     &format!("DEBUG: Read Loop - Read Error: {:?}", e).into()
                                 );
@@ -213,11 +219,13 @@ impl ConnectionManager {
                 }
             }
 
+            #[cfg(debug_assertions)]
             web_sys::console::log_1(&"DEBUG: Read Loop EXITED".into());
             let _ = transport.close().await;
+            #[cfg(debug_assertions)]
             web_sys::console::log_1(&"DEBUG: Transport closed".into());
 
-            let current_state = manager.state.get_untracked();
+            let current_state = manager.atomic_state.get();
 
             // Fix: Check if disconnect was user-initiated to prevent race condition
             // If user clicked disconnect, we expect the loop to break, but we shouldn't
@@ -268,9 +276,19 @@ impl ConnectionManager {
             let timeout_signal = wasm_bindgen_futures::JsFuture::from(timeout_promise);
 
             futures::select! {
-                _ = completion_future.fuse() => {}
+                _ = completion_future.fuse() => {
+                    #[cfg(debug_assertions)]
+                    {
+                        web_sys::console::log_1(&"Read loop completed gracefully".into());
+                    }
+                }
                 _ = timeout_signal.fuse() => {
-                    web_sys::console::warn_1(&"Read loop did not complete in time".into());
+                    web_sys::console::warn_1(
+                        &"Read loop timeout - loop will self-terminate on next iteration (cmd channel closed)".into()
+                    );
+                    // Note: In WASM single-threaded environment, read loop will detect closed
+                    // cmd channel on next select! iteration and exit gracefully. No forced
+                    // termination is needed or possible.
                 }
             }
         }
@@ -301,7 +319,7 @@ impl ConnectionManager {
     }
 
     pub async fn reconfigure(&self, baud: u32, framing: &str) {
-        if self.state.get_untracked() != ConnectionState::Connected {
+        if self.atomic_state.get() != ConnectionState::Connected {
             return;
         }
 
@@ -313,6 +331,19 @@ impl ConnectionManager {
         }
 
         if let Some(port) = port_opt {
+            // Validate port is still usable
+            if port.readable().is_null() || port.writable().is_null() {
+                web_sys::console::warn_1(
+                    &"Stored port reference is invalid - port was closed".into(),
+                );
+                self.active_port.borrow_mut().take(); // Clear stale reference
+
+                if !self.atomic_state.is_locked() {
+                    self.transition_to(ConnectionState::Disconnected);
+                }
+                return;
+            }
+
             let _ = wasm_bindgen_futures::JsFuture::from(js_sys::Promise::new(&mut |r, _| {
                 if let Some(window) = web_sys::window() {
                     let _ = window.set_timeout_with_callback_and_timeout_and_arguments_0(&r, 100);
@@ -335,7 +366,14 @@ impl ConnectionManager {
                     )
                     .await;
                     if self.active_port.borrow().is_none() {
-                        self.transition_to(ConnectionState::Disconnected);
+                        web_sys::console::warn_1(
+                            &"Reconfigure aborted - port was cleared (device disconnected)".into(),
+                        );
+
+                        // Only transition if we're not locked (another operation isn't managing state)
+                        if !self.atomic_state.is_locked() {
+                            self.transition_to(ConnectionState::Disconnected);
+                        }
                         return;
                     }
                     (b, f, Some(buf), proto)
@@ -364,9 +402,26 @@ impl ConnectionManager {
                 }
                 Err(e) => {
                     web_sys::console::error_1(&format!("Reconfigure failed: {}", e).into());
+
+                    // Force-clean connection handle if still present
+                    if self.connection_handle.borrow().is_some() {
+                        web_sys::console::warn_1(
+                            &"Force-cleaning connection handle after reconfigure failure".into(),
+                        );
+                        self.connection_handle.borrow_mut().take();
+                    }
+
+                    // Force-clean active port if still present
+                    if self.active_port.borrow().is_some() {
+                        web_sys::console::warn_1(
+                            &"Force-cleaning active port after reconfigure failure".into(),
+                        );
+                        self.active_port.borrow_mut().take();
+                    }
+
                     self.restore_ui_state(snapshot).await;
                     self.transition_to(ConnectionState::Disconnected);
-                    // Status already set to "Ready to connect" by transition_to()
+                    self.set_status.set(format!("Reconfigure failed: {}", e));
                 }
             }
         } else {
