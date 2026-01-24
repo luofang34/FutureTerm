@@ -37,12 +37,14 @@ pub async fn detect_config(
         }
 
         set_status.set(format!("Scanning {}...", rate));
+        #[cfg(debug_assertions)]
         web_sys::console::log_1(&format!("AUTO: Probing [v2] {}...", rate).into());
         let probe_start_ts = js_sys::Date::now();
 
         // 1. Probe 8N1
         let buffer = gather_probe_data(port.clone(), rate, "8N1", true).await;
         let open_dur = js_sys::Date::now() - probe_start_ts;
+        #[cfg(debug_assertions)]
         web_sys::console::log_1(
             &format!(
                 "PROFILE: Rate {} PROBED in {:.1}ms. Bytes: {}",
@@ -71,6 +73,7 @@ pub async fn detect_config(
         let score_7e1 = analysis::calculate_score_7e1(&buffer);
         let score_mav = analysis::calculate_score_mavlink(&buffer);
 
+        #[cfg(debug_assertions)]
         web_sys::console::log_1(
             &format!(
                 "AUTO: Rate {} => 8N1: {:.4}, 7E1: {:.4}, MAV: {:.4} (Size: {})",
@@ -90,6 +93,7 @@ pub async fn detect_config(
             best_framing = "8N1".to_string(); // MAVLink is 8N1
             best_buffer = buffer.clone();
             best_proto = Some("mavlink".to_string());
+            #[cfg(debug_assertions)]
             web_sys::console::log_1(
                 &"AUTO: MAVLink Verified (Magic+Parse)! Stopping probe.".into(),
             );
