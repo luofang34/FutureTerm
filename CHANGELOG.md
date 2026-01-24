@@ -22,6 +22,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - Lock bit preservation across operations
   - Transition validity under arbitrary sequences
   - Idempotence and determinism properties
+- **Test Coverage**: Expanded test suite from 68 to 72 tests:
+  - Added tests for disconnect race conditions and flag leak scenarios
+  - Added tests for reconfigure VID/PID preservation behavior
+  - Documents disconnect_internal() API usage patterns
 
 ### Fixed
 - **Probing Hang**: Fixed infinite loop when probing silent devices by implementing a robust race-safe timeout.
@@ -36,6 +40,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **User Cancellation Flow**: Fixed invalid state transitions during user-initiated disconnect:
   - Added `Connecting` state to ensure proper transition sequence before port open
   - Removed invalid `Disconnected → Reconfiguring` transition
+- **Code Review Fixes**: Addressed all 15 issues from comprehensive code review:
+  - **HIGH Priority (2)**: Fixed auto-reconnect TOCTOU race and probing interruption state violations
+  - **MEDIUM Priority (7)**: Systematic replacement of signal reads with atomic_state reads in critical paths
+  - **LOW Priority (6)**: Code quality improvements including conditional DEBUG logs and constant documentation
+- **Double-Disconnect Race**: Fixed flag leak when rapid disconnect attempts occur:
+  - Second disconnect call now properly clears `user_initiated_disconnect` flag if guard acquisition fails
+  - Prevents permanent connection failure after USB unplug during probing
+- **Reconfigure VID/PID Preservation**: Fixed baud rate changes clearing auto-reconnect device info:
+  - Added `disconnect_internal(clear_auto_reconnect: bool)` to control VID/PID clearing
+  - User-initiated disconnect clears VID/PID, but reconfigure and auto-reconnect preserve it
+- **Reconfigure Port Validation**: Removed incorrect port validity check that broke baud rate changes:
+  - Port check was executing after intentional disconnect, always detecting port as invalid
+  - Reconfigure now properly reconnects with new baud rate settings
 
 ### Changed
 - **Modular Architecture**: Split `connection.rs` (3,700+ lines) into `types.rs`, `prober.rs`, `driver.rs`, and `reconnect.rs`.
