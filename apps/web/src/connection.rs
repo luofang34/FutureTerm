@@ -248,17 +248,26 @@ impl ConnectionManager {
         }
 
         // Sub-methods handle state transitions (Connecting, Probing, Connected, etc.)
-        if baud > 0 && framing == "Auto" {
+        let result = if baud > 0 && framing == "Auto" {
             self.connect_with_smart_framing(port, baud).await
         } else if baud == 0 {
             self.connect_with_auto_detect(port, framing).await
         } else {
-            self.connect_impl(port, baud, framing, None).await
-        }
+            // Direct connect path - set Connecting state first
+            self.transition_to(ConnectionState::Connecting);
+            match self.connect_impl(port, baud, framing, None).await {
+                Ok(()) => Ok(()),
+                Err(e) => {
+                    self.transition_to(ConnectionState::Disconnected);
+                    Err(e)
+                }
+            }
+        };
 
         // Lock automatically released on Drop
         // Note: State is already set to Connected by sub-methods on success,
         // or reverted to Disconnected on error
+        result
     }
 
     async fn connect_with_smart_framing(
@@ -275,8 +284,16 @@ impl ConnectionManager {
             self.set_decoder(p);
         }
 
-        self.connect_impl(port, baud, &detect_framing, Some(initial_buf))
+        match self
+            .connect_impl(port, baud, &detect_framing, Some(initial_buf))
             .await
+        {
+            Ok(()) => Ok(()),
+            Err(e) => {
+                self.transition_to(ConnectionState::Disconnected);
+                Err(e)
+            }
+        }
     }
 
     async fn connect_with_auto_detect(
@@ -296,23 +313,32 @@ impl ConnectionManager {
         .await;
 
         // Handle interruption
-        let (final_port, final_baud, final_framing, initial_buffer, detected_proto) = self
+        let recovery_result = self
             .handle_probing_with_interrupt_recovery(port, baud, framing_str, buffer, proto)
-            .await?;
+            .await;
 
-        if let Some(p) = detected_proto {
-            self.set_decoder(p);
+        match recovery_result {
+            Ok((final_port, final_baud, final_framing, initial_buffer, detected_proto)) => {
+                if let Some(p) = detected_proto {
+                    self.set_decoder(p);
+                }
+
+                let current_state = self.state.get_untracked();
+                if current_state == ConnectionState::Probing
+                    || current_state == ConnectionState::Disconnected
+                {
+                    self.transition_to(ConnectionState::Connecting);
+                }
+
+                self.connect_impl(final_port, final_baud, &final_framing, initial_buffer)
+                    .await
+            }
+            Err(e) => {
+                // Transition to Disconnected when user cancels or error occurs
+                self.transition_to(ConnectionState::Disconnected);
+                Err(e)
+            }
         }
-
-        let current_state = self.state.get_untracked();
-        if current_state == ConnectionState::Probing
-            || current_state == ConnectionState::Disconnected
-        {
-            self.transition_to(ConnectionState::Connecting);
-        }
-
-        self.connect_impl(final_port, final_baud, &final_framing, initial_buffer)
-            .await
     }
 
     async fn handle_probing_with_interrupt_recovery(
@@ -370,7 +396,8 @@ impl ConnectionManager {
                 // Check if this was user-initiated disconnect vs device unplug
                 if self.user_initiated_disconnect.get() {
                     web_sys::console::log_1(
-                        &"DEBUG: Probing interrupted by user disconnect - aborting connection".into(),
+                        &"DEBUG: Probing interrupted by user disconnect - aborting connection"
+                            .into(),
                     );
                     self.probing_interrupted.set(false);
                     return Err("User cancelled".to_string());
