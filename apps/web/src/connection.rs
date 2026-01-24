@@ -334,6 +334,15 @@ impl ConnectionManager {
     > {
         let was_interrupted = self.probing_interrupted.get();
         if was_interrupted {
+            // Check if this was user-initiated disconnect vs device unplug
+            if self.user_initiated_disconnect.get() {
+                web_sys::console::log_1(
+                    &"DEBUG: Probing interrupted by user disconnect - aborting connection".into(),
+                );
+                self.probing_interrupted.set(false);
+                return Err("User cancelled".to_string());
+            }
+
             web_sys::console::warn_1(
                 &"Probing was interrupted by ondisconnect event - port reference is stale".into(),
             );
@@ -358,6 +367,15 @@ impl ConnectionManager {
             .await;
 
             if self.probing_interrupted.get() {
+                // Check if this was user-initiated disconnect vs device unplug
+                if self.user_initiated_disconnect.get() {
+                    web_sys::console::log_1(
+                        &"DEBUG: Probing interrupted by user disconnect - aborting connection".into(),
+                    );
+                    self.probing_interrupted.set(false);
+                    return Err("User cancelled".to_string());
+                }
+
                 self.probing_interrupted.set(false);
                 match self.poll_for_device_reenumeration().await {
                     Ok(fresh_port) => Ok((fresh_port, baud, framing, Some(buffer), proto)),
