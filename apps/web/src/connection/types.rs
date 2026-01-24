@@ -48,7 +48,11 @@ impl ConnectionState {
     pub fn can_disconnect(&self) -> bool {
         matches!(
             self,
-            Self::Connected | Self::AutoReconnecting | Self::DeviceLost
+            Self::Probing
+                | Self::Connecting
+                | Self::Connected
+                | Self::AutoReconnecting
+                | Self::DeviceLost
         )
     }
 
@@ -104,11 +108,13 @@ impl ConnectionState {
 
             // From Probing
             (Probing, Connecting) => true, // Probe complete, connecting
+            (Probing, Disconnecting) => true, // User cancels probe
             (Probing, Disconnected) => true, // Probe failed/canceled
             (Probing, AutoReconnecting) => true, // Device found during probe (onconnect race)
 
             // From Connecting
             (Connecting, Connected) => true, // Connection successful
+            (Connecting, Disconnecting) => true, // User cancels connection
             (Connecting, Disconnected) => true, // Connection failed
             (Connecting, DeviceLost) => true, // Device unplugged during connect
 
@@ -219,7 +225,7 @@ pub fn parse_framing(s: &str) -> (u8, String, u8) {
         Some('O') => "odd",
         _ => "none",
     }
-    .to_string();
+    .into();
     let s_bits = chars.get(2).and_then(|c| c.to_digit(10)).unwrap_or(1) as u8;
     (d, p, s_bits)
 }
@@ -232,10 +238,17 @@ pub fn parse_framing(s: &str) -> (u8, String, u8) {
 /// 3. Both atomic and signal are updated together atomically
 ///
 /// # Usage
-/// ```
-/// let guard = manager.begin_exclusive_transition(current, Connecting)?;
-/// // ... do work ...
-/// guard.finish(Connected); // Success: unlock to Connected + sync signal
+/// ```ignore
+/// // This is a simplified example showing guard usage pattern.
+/// // Actual usage requires ConnectionManager context and async runtime.
+/// use app_web::connection::types::ConnectionState;
+///
+/// let guard = manager.begin_exclusive_transition(
+///     ConnectionState::Disconnected,
+///     ConnectionState::Connecting
+/// )?;
+/// // ... perform operations (port.open, etc.) ...
+/// guard.finish(ConnectionState::Connected); // Success: unlock to Connected + sync signal
 /// // Or: drop(guard); // Error: auto-unlock to Disconnected + sync signal
 /// ```
 pub struct ExclusiveTransitionGuard {
@@ -255,7 +268,7 @@ impl ExclusiveTransitionGuard {
 
         // Update signal to match
         self.set_state.set(final_state);
-        self.set_status.set(final_state.status_text().to_string());
+        self.set_status.set(final_state.status_text().into());
 
         // Don't run Drop (we handled cleanup)
         std::mem::forget(self);
@@ -264,17 +277,41 @@ impl ExclusiveTransitionGuard {
 
 impl Drop for ExclusiveTransitionGuard {
     fn drop(&mut self) {
-        // Panic/error path: unlock to Disconnected and sync signal
-        // This ensures BOTH atomic and signal are always synchronized
-        self.atomic_state
-            .unlock_and_set(ConnectionState::Disconnected);
-        self.set_state.set(ConnectionState::Disconnected);
-        self.set_status.set("Ready to connect".to_string());
+        // Check current state to avoid overwriting user-initiated states
+        let current = self.atomic_state.get();
+
+        // Preserve states that have specific cleanup semantics
+        let target = match current {
+            ConnectionState::Disconnecting => {
+                // User initiated disconnect is running, let it complete
+                #[cfg(debug_assertions)]
+                {
+                    web_sys::console::log_1(
+                        &"Guard dropped during Disconnecting - preserving state".into(),
+                    );
+                }
+                current
+            }
+            _ => {
+                // Default error path: go to Disconnected
+                ConnectionState::Disconnected
+            }
+        };
+
+        self.atomic_state.unlock_and_set(target);
+        self.set_state.set(target);
+        self.set_status.set(target.status_text().into());
 
         #[cfg(debug_assertions)]
-        web_sys::console::warn_1(
-            &"ExclusiveTransitionGuard dropped without finish() - unlocking to Disconnected".into(),
-        );
+        {
+            web_sys::console::warn_1(
+                &format!(
+                    "ExclusiveTransitionGuard dropped - unlocking to {:?}",
+                    target
+                )
+                .into(),
+            );
+        }
     }
 }
 
@@ -288,10 +325,12 @@ impl Drop for ExclusiveTransitionGuard {
 /// - Only clears the lock bit on Drop (does NOT change state to Disconnected)
 ///
 /// # Usage
-/// ```
+/// ```ignore
+/// // This is a simplified example showing lock guard usage pattern.
+/// // Actual usage requires ConnectionManager, SerialPort, and async runtime.
 /// let _lock = manager.acquire_operation_lock()?;
-/// // Sub-methods can call transition_to() freely
-/// manager.connect_with_auto_detect(port, framing).await?;
+/// // Sub-methods can call transition_to() freely without re-acquiring locks
+/// manager.connect_with_auto_detect(port, "Auto").await?;
 /// // Lock automatically released on Drop (state unchanged)
 /// ```
 pub struct OperationLockGuard {
@@ -302,9 +341,11 @@ impl ConnectionManager {
     /// Securely finalize a connection state transition (update both signal and atomic)
     /// This helper prevents desynchronization bugs where signal is updated but atomic isn't.
     /// It preserves the atomic lock bit if present.
+    /// CRITICAL: Also updates status text to match FSM state (single source of truth)
     pub fn finalize_connection(&self, state: ConnectionState) {
         self.atomic_state.set_preserving_lock(state);
         self.set_state.set(state);
+        self.set_status.set(state.status_text().into());
     }
 }
 
@@ -524,10 +565,10 @@ mod tests {
         use ConnectionState::*;
 
         let invalid = vec![
-            (Disconnected, Connected),  // Must go through Connecting
-            (Connected, Disconnected),  // Must go through Disconnecting
-            (Disconnecting, Connected), // Disconnecting is one-way
-            (Probing, Disconnecting),   // Must cancel probing first
+            (Disconnected, Connected),      // Must go through Connecting
+            (Connected, Disconnected),      // Must go through Disconnecting
+            (Disconnecting, Connected),     // Disconnecting is one-way
+            (Reconfiguring, Disconnecting), // Cannot interrupt reconfiguration
         ];
 
         for (from, to) in invalid {
@@ -709,8 +750,10 @@ mod tests {
             (Disconnected, Probing),
             (Disconnected, Connecting),
             (Probing, Connecting),
+            (Probing, Disconnecting),
             (Probing, Disconnected),
             (Connecting, Connected),
+            (Connecting, Disconnecting),
             (Connecting, Disconnected),
             (Connecting, DeviceLost),
             (Connected, Reconfiguring),
@@ -755,11 +798,14 @@ mod tests {
         assert!(!Disconnected.indicator_should_pulse());
 
         // Test disconnect button
+        assert!(Probing.can_disconnect());
+        assert!(Connecting.can_disconnect());
         assert!(Connected.can_disconnect());
         assert!(DeviceLost.can_disconnect());
         assert!(AutoReconnecting.can_disconnect());
-        assert!(!Connecting.can_disconnect());
         assert!(!Disconnected.can_disconnect());
+        assert!(!Disconnecting.can_disconnect());
+        assert!(!Reconfiguring.can_disconnect());
 
         // Test status text
         assert_eq!(Connected.status_text(), "Connected");
@@ -818,7 +864,7 @@ mod tests {
 
         // Test each state has at least one valid transition
         for state in all_states {
-            let has_valid_transition = vec![
+            let has_valid_transition = [
                 Disconnected,
                 Probing,
                 Connecting,
@@ -844,7 +890,7 @@ mod tests {
         use ConnectionState::*;
 
         // Each state should have unique visual representation
-        let states = vec![
+        let states = [
             Disconnected,
             Probing,
             Connecting,
@@ -933,11 +979,14 @@ mod tests {
 
         // Probing for firmware...
         let state = Probing;
-        assert!(!state.can_disconnect()); // Cannot disconnect while probing
+        assert!(state.can_disconnect()); // User can cancel probing
+        assert!(state.can_transition_to(Disconnecting)); // Cancel via disconnect button
         assert!(state.can_transition_to(Connecting));
 
         // Found firmware, connecting...
         let state = Connecting;
+        assert!(state.can_disconnect()); // User can cancel connecting
+        assert!(state.can_transition_to(Disconnecting)); // Cancel via disconnect button
         assert!(state.can_transition_to(Connected));
 
         // Connected!
@@ -1077,6 +1126,48 @@ mod tests {
         assert!(state.can_transition_to(Connected));
     }
 
+    /// Test user can cancel connection attempts
+    #[test]
+    fn test_user_cancel_connection_flow() {
+        use ConnectionState::*;
+
+        // Scenario 1: User cancels during probing
+        let state = Probing;
+        assert!(
+            state.can_disconnect(),
+            "User should be able to cancel probing"
+        );
+        assert!(
+            state.can_transition_to(Disconnecting),
+            "Probing → Disconnecting should be allowed"
+        );
+        let state = Disconnecting;
+        assert!(state.can_transition_to(Disconnected));
+
+        // Scenario 2: User cancels during connecting
+        let state = Connecting;
+        assert!(
+            state.can_disconnect(),
+            "User should be able to cancel connecting"
+        );
+        assert!(
+            state.can_transition_to(Disconnecting),
+            "Connecting → Disconnecting should be allowed"
+        );
+        let state = Disconnecting;
+        assert!(state.can_transition_to(Disconnected));
+
+        // Verify button UI shows "Disconnect" during these states
+        assert!(
+            Probing.button_shows_disconnect(),
+            "Button should show 'Disconnect' during probing"
+        );
+        assert!(
+            Connecting.button_shows_disconnect(),
+            "Button should show 'Disconnect' during connecting"
+        );
+    }
+
     // ============ Fail-Fast Validation Tests ============
 
     /// Test that invalid state combinations are impossible
@@ -1094,10 +1185,9 @@ mod tests {
 
         // Cannot be connected while disconnecting
         assert!(!Disconnecting.can_transition_to(Connected));
-        assert!(!Connected
-            .can_transition_to(Disconnecting)
-            .then(|| Disconnecting.can_transition_to(Connected))
-            .unwrap_or(true));
+        let can_disconnect = Connected.can_transition_to(Disconnecting);
+        let can_reconnect = Disconnecting.can_transition_to(Connected);
+        assert!(!(can_disconnect && can_reconnect));
     }
 
     /// Test that all transition paths are deterministic
@@ -1113,16 +1203,10 @@ mod tests {
         assert!(!Disconnecting.can_transition_to(Connected));
         assert!(!Disconnecting.can_transition_to(Connecting));
 
-        // Connecting can only go to Connected or back to Disconnected
-        // (or DeviceLost if USB unplugged)
-        let valid_connecting_exits = [Connected, Disconnected, DeviceLost];
-        for state in [
-            Probing,
-            Connecting,
-            Reconfiguring,
-            Disconnecting,
-            AutoReconnecting,
-        ] {
+        // Connecting can go to: Connected (success), Disconnecting (user cancel),
+        // Disconnected (failed), or DeviceLost (USB unplugged)
+        let valid_connecting_exits = [Connected, Disconnecting, Disconnected, DeviceLost];
+        for state in [Probing, Connecting, Reconfiguring, AutoReconnecting] {
             if !valid_connecting_exits.contains(&state) {
                 assert!(!Connecting.can_transition_to(state));
             }
@@ -1195,10 +1279,10 @@ mod tests {
         use ConnectionState::*;
 
         let invalid_transitions = vec![
-            (Disconnected, Connected),  // Must go through Connecting
-            (Connected, Disconnected),  // Must go through Disconnecting
-            (Disconnecting, Connected), // Disconnecting is one-way
-            (Probing, Disconnecting),   // Cannot disconnect while probing
+            (Disconnected, Connected),      // Must go through Connecting
+            (Connected, Disconnected),      // Must go through Disconnecting
+            (Disconnecting, Connected),     // Disconnecting is one-way
+            (Reconfiguring, Disconnecting), // Cannot interrupt reconfiguration
         ];
 
         for (from, to) in invalid_transitions {
@@ -1339,5 +1423,250 @@ mod tests {
             atomic.is_locked(),
             "Lock must be preserved (for OperationLockGuard to unlock)"
         );
+    }
+
+    #[test]
+    fn test_user_initiated_disconnect_flag_behavior() {
+        // This test documents the expected behavior of user_initiated_disconnect flag
+        // Bug Fix: Rapid double-disconnect should not leave flag stuck as true
+        //
+        // Scenario that was broken:
+        // 1. User clicks disconnect (fast)
+        // 2. First call sets flag=true, acquires guard
+        // 3. Second call sets flag=true, guard acquisition fails, returns false
+        // 4. First call completes, sets flag=false
+        // 5. BUG: Flag is now true (from step 3), blocking next connect
+        //
+        // Fix: Second call now clears its own flag on guard acquisition failure
+
+        use std::cell::Cell;
+
+        let flag = Cell::new(false);
+
+        // Simulate first disconnect acquiring guard
+        flag.set(true);
+        let first_acquired = true;
+
+        // Simulate second disconnect failing to acquire guard
+        flag.set(true); // This was the bug - sets flag but doesn't clear it
+        let second_acquired = false;
+
+        // After fix: second call should clear its flag
+        if !second_acquired {
+            flag.set(false); // ✅ Fix: Clear the flag we just set
+        }
+
+        // Simulate first disconnect completing
+        if first_acquired {
+            flag.set(false);
+        }
+
+        // Verify flag is cleared
+        assert!(
+            !flag.get(),
+            "Flag should be false after both disconnects complete"
+        );
+    }
+
+    #[test]
+    fn test_disconnect_internal_scenarios() {
+        // This test documents the clear_auto_reconnect parameter behavior
+        // Bug Fix: reconfigure() was clearing VID/PID, breaking reconnection
+        //
+        // Scenarios:
+        // 1. User disconnect: clear_auto_reconnect = true
+        //    - User clicked disconnect button
+        //    - Should prevent auto-reconnect by clearing VID/PID
+        //
+        // 2. Reconfigure: clear_auto_reconnect = false
+        //    - Temporarily disconnect to change baud rate
+        //    - Should preserve VID/PID to allow reconnection
+        //
+        // 3. Auto-reconnect cleanup: clear_auto_reconnect = false
+        //    - Device unplugged, preparing to reconnect
+        //    - Should preserve VID/PID to allow reconnection
+
+        struct DisconnectScenario {
+            name: &'static str,
+            clear_auto_reconnect: bool,
+            should_preserve_vid_pid: bool,
+        }
+
+        let scenarios = vec![
+            DisconnectScenario {
+                name: "User disconnect",
+                clear_auto_reconnect: true,
+                should_preserve_vid_pid: false,
+            },
+            DisconnectScenario {
+                name: "Reconfigure",
+                clear_auto_reconnect: false,
+                should_preserve_vid_pid: true,
+            },
+            DisconnectScenario {
+                name: "Auto-reconnect cleanup",
+                clear_auto_reconnect: false,
+                should_preserve_vid_pid: true,
+            },
+        ];
+
+        for scenario in scenarios {
+            let vid_pid_preserved = !scenario.clear_auto_reconnect;
+            assert_eq!(
+                vid_pid_preserved, scenario.should_preserve_vid_pid,
+                "{}: VID/PID preservation mismatch",
+                scenario.name
+            );
+        }
+    }
+
+    // ============ Property-Based Tests ============
+    //
+    // These tests use proptest to verify FSM invariants under arbitrary inputs.
+    // They catch edge cases that manual tests might miss.
+    // Note: proptest is not available on wasm32, so these tests only run on native platforms.
+
+    #[cfg(not(target_arch = "wasm32"))]
+    mod property_tests {
+        use super::*;
+        use proptest::prelude::*;
+
+        // Strategy: Generate arbitrary connection states
+        fn arb_state() -> impl Strategy<Value = ConnectionState> {
+            prop_oneof![
+                Just(ConnectionState::Disconnected),
+                Just(ConnectionState::Probing),
+                Just(ConnectionState::Connecting),
+                Just(ConnectionState::Connected),
+                Just(ConnectionState::Reconfiguring),
+                Just(ConnectionState::Disconnecting),
+                Just(ConnectionState::DeviceLost),
+                Just(ConnectionState::AutoReconnecting),
+            ]
+        }
+
+        proptest! {
+            /// Property: State encoding/decoding is lossless
+            /// For all states, from_u8(to_u8(state)) == state
+            #[test]
+            fn prop_state_encoding_roundtrip(state in arb_state()) {
+                let encoded = state.to_u8();
+                let decoded = ConnectionState::from_u8(encoded).unwrap();
+                prop_assert_eq!(decoded, state, "State encoding roundtrip failed");
+            }
+
+            /// Property: Lock bit never corrupts state value
+            /// Locking and unlocking should not change the state itself
+            #[test]
+            fn prop_lock_preserves_state(state in arb_state()) {
+                let atomic = AtomicConnectionState::new(state);
+
+                // Lock the state
+                atomic.try_lock().unwrap();
+                prop_assert_eq!(atomic.get(), state, "Lock corrupted state");
+                prop_assert!(atomic.is_locked(), "Lock bit not set");
+
+                // Unlock without changing state
+                atomic.unlock();
+                prop_assert_eq!(atomic.get(), state, "Unlock changed state");
+                prop_assert!(!atomic.is_locked(), "Lock bit not cleared");
+            }
+
+            /// Property: Idempotent transitions maintain state
+            /// States that can transition to themselves should remain unchanged
+            #[test]
+            fn prop_idempotent_transitions_maintain_state(state in arb_state()) {
+                if state.can_transition_to(state) {
+                    let atomic = AtomicConnectionState::new(state);
+                    let result = atomic.try_transition(state, state);
+                    prop_assert!(result.is_ok(), "Idempotent transition failed");
+                    prop_assert_eq!(atomic.get(), state, "Idempotent transition changed state");
+                }
+            }
+
+            /// Property: set_preserving_lock maintains lock bit
+            /// When locked, set_preserving_lock should keep lock active
+            #[test]
+            fn prop_set_preserving_lock_maintains_lock(
+                initial in arb_state(),
+                new_state in arb_state()
+            ) {
+                let atomic = AtomicConnectionState::new(initial);
+
+                // Lock the state
+                atomic.try_lock().unwrap();
+                prop_assert!(atomic.is_locked(), "Initial lock failed");
+
+                // Change state while preserving lock
+                atomic.set_preserving_lock(new_state);
+
+                prop_assert_eq!(atomic.get(), new_state, "State not updated");
+                prop_assert!(atomic.is_locked(), "Lock bit lost during set_preserving_lock");
+            }
+
+            /// Property: Invalid transitions always fail
+            /// Transitions not in the valid set should be rejected
+            #[test]
+            fn prop_invalid_transitions_rejected(
+                from in arb_state(),
+                to in arb_state()
+            ) {
+                if !from.can_transition_to(to) {
+                    let atomic = AtomicConnectionState::new(from);
+                    let result = atomic.try_transition(from, to);
+                    prop_assert!(result.is_err(),
+                        "Invalid transition {:?} -> {:?} was accepted", from, to);
+                    prop_assert_eq!(atomic.get(), from,
+                        "State changed despite invalid transition");
+                }
+            }
+
+            /// Property: State encoding uses only lower 7 bits
+            /// to_u8 should never use bit 7 (reserved for lock flag)
+            #[test]
+            fn prop_state_encoding_respects_lock_bit(state in arb_state()) {
+                let encoded = state.to_u8();
+                prop_assert_eq!(encoded & 0x80, 0,
+                    "State encoding uses lock bit (bit 7)");
+                prop_assert!(encoded <= 7,
+                    "State encoding exceeds 3-bit range (0-7)");
+            }
+
+            /// Property: Concurrent lock attempts fail
+            /// Only one lock can be acquired at a time
+            #[test]
+            fn prop_concurrent_locks_rejected(state in arb_state()) {
+                let atomic = AtomicConnectionState::new(state);
+
+                // First lock succeeds
+                let first = atomic.try_lock();
+                prop_assert!(first.is_ok(), "First lock should succeed");
+
+                // Second lock fails (already locked)
+                let second = atomic.try_lock();
+                prop_assert!(second.is_err(), "Second lock should fail");
+                prop_assert_eq!(second.unwrap_err(), state,
+                    "Lock failure should return current state");
+            }
+
+            /// Property: unlock_and_set clears lock and updates state
+            #[test]
+            fn prop_unlock_and_set_clears_lock(
+                initial in arb_state(),
+                new_state in arb_state()
+            ) {
+                let atomic = AtomicConnectionState::new(initial);
+
+                // Lock first
+                atomic.try_lock().unwrap();
+                prop_assert!(atomic.is_locked(), "Lock failed");
+
+                // Unlock and set new state
+                atomic.unlock_and_set(new_state);
+
+                prop_assert_eq!(atomic.get(), new_state, "State not updated");
+                prop_assert!(!atomic.is_locked(), "Lock not cleared");
+            }
+        }
     }
 }

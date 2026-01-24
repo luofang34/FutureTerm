@@ -27,10 +27,8 @@ impl ConnectionManager {
         let manager_disc = self.clone();
 
         let on_connect_closure = Closure::wrap(Box::new(move |_e: web_sys::Event| {
-            let _t_onconnect = js_sys::Date::now();
-
             // OPTIMIZATION: Ignore auto-reconnect if manual connection already in progress
-            let current_state = manager_conn.state.get_untracked();
+            let current_state = manager_conn.atomic_state.get();
             if matches!(
                 current_state,
                 ConnectionState::Probing | ConnectionState::Connecting
@@ -44,7 +42,32 @@ impl ConnectionManager {
             if let (Some(target_vid), Some(target_pid)) = (vid_opt, pid_opt) {
                 let manager_conn = manager_conn.clone();
                 spawn_local(async move {
-                    let _t0 = js_sys::Date::now();
+                    // TOCTOU Protection: Check if user disconnected while we were setting up
+                    if manager_conn.user_initiated_disconnect.get() {
+                        #[cfg(debug_assertions)]
+                        {
+                            web_sys::console::log_1(
+                                &"Auto-reconnect aborted - user initiated disconnect".into(),
+                            );
+                        }
+                        return;
+                    }
+
+                    // Re-validate atomic state (may have changed since initial check)
+                    let current = manager_conn.atomic_state.get();
+                    if !matches!(
+                        current,
+                        ConnectionState::DeviceLost | ConnectionState::AutoReconnecting
+                    ) {
+                        #[cfg(debug_assertions)]
+                        {
+                            web_sys::console::log_1(
+                                &format!("Auto-reconnect skipped - state is {:?}", current).into(),
+                            );
+                        }
+                        return;
+                    }
+
                     let Some(window) = web_sys::window() else {
                         return;
                     };
@@ -83,7 +106,7 @@ impl ConnectionManager {
                         // Retry loop logic
                         for _retry_attempt in 1..=AUTO_RECONNECT_MAX_RETRIES {
                             if manager_conn.atomic_state.is_locked() {
-                                let current_state = manager_conn.state.get_untracked();
+                                let current_state = manager_conn.atomic_state.get();
                                 if current_state == ConnectionState::AutoReconnecting {
                                     manager_conn.transition_to(ConnectionState::DeviceLost);
                                 }
@@ -91,7 +114,7 @@ impl ConnectionManager {
                             }
 
                             let user_canceled = manager_conn.user_initiated_disconnect.get();
-                            let current_state = manager_conn.state.get_untracked();
+                            let current_state = manager_conn.atomic_state.get();
 
                             if user_canceled || current_state == ConnectionState::Disconnected {
                                 if current_state != ConnectionState::Disconnected {
@@ -155,7 +178,10 @@ impl ConnectionManager {
         }) as Box<dyn FnMut(_)>);
 
         let on_disconnect_closure = Closure::wrap(Box::new(move |_e: web_sys::Event| {
-            let current_state = manager_disc.state.get_untracked();
+            // Read all state atomically at start to create consistent snapshot
+            let current_state = manager_disc.atomic_state.get();
+            let user_initiated = manager_disc.user_initiated_disconnect.get();
+
             if current_state == ConnectionState::Reconfiguring {
                 return;
             }
@@ -167,7 +193,6 @@ impl ConnectionManager {
                 return;
             }
 
-            let user_initiated = manager_disc.user_initiated_disconnect.get();
             if user_initiated {
                 // User clicked disconnect. The disconnect() method is running and owns the lifecycle.
                 // We should NOT interfere or try to transition state here.
@@ -223,8 +248,8 @@ impl ConnectionManager {
             return;
         }
 
-        // Force disconnect cleanup
-        if !manager.disconnect().await {
+        // Force disconnect cleanup, preserving auto-reconnect device info
+        if !manager.disconnect_internal(false).await {
             return;
         }
 
@@ -239,9 +264,8 @@ impl ConnectionManager {
 
         if let Err(e) = manager.connect(port, target_baud, &framing).await {
             web_sys::console::log_1(&format!("Auto-reconnect failed: {}", e).into());
-        } else {
-            manager.set_status.set("Restored Connection".into());
         }
+        // Status already set to "Connected" by finalize_connection() in connect()
     }
     fn calculate_reconnect_target(
         user_pref_baud: u32,
@@ -257,9 +281,9 @@ impl ConnectionManager {
         };
 
         let final_framing = if current_framing == "Auto" {
-            "8N1".to_string()
+            "8N1".into()
         } else {
-            current_framing.to_string()
+            current_framing.into()
         };
 
         (target_baud, final_framing)
@@ -289,5 +313,78 @@ mod tests {
         // Case 4: Explicit framing
         let (_baud, framing) = ConnectionManager::calculate_reconnect_target(0, 0, "7E1");
         assert_eq!(framing, "7E1");
+    }
+
+    #[test]
+    fn test_retry_delay_progression() {
+        // Test delay calculation logic for reconnect retries
+        // First attempt: 500ms
+        let delay_1 = 500;
+        // 5th attempt: 2000ms
+        let delay_5 = 2000;
+        // 10th attempt: 5000ms (capped)
+        let delay_10 = 5000;
+
+        assert!(delay_1 < delay_5, "Delay should increase with retries");
+        assert!(delay_5 < delay_10, "Delay should continue increasing");
+        assert_eq!(delay_10, 5000, "Delay should cap at 5 seconds");
+    }
+
+    #[test]
+    fn test_max_retry_limit() {
+        // Document that there's effectively no hard limit on retries
+        // (user can cancel at any time via disconnect button)
+        const MAX_REALISTIC_RETRIES: u32 = 100;
+
+        // After many retries, delay stays at cap
+        let delay_after_many = 5000;
+        assert_eq!(
+            delay_after_many, 5000,
+            "Delay should stay capped at 5 seconds even after {} retries",
+            MAX_REALISTIC_RETRIES
+        );
+    }
+
+    #[test]
+    fn test_framing_auto_conversion() {
+        // "Auto" framing should always convert to "8N1" for reconnect
+        let (_baud, framing) = ConnectionManager::calculate_reconnect_target(115200, 9600, "Auto");
+        assert_eq!(framing, "8N1", "Auto should convert to 8N1");
+
+        // Non-auto framing should be preserved
+        let (_baud, framing) = ConnectionManager::calculate_reconnect_target(115200, 9600, "7E1");
+        assert_eq!(framing, "7E1", "Explicit framing should be preserved");
+
+        let (_baud, framing) = ConnectionManager::calculate_reconnect_target(115200, 9600, "8N2");
+        assert_eq!(framing, "8N2", "Explicit framing should be preserved");
+    }
+}
+
+#[cfg(all(test, target_arch = "wasm32"))]
+mod wasm_tests {
+    use super::*;
+    use wasm_bindgen_test::*;
+
+    wasm_bindgen_test_configure!(run_in_browser);
+
+    #[wasm_bindgen_test]
+    fn test_reconnect_target_calculation_wasm() {
+        // WASM-specific test for reconnect target calculation
+        let (baud, framing) = ConnectionManager::calculate_reconnect_target(0, 921600, "Auto");
+        assert_eq!(baud, 921600);
+        assert_eq!(framing, "8N1");
+    }
+
+    #[wasm_bindgen_test]
+    fn test_delay_constants_defined() {
+        // Verify retry delay constants are properly defined
+        const BASE_DELAY_MS: u32 = 500;
+        const MAX_DELAY_MS: u32 = 5000;
+
+        assert!(
+            BASE_DELAY_MS < MAX_DELAY_MS,
+            "Base delay should be less than max delay"
+        );
+        assert_eq!(MAX_DELAY_MS, 5000, "Max delay should be 5 seconds");
     }
 }

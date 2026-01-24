@@ -202,7 +202,7 @@ mod tests {
             0xFE, 0x00, 0x01, 0x01, 0x01, 0x00, 0x00,
             0x00, // Valid minimal 8-byte packet (payload 0)
         ]);
-        noise.extend_from_slice(&vec![0xAA; 100]);
+        noise.extend_from_slice(&[0xAA; 100]);
 
         // Total 208 bytes. 8 valid. Score = 8/208 ~= 0.038
         // Wait, the current logic is purely ratio based.

@@ -50,6 +50,7 @@ impl WebSerialTransport {
         port: SerialPort,
         config: SerialConfig,
     ) -> Result<(), TransportError> {
+        #[cfg(debug_assertions)]
         web_sys::console::log_1(
             &format!(
                 "WebSerialTransport: open() called. Baud: {}",
@@ -88,11 +89,13 @@ impl WebSerialTransport {
         // Convert to SerialOptions
         let serial_options: SerialOptions = options.unchecked_into();
 
+        #[cfg(debug_assertions)]
         web_sys::console::log_1(&"WebSerialTransport: Invoking port.open()...".into());
         let promise = port.open(&serial_options);
         JsFuture::from(promise)
             .await
             .map_err(|e| TransportError::ConnectionFailed(format!("{:?}", e)))?;
+        #[cfg(debug_assertions)]
         web_sys::console::log_1(&"WebSerialTransport: port.open() resolved.".into());
 
         // Setup streams
@@ -129,6 +132,7 @@ impl WebSerialTransport {
         self.reader = Some(reader);
         self.writer = Some(writer);
         self.pending_read = std::cell::RefCell::new(None);
+        #[cfg(debug_assertions)]
         web_sys::console::log_1(
             &"WebSerialTransport: Stream readers/writers setup complete.".into(),
         );
@@ -166,6 +170,7 @@ impl Transport for WebSerialTransport {
             let _ = JsFuture::from(reader.cancel()).await;
             reader.release_lock();
             let dur_r = js_sys::Date::now() - start_r;
+            #[cfg(debug_assertions)]
             web_sys::console::log_1(
                 &format!("WebSerialTransport: reader.cancel() took {:.1}ms", dur_r).into(),
             );
@@ -190,6 +195,7 @@ impl Transport for WebSerialTransport {
 
             writer.release_lock();
             let dur_w = js_sys::Date::now() - start_w;
+            #[cfg(debug_assertions)]
             web_sys::console::log_1(
                 &format!("WebSerialTransport: writer.close() took {:.1}ms", dur_w).into(),
             );
@@ -203,6 +209,7 @@ impl Transport for WebSerialTransport {
                     // Use timeout and error handling to ensure we don't block
                     match func.call0(&port) {
                         Ok(p) => {
+                            #[cfg(debug_assertions)]
                             web_sys::console::log_1(
                                 &"WebSerialTransport: port.close() invoking...".into(),
                             );
@@ -227,6 +234,7 @@ impl Transport for WebSerialTransport {
                             let _ = JsFuture::from(race_result).await;
 
                             let dur_c = js_sys::Date::now() - start_c;
+                            #[cfg(debug_assertions)]
                             web_sys::console::log_1(
                                 &format!(
                                     "WebSerialTransport: port.close() resolved in {:.1}ms",
@@ -237,6 +245,7 @@ impl Transport for WebSerialTransport {
                         }
                         Err(_) => {
                             // Port already closed or other error - this is fine
+                            #[cfg(debug_assertions)]
                             web_sys::console::log_1(
                                 &"WebSerialTransport: port.close() call failed (port likely \
                                   already closed)"
@@ -249,6 +258,7 @@ impl Transport for WebSerialTransport {
         }
 
         let total_close = js_sys::Date::now() - start_close;
+        #[cfg(debug_assertions)]
         web_sys::console::log_1(
             &format!(
                 "WebSerialTransport: close() complete in {:.1}ms",

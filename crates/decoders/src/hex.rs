@@ -80,7 +80,7 @@ mod tests {
 
         let mut results = Vec::new();
         decoder.ingest(&frame, &mut results);
-        let event = results.get(0).expect("Hex decoder always succeeds");
+        let event = results.first().expect("Hex decoder always succeeds");
 
         assert_eq!(event.protocol, "Hex");
 
@@ -107,7 +107,7 @@ mod tests {
 
         let mut results = Vec::new();
         decoder.ingest(&frame, &mut results);
-        let event = results.get(0).expect("Hex decoder always succeeds");
+        let event = results.first().expect("Hex decoder always succeeds");
 
         match event.get_field("len") {
             Some(Value::I64(v)) => assert_eq!(*v, 0),
@@ -123,7 +123,7 @@ mod tests {
 
         let mut results = Vec::new();
         decoder.ingest(&frame, &mut results);
-        let event = results.get(0).expect("Hex decoder always succeeds");
+        let event = results.first().expect("Hex decoder always succeeds");
 
         // Summary should be truncated
         assert!(event.summary.ends_with("..."));
@@ -137,7 +137,7 @@ mod tests {
 
         let mut results = Vec::new();
         decoder.ingest(&frame, &mut results);
-        let event = results.get(0).expect("Hex decoder always succeeds");
+        let event = results.first().expect("Hex decoder always succeeds");
 
         match event.get_field("ascii") {
             Some(Value::String(s)) => assert_eq!(s, "Hello"),

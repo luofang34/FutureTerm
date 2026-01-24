@@ -45,7 +45,7 @@ mod tests {
 
         let mut results = Vec::new();
         decoder.ingest(&frame, &mut results);
-        let event = results.get(0).expect("Utf8 decoder always succeeds");
+        let event = results.first().expect("Utf8 decoder always succeeds");
 
         assert_eq!(event.protocol, "UTF-8");
         assert_eq!(event.summary, "Hello");
@@ -60,7 +60,7 @@ mod tests {
 
         let mut results = Vec::new();
         decoder.ingest(&frame, &mut results);
-        let event = results.get(0).expect("Succeeds");
+        let event = results.first().expect("Succeeds");
         assert_eq!(event.summary, "\x1B[31m");
     }
 
@@ -71,7 +71,7 @@ mod tests {
 
         let mut results = Vec::new();
         decoder.ingest(&frame, &mut results);
-        let event = results.get(0).expect("Utf8 decoder always succeeds");
+        let event = results.first().expect("Utf8 decoder always succeeds");
 
         assert_eq!(event.summary, "");
     }
@@ -86,7 +86,7 @@ mod tests {
         let mut results = Vec::new();
         decoder.ingest(&frame, &mut results);
         let event = results
-            .get(0)
+            .first()
             .expect("Utf8 decoder always succeeds (lossy)");
 
         // Should contain replacement characters
@@ -102,7 +102,7 @@ mod tests {
 
         let mut results = Vec::new();
         decoder.ingest(&frame, &mut results);
-        let event = results.get(0).expect("Utf8 decoder always succeeds");
+        let event = results.first().expect("Utf8 decoder always succeeds");
 
         assert_eq!(event.summary, "日本語");
     }

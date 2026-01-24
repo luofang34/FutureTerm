@@ -17,10 +17,24 @@ use wasm_bindgen::JsCast;
 use wasm_bindgen_futures::spawn_local;
 use web_sys::Worker;
 
+/// USB device re-enumeration typically takes 100-300ms on most operating systems
+/// after physical disconnect. We wait 200ms to ensure the device has completed
+/// its re-initialization before attempting to access it.
 const REENUMERATION_WAIT_MS: i32 = 200;
+
+/// After probing interruption, wait for probe buffers and event handlers to drain
+/// before checking the probing_interrupted flag. This prevents race conditions
+/// where the flag is checked before the ondisconnect handler sets it.
 const PROBING_CLEANUP_WAIT_MS: i32 = 150;
+
+/// Polling intervals for device re-enumeration detection.
+/// Fast interval (first 2 attempts): 100ms for responsive user experience
 const POLL_INTERVAL_FAST_MS: i32 = 100;
+
+/// Medium interval (next 5 attempts): 200ms balances responsiveness with CPU usage
 const POLL_INTERVAL_MEDIUM_MS: i32 = 200;
+
+/// Slow interval (remaining attempts): 400ms reduces CPU usage for extended waits
 const POLL_INTERVAL_SLOW_MS: i32 = 400;
 
 impl ConnectionManager {
@@ -28,13 +42,13 @@ impl ConnectionManager {
         // Initialize state machine with Disconnected state
         let (state, set_state) = create_signal(ConnectionState::Disconnected);
 
-        let (status, set_status) = create_signal("Ready to connect".to_string());
+        let (status, set_status) = create_signal("Ready to connect".into());
         let (detected_baud, set_detected_baud) = create_signal(0);
-        let (detected_framing, set_detected_framing) = create_signal("".to_string());
+        let (detected_framing, set_detected_framing) = create_signal("".into());
 
         let (rx_active, set_rx_active) = create_signal(false);
         let (tx_active, set_tx_active) = create_signal(false);
-        let (decoder_id, set_decoder_id) = create_signal("utf8".to_string());
+        let (decoder_id, set_decoder_id) = create_signal("utf8".into());
 
         Self {
             state: state.into(),
@@ -160,10 +174,17 @@ impl ConnectionManager {
     /// even if panic occurs.
     ///
     /// # Usage
-    /// ```
-    /// let guard = self.begin_exclusive_transition(current, Connecting)?;
-    /// // ... do work ...
-    /// guard.finish(Connected); // Success path
+    /// ```ignore
+    /// // This is a simplified example showing the API usage pattern.
+    /// // Actual usage requires ConnectionManager context and async runtime.
+    /// use app_web::connection::types::ConnectionState;
+    ///
+    /// let guard = manager.begin_exclusive_transition(
+    ///     ConnectionState::Disconnected,
+    ///     ConnectionState::Connecting
+    /// )?;
+    /// // ... perform async operations ...
+    /// guard.finish(ConnectionState::Connected); // Success path
     /// // Or: drop(guard); // Error path (auto-unlocks to Disconnected)
     /// ```
     pub fn begin_exclusive_transition(
@@ -198,10 +219,12 @@ impl ConnectionManager {
     /// to call transition_to() to update states as needed.
     ///
     /// # Usage
-    /// ```
-    /// let _lock = self.acquire_operation_lock()?;
-    /// // Sub-methods can call transition_to() freely
-    /// self.connect_with_auto_detect(port, framing).await?;
+    /// ```ignore
+    /// // This is a simplified example showing the API usage pattern.
+    /// // Actual usage requires ConnectionManager context, SerialPort, and async runtime.
+    /// let _lock = manager.acquire_operation_lock()?;
+    /// // Sub-methods can call transition_to() freely without re-acquiring locks
+    /// manager.connect_with_auto_detect(port, "Auto").await?;
     /// // Lock automatically released on Drop
     /// ```
     pub fn acquire_operation_lock(&self) -> Result<OperationLockGuard, String> {
@@ -224,6 +247,7 @@ impl ConnectionManager {
         if let Some(set_pid) = *self.set_last_pid.borrow() {
             set_pid.set(None);
         }
+        #[cfg(debug_assertions)]
         web_sys::console::log_1(&"DEBUG: Cleared VID/PID to prevent auto-reconnect".into());
     }
 
@@ -240,7 +264,7 @@ impl ConnectionManager {
         let _lock = self.acquire_operation_lock()?;
 
         if self.active_port.borrow().is_some() {
-            return Err("Already connected".to_string());
+            return Err("Already connected".into());
         }
 
         if baud == 0 {
@@ -248,17 +272,26 @@ impl ConnectionManager {
         }
 
         // Sub-methods handle state transitions (Connecting, Probing, Connected, etc.)
-        if baud > 0 && framing == "Auto" {
+        let result = if baud > 0 && framing == "Auto" {
             self.connect_with_smart_framing(port, baud).await
         } else if baud == 0 {
             self.connect_with_auto_detect(port, framing).await
         } else {
-            self.connect_impl(port, baud, framing, None).await
-        }
+            // Direct connect path - set Connecting state first
+            self.transition_to(ConnectionState::Connecting);
+            match self.connect_impl(port, baud, framing, None).await {
+                Ok(()) => Ok(()),
+                Err(e) => {
+                    self.transition_to(ConnectionState::Disconnected);
+                    Err(e)
+                }
+            }
+        };
 
         // Lock automatically released on Drop
         // Note: State is already set to Connected by sub-methods on success,
         // or reverted to Disconnected on error
+        result
     }
 
     async fn connect_with_smart_framing(
@@ -275,8 +308,16 @@ impl ConnectionManager {
             self.set_decoder(p);
         }
 
-        self.connect_impl(port, baud, &detect_framing, Some(initial_buf))
+        match self
+            .connect_impl(port, baud, &detect_framing, Some(initial_buf))
             .await
+        {
+            Ok(()) => Ok(()),
+            Err(e) => {
+                self.transition_to(ConnectionState::Disconnected);
+                Err(e)
+            }
+        }
     }
 
     async fn connect_with_auto_detect(
@@ -296,23 +337,60 @@ impl ConnectionManager {
         .await;
 
         // Handle interruption
-        let (final_port, final_baud, final_framing, initial_buffer, detected_proto) = self
+        let recovery_result = self
             .handle_probing_with_interrupt_recovery(port, baud, framing_str, buffer, proto)
-            .await?;
+            .await;
 
-        if let Some(p) = detected_proto {
-            self.set_decoder(p);
+        match recovery_result {
+            Ok((final_port, final_baud, final_framing, initial_buffer, detected_proto)) => {
+                if let Some(p) = detected_proto {
+                    self.set_decoder(p);
+                }
+
+                // Check user intent FIRST (before any state transitions)
+                if self.user_initiated_disconnect.get() {
+                    #[cfg(debug_assertions)]
+                    {
+                        web_sys::console::log_1(
+                            &"Connection aborted - user initiated disconnect".into(),
+                        );
+                    }
+                    self.transition_to(ConnectionState::Disconnected);
+                    return Err("User cancelled".into());
+                }
+
+                let current_state = self.atomic_state.get();
+                if current_state == ConnectionState::Probing
+                    || current_state == ConnectionState::Disconnected
+                {
+                    // Double-check user intent (TOCTOU protection)
+                    if self.user_initiated_disconnect.get() {
+                        self.transition_to(ConnectionState::Disconnected);
+                        return Err("User cancelled".into());
+                    }
+
+                    self.transition_to(ConnectionState::Connecting);
+                    match self
+                        .connect_impl(final_port, final_baud, &final_framing, initial_buffer)
+                        .await
+                    {
+                        Ok(()) => Ok(()),
+                        Err(e) => {
+                            self.transition_to(ConnectionState::Disconnected);
+                            Err(e)
+                        }
+                    }
+                } else {
+                    self.transition_to(ConnectionState::Disconnected);
+                    Err("Connection aborted".into())
+                }
+            }
+            Err(e) => {
+                // Transition to Disconnected when user cancels or error occurs
+                self.transition_to(ConnectionState::Disconnected);
+                Err(e)
+            }
         }
-
-        let current_state = self.state.get_untracked();
-        if current_state == ConnectionState::Probing
-            || current_state == ConnectionState::Disconnected
-        {
-            self.transition_to(ConnectionState::Connecting);
-        }
-
-        self.connect_impl(final_port, final_baud, &final_framing, initial_buffer)
-            .await
     }
 
     async fn handle_probing_with_interrupt_recovery(
@@ -334,6 +412,16 @@ impl ConnectionManager {
     > {
         let was_interrupted = self.probing_interrupted.get();
         if was_interrupted {
+            // Check if this was user-initiated disconnect vs device unplug
+            if self.user_initiated_disconnect.get() {
+                #[cfg(debug_assertions)]
+                web_sys::console::log_1(
+                    &"DEBUG: Probing interrupted by user disconnect - aborting connection".into(),
+                );
+                self.probing_interrupted.set(false);
+                return Err("User cancelled".into());
+            }
+
             web_sys::console::warn_1(
                 &"Probing was interrupted by ondisconnect event - port reference is stale".into(),
             );
@@ -342,7 +430,7 @@ impl ConnectionManager {
             match self.poll_for_device_reenumeration().await {
                 Ok(fresh_port) => Ok((fresh_port, baud, framing, Some(buffer), proto)),
                 Err(e) => {
-                    self.set_status.set(format!("Connection Failed: {}", e));
+                    // Status will be set by transition_to(Disconnected) in caller
                     Err(e)
                 }
             }
@@ -358,11 +446,22 @@ impl ConnectionManager {
             .await;
 
             if self.probing_interrupted.get() {
+                // Check if this was user-initiated disconnect vs device unplug
+                if self.user_initiated_disconnect.get() {
+                    #[cfg(debug_assertions)]
+                    web_sys::console::log_1(
+                        &"DEBUG: Probing interrupted by user disconnect - aborting connection"
+                            .into(),
+                    );
+                    self.probing_interrupted.set(false);
+                    return Err("User cancelled".into());
+                }
+
                 self.probing_interrupted.set(false);
                 match self.poll_for_device_reenumeration().await {
                     Ok(fresh_port) => Ok((fresh_port, baud, framing, Some(buffer), proto)),
                     Err(e) => {
-                        self.set_status.set(format!("Connection Failed: {}", e));
+                        // Status will be set by transition_to(Disconnected) in caller
                         Err(e)
                     }
                 }
@@ -374,7 +473,7 @@ impl ConnectionManager {
 
     async fn poll_for_device_reenumeration(&self) -> Result<web_sys::SerialPort, String> {
         let Some(window) = web_sys::window() else {
-            return Err("Window not available".to_string());
+            return Err("Window not available".into());
         };
         let nav = window.navigator();
         let serial = nav.serial();
@@ -391,7 +490,7 @@ impl ConnectionManager {
                         break;
                     }
                 }
-                Err(_) => return Err("Cannot access ports".to_string()),
+                Err(_) => return Err("Cannot access ports".into()),
             }
 
             let wait_ms = if attempt <= 5 {
@@ -423,7 +522,7 @@ impl ConnectionManager {
             .await;
             Ok(port)
         } else {
-            Err("Device not found after disconnect".to_string())
+            Err("Device not found after disconnect".into())
         }
     }
 
@@ -452,15 +551,15 @@ impl ConnectionManager {
                 })
                 .is_err()
             {
-                return Err("Connection closed".to_string());
+                return Err("Connection closed".into());
             }
 
             match rx.await {
                 Ok(result) => result,
-                Err(_) => Err("Write timeout".to_string()),
+                Err(_) => Err("Write timeout".into()),
             }
         } else {
-            Err("Not connected".to_string())
+            Err("Not connected".into())
         }
     }
 

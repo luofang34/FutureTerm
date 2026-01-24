@@ -279,6 +279,7 @@ pub fn App() -> impl IntoView {
         // Use state machine to determine button behavior
         let current_state = manager_disc.state.get();
 
+        #[cfg(debug_assertions)]
         web_sys::console::log_1(
             &format!(
                 "DEBUG: Button clicked - state={:?}, force_picker={}, can_disconnect={}",
@@ -292,6 +293,7 @@ pub fn App() -> impl IntoView {
         // Allow disconnect if state allows it (Connected, AutoReconnecting, or DeviceLost)
         if current_state.can_disconnect() && !force_picker {
             // Disconnect Logic - cancels auto-reconnect OR disconnects active connection
+            #[cfg(debug_assertions)]
             web_sys::console::log_1(&"DEBUG: Executing disconnect logic".into());
             let manager_d = manager_disc.clone();
             spawn_local(async move {
@@ -300,6 +302,7 @@ pub fn App() -> impl IntoView {
             return;
         }
 
+        #[cfg(debug_assertions)]
         web_sys::console::log_1(
             &format!(
                 "DEBUG: Executing connect logic (can_disconnect={}, force_picker={})",
@@ -473,6 +476,7 @@ pub fn App() -> impl IntoView {
                 // loops if both set to Auto) Allow Auto (0 / Auto) to trigger
                 // reconfiguration too
 
+                #[cfg(debug_assertions)]
                 web_sys::console::log_1(&"Dynamically Reconfiguring Port...".into());
 
                 // Manager Reconfigure (Handles Close -> Open -> Loop)

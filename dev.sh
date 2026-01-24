@@ -107,12 +107,12 @@ run_quality_checks() {
 }
 
 # ============================================================
-# TESTS
+# UNIT TESTS (Native)
 # ============================================================
-run_tests() {
+run_unit_tests() {
     echo ""
     echo -e "${BLUE}================================================${NC}"
-    echo -e "${BLUE}🧪 Running Tests${NC}"
+    echo -e "${BLUE}🧪 Running Unit Tests (Native)${NC}"
     echo -e "${BLUE}================================================${NC}"
     echo ""
 
@@ -128,7 +128,56 @@ run_tests() {
     cargo test --package app-web --lib
 
     echo ""
-    echo -e "${GREEN}✅ All tests passed${NC}"
+    echo -e "${GREEN}✅ Unit tests passed${NC}"
+}
+
+# ============================================================
+# WASM TESTS (Browser)
+# ============================================================
+run_wasm_tests() {
+    echo ""
+    echo -e "${BLUE}================================================${NC}"
+    echo -e "${BLUE}🧪 Running WASM Tests (Browser)${NC}"
+    echo -e "${BLUE}================================================${NC}"
+    echo ""
+
+    # Check if wasm-pack is installed
+    if ! command -v wasm-pack &> /dev/null; then
+        echo -e "${YELLOW}wasm-pack not found. Installing...${NC}"
+        curl https://rustwasm.github.io/wasm-pack/installer/init.sh -sSf | sh
+    fi
+
+    cd apps/web
+    echo -e "${YELLOW}▶ Running tests in headless Chrome${NC}"
+    wasm-pack test --headless --chrome
+
+    # Firefox tests disabled due to geckodriver stability issues on some systems
+    # Uncomment to enable Firefox tests:
+    # echo -e "${YELLOW}▶ Running tests in headless Firefox${NC}"
+    # wasm-pack test --headless --firefox
+    cd ../..
+
+    echo ""
+    echo -e "${GREEN}✅ WASM tests passed${NC}"
+}
+
+# ============================================================
+# COMPREHENSIVE TEST SUITE
+# ============================================================
+run_all_tests() {
+    echo ""
+    echo -e "${BLUE}================================================${NC}"
+    echo -e "${BLUE}🎯 Running Comprehensive Test Suite${NC}"
+    echo -e "${BLUE}================================================${NC}"
+
+    run_quality_checks
+    run_unit_tests
+    run_wasm_tests
+
+    echo ""
+    echo -e "${BLUE}================================================${NC}"
+    echo -e "${GREEN}✅ ALL TESTS PASSED${NC}"
+    echo -e "${BLUE}================================================${NC}"
 }
 
 # ============================================================
@@ -188,12 +237,14 @@ show_usage() {
     echo "Usage: ./dev.sh [command]"
     echo ""
     echo "Commands:"
-    echo "  check      Run quality checks only (fmt, clippy, cargo check)"
-    echo "  test       Run quality checks + tests"
-    echo "  build      Run quality checks + tests + release build"
-    echo "  serve      Run quality checks + start dev server (default)"
+    echo "  test       🎯 Full test suite (check + unit tests + WASM tests) - RECOMMENDED"
+    echo "  serve      🚀 Run checks + start dev server (default)"
+    echo "  build      🏗️  Full test suite + release build"
     echo ""
-    echo "If no command is specified, 'serve' is assumed."
+    echo "  check      🔍 Quality checks only (fmt, clippy, cargo check)"
+    echo "  wasm-test  🌐 WASM browser tests only"
+    echo ""
+    echo "If no command is specified, 'serve' is assumed for local development."
 }
 
 COMMAND="${1:-serve}"
@@ -203,15 +254,20 @@ case "$COMMAND" in
         run_quality_checks
         ;;
     test)
-        run_quality_checks
-        run_tests
+        # Comprehensive test suite: quality checks + unit tests + WASM tests
+        run_all_tests
+        ;;
+    wasm-test)
+        # WASM tests only (for quick iteration on browser-specific tests)
+        run_wasm_tests
         ;;
     build)
-        run_quality_checks
-        run_tests
+        # Full validation before release
+        run_all_tests
         build_release
         ;;
     serve)
+        # Local development: check quality then start dev server
         run_quality_checks
         run_dev_server
         ;;
