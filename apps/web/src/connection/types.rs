@@ -1392,4 +1392,152 @@ mod tests {
             "Lock must be preserved (for OperationLockGuard to unlock)"
         );
     }
+
+    // ============ Property-Based Tests ============
+    //
+    // These tests use proptest to verify FSM invariants under arbitrary inputs.
+    // They catch edge cases that manual tests might miss.
+
+    mod property_tests {
+        use super::*;
+        use proptest::prelude::*;
+
+        // Strategy: Generate arbitrary connection states
+        fn arb_state() -> impl Strategy<Value = ConnectionState> {
+            prop_oneof![
+                Just(ConnectionState::Disconnected),
+                Just(ConnectionState::Probing),
+                Just(ConnectionState::Connecting),
+                Just(ConnectionState::Connected),
+                Just(ConnectionState::Reconfiguring),
+                Just(ConnectionState::Disconnecting),
+                Just(ConnectionState::DeviceLost),
+                Just(ConnectionState::AutoReconnecting),
+            ]
+        }
+
+        proptest! {
+            /// Property: State encoding/decoding is lossless
+            /// For all states, from_u8(to_u8(state)) == state
+            #[test]
+            fn prop_state_encoding_roundtrip(state in arb_state()) {
+                let encoded = state.to_u8();
+                let decoded = ConnectionState::from_u8(encoded).unwrap();
+                prop_assert_eq!(decoded, state, "State encoding roundtrip failed");
+            }
+
+            /// Property: Lock bit never corrupts state value
+            /// Locking and unlocking should not change the state itself
+            #[test]
+            fn prop_lock_preserves_state(state in arb_state()) {
+                let atomic = AtomicConnectionState::new(state);
+
+                // Lock the state
+                atomic.try_lock().unwrap();
+                prop_assert_eq!(atomic.get(), state, "Lock corrupted state");
+                prop_assert!(atomic.is_locked(), "Lock bit not set");
+
+                // Unlock without changing state
+                atomic.unlock();
+                prop_assert_eq!(atomic.get(), state, "Unlock changed state");
+                prop_assert!(!atomic.is_locked(), "Lock bit not cleared");
+            }
+
+            /// Property: Idempotent transitions maintain state
+            /// States that can transition to themselves should remain unchanged
+            #[test]
+            fn prop_idempotent_transitions_maintain_state(state in arb_state()) {
+                if state.can_transition_to(state) {
+                    let atomic = AtomicConnectionState::new(state);
+                    let result = atomic.try_transition(state, state);
+                    prop_assert!(result.is_ok(), "Idempotent transition failed");
+                    prop_assert_eq!(atomic.get(), state, "Idempotent transition changed state");
+                }
+            }
+
+            /// Property: set_preserving_lock maintains lock bit
+            /// When locked, set_preserving_lock should keep lock active
+            #[test]
+            fn prop_set_preserving_lock_maintains_lock(
+                initial in arb_state(),
+                new_state in arb_state()
+            ) {
+                let atomic = AtomicConnectionState::new(initial);
+
+                // Lock the state
+                atomic.try_lock().unwrap();
+                prop_assert!(atomic.is_locked(), "Initial lock failed");
+
+                // Change state while preserving lock
+                atomic.set_preserving_lock(new_state);
+
+                prop_assert_eq!(atomic.get(), new_state, "State not updated");
+                prop_assert!(atomic.is_locked(), "Lock bit lost during set_preserving_lock");
+            }
+
+            /// Property: Invalid transitions always fail
+            /// Transitions not in the valid set should be rejected
+            #[test]
+            fn prop_invalid_transitions_rejected(
+                from in arb_state(),
+                to in arb_state()
+            ) {
+                if !from.can_transition_to(to) {
+                    let atomic = AtomicConnectionState::new(from);
+                    let result = atomic.try_transition(from, to);
+                    prop_assert!(result.is_err(),
+                        "Invalid transition {:?} -> {:?} was accepted", from, to);
+                    prop_assert_eq!(atomic.get(), from,
+                        "State changed despite invalid transition");
+                }
+            }
+
+            /// Property: State encoding uses only lower 7 bits
+            /// to_u8 should never use bit 7 (reserved for lock flag)
+            #[test]
+            fn prop_state_encoding_respects_lock_bit(state in arb_state()) {
+                let encoded = state.to_u8();
+                prop_assert_eq!(encoded & 0x80, 0,
+                    "State encoding uses lock bit (bit 7)");
+                prop_assert!(encoded <= 7,
+                    "State encoding exceeds 3-bit range (0-7)");
+            }
+
+            /// Property: Concurrent lock attempts fail
+            /// Only one lock can be acquired at a time
+            #[test]
+            fn prop_concurrent_locks_rejected(state in arb_state()) {
+                let atomic = AtomicConnectionState::new(state);
+
+                // First lock succeeds
+                let first = atomic.try_lock();
+                prop_assert!(first.is_ok(), "First lock should succeed");
+
+                // Second lock fails (already locked)
+                let second = atomic.try_lock();
+                prop_assert!(second.is_err(), "Second lock should fail");
+                prop_assert_eq!(second.unwrap_err(), state,
+                    "Lock failure should return current state");
+            }
+
+            /// Property: unlock_and_set clears lock and updates state
+            #[test]
+            fn prop_unlock_and_set_clears_lock(
+                initial in arb_state(),
+                new_state in arb_state()
+            ) {
+                let atomic = AtomicConnectionState::new(initial);
+
+                // Lock first
+                atomic.try_lock().unwrap();
+                prop_assert!(atomic.is_locked(), "Lock failed");
+
+                // Unlock and set new state
+                atomic.unlock_and_set(new_state);
+
+                prop_assert_eq!(atomic.get(), new_state, "State not updated");
+                prop_assert!(!atomic.is_locked(), "Lock not cleared");
+            }
+        }
+    }
 }
