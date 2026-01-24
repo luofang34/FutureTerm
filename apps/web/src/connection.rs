@@ -377,7 +377,7 @@ impl ConnectionManager {
             match self.poll_for_device_reenumeration().await {
                 Ok(fresh_port) => Ok((fresh_port, baud, framing, Some(buffer), proto)),
                 Err(e) => {
-                    self.set_status.set(format!("Connection Failed: {}", e));
+                    // Status will be set by transition_to(Disconnected) in caller
                     Err(e)
                 }
             }
@@ -407,7 +407,7 @@ impl ConnectionManager {
                 match self.poll_for_device_reenumeration().await {
                     Ok(fresh_port) => Ok((fresh_port, baud, framing, Some(buffer), proto)),
                     Err(e) => {
-                        self.set_status.set(format!("Connection Failed: {}", e));
+                        // Status will be set by transition_to(Disconnected) in caller
                         Err(e)
                     }
                 }

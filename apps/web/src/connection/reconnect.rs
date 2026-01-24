@@ -239,9 +239,8 @@ impl ConnectionManager {
 
         if let Err(e) = manager.connect(port, target_baud, &framing).await {
             web_sys::console::log_1(&format!("Auto-reconnect failed: {}", e).into());
-        } else {
-            manager.set_status.set("Restored Connection".into());
         }
+        // Status already set to "Connected" by finalize_connection() in connect()
     }
     fn calculate_reconnect_target(
         user_pref_baud: u32,

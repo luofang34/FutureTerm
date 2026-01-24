@@ -141,7 +141,7 @@ impl ConnectionManager {
                         .await;
                         continue;
                     }
-                    self.set_status.set(format!("Connection Failed: {:?}", e));
+                    // Status will be set by transition_to(Disconnected) in caller
                     break Err(format!("{:?}", e));
                 }
             }
@@ -360,13 +360,13 @@ impl ConnectionManager {
                 .await
             {
                 Ok(_) => {
-                    self.set_status.set("Reconfigured".into());
+                    // Status already set to "Connected" by finalize_connection() in connect_impl
                 }
                 Err(e) => {
                     web_sys::console::error_1(&format!("Reconfigure failed: {}", e).into());
                     self.restore_ui_state(snapshot).await;
                     self.transition_to(ConnectionState::Disconnected);
-                    self.set_status.set(format!("Reconfigure failed: {}", e));
+                    // Status already set to "Ready to connect" by transition_to()
                 }
             }
         } else {

@@ -308,9 +308,11 @@ impl ConnectionManager {
     /// Securely finalize a connection state transition (update both signal and atomic)
     /// This helper prevents desynchronization bugs where signal is updated but atomic isn't.
     /// It preserves the atomic lock bit if present.
+    /// CRITICAL: Also updates status text to match FSM state (single source of truth)
     pub fn finalize_connection(&self, state: ConnectionState) {
         self.atomic_state.set_preserving_lock(state);
         self.set_state.set(state);
+        self.set_status.set(state.status_text().into());
     }
 }
 

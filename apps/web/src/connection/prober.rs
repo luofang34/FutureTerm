@@ -165,10 +165,7 @@ pub async fn detect_config(
         }
     }
 
-    set_status.set(format!(
-        "Detected: {} {} (Score: {:.2})",
-        best_rate, best_framing, best_score
-    ));
+    // Status will be updated by FSM state transition in caller
 
     (best_rate, best_framing, best_buffer, best_proto)
 }
