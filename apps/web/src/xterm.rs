@@ -441,11 +441,14 @@ pub fn TerminalView(
                             );
 
                             // Create selection range
+                            // Note: Terminal selections use byte offsets only.
+                            // Timestamp fields (start/end) are set to 0 as terminal
+                            // displays current buffer state without historical timing.
                             let range = SelectionRange::new(
                                 byte_start,
                                 byte_end,
-                                0, // TODO: lookup timestamp from spans
-                                0,
+                                0, // timestamp_start_us
+                                0, // timestamp_end_us
                                 SelectionSource::Terminal,
                             );
                             set_global_sel.set(Some(range));

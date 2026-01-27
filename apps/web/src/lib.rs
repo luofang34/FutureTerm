@@ -7,8 +7,11 @@ use wasm_bindgen_futures::spawn_local;
 use web_sys::{MessageEvent, Worker};
 // Imports Cleaned
 
-mod connection;
-use connection::{ConnectionManager, ConnectionState};
+// Actor system (replaces ConnectionManager)
+mod actor_bridge;
+mod actor_system;
+use actor_bridge::ActorBridge;
+use actor_protocol::ConnectionState;
 
 mod hex_view;
 // mod mavlink_view; // Removed duplicate
@@ -18,6 +21,8 @@ pub mod worker_logic;
 mod xterm;
 
 pub mod mavlink_view;
+mod ui;
+use ui::{Sidebar, ViewMode};
 
 // Data retention limits for the unified raw log
 /// Maximum raw log size in bytes (10 MB)
@@ -29,23 +34,18 @@ const MAX_LOG_EVENTS: usize = 10000;
 /// Maximum number of decoded events to retain
 const MAX_DECODED_EVENTS: usize = 2500;
 
-#[derive(Clone, Copy, PartialEq)]
-enum ViewMode {
-    Terminal,
-    Hex,
-}
-
 #[component]
 pub fn App() -> impl IntoView {
     let (_terminal_ready, set_terminal_ready) = create_signal(false);
     let (is_webserial_supported, set_is_webserial_supported) = create_signal(true);
 
-    // Worker Signal (Used by ConnectionManager)
+    // Worker Signal (Used by ActorBridge)
     let (worker, set_worker) = create_signal::<Option<Worker>>(None);
     let (view_mode, set_view_mode) = create_signal(ViewMode::Terminal);
 
-    // Connection Manager encapsulates Status, Connected, Transport, Port
-    let manager = ConnectionManager::new(worker.into());
+    // Actor System (replaces ConnectionManager)
+    let manager_internal = actor_system::create_actor_system();
+    let manager = ActorBridge::new(manager_internal, worker.into());
     let status = manager.get_status();
 
     // Derive connected signal from state machine
@@ -318,17 +318,37 @@ pub fn App() -> impl IntoView {
 
         let current_baud = baud_rate.get_untracked();
 
-        // Store connection info for checking against future events
-        // Load connection info from local storage if available
+        // Load device from localStorage (same key as ReconnectActor)
         let storage = web_sys::window().and_then(|w| w.local_storage().ok().flatten());
-        let init_vid = storage
+        let device = storage
             .as_ref()
-            .and_then(|s| s.get_item("last_vid").ok().flatten())
-            .and_then(|s| s.parse::<u16>().ok());
-        let init_pid = storage
-            .as_ref()
-            .and_then(|s| s.get_item("last_pid").ok().flatten())
-            .and_then(|s| s.parse::<u16>().ok());
+            .and_then(|s| s.get_item("futureterm_last_device").ok().flatten())
+            .and_then(|value| {
+                // Parse "0403:6001" format (hex)
+                let parts: Vec<&str> = value.split(':').collect();
+                if parts.len() == 2 {
+                    let vid = parts.first().and_then(|s| u16::from_str_radix(s, 16).ok());
+                    let pid = parts.get(1).and_then(|s| u16::from_str_radix(s, 16).ok());
+                    if let (Some(v), Some(p)) = (vid, pid) {
+                        return Some((v, p));
+                    }
+                }
+                None
+            });
+
+        let (init_vid, init_pid) = match device {
+            Some((vid, pid)) => (Some(vid), Some(pid)),
+            None => (None, None),
+        };
+
+        #[cfg(debug_assertions)]
+        web_sys::console::log_1(
+            &format!(
+                "DEBUG: Loaded from localStorage: VID={:04X?}, PID={:04X?}",
+                init_vid, init_pid
+            )
+            .into(),
+        );
 
         let (last_vid, set_last_vid) = create_signal::<Option<u16>>(init_vid);
         let (last_pid, set_last_pid) = create_signal::<Option<u16>>(init_pid);
@@ -373,16 +393,10 @@ pub fn App() -> impl IntoView {
                 }
 
                 // Capture VID/PID for Reconnect
+                // Note: SerialPortInfo has usb_vendor_id() and usb_product_id() methods,
+                // but they may not be present for all port types (e.g., virtual COM ports).
+                // We use Reflect to safely handle missing properties.
                 let info = port.get_info();
-                // web-sys SerialPortInfo doesn't expose fields directly without structural casting
-                // usually? Let's rely on Reflect for safety or try methods if
-                // available. Actually web-sys 0.3.69+ exposes `usb_vendor_id` and
-                // `usb_product_id`. Let's use Reflect to be safe against version
-                // mismatch or use provided methods. Checking docs: SerialPortInfo
-                // has `usb_vendor_id` and `usb_product_id` getters.
-
-                // NOTE: We need to enable `SerialPortInfo` in Cargo.toml (Already Done).
-                // However, let's use a small helper to extract it safely.
                 let vid = js_sys::Reflect::get(&info, &"usbVendorId".into())
                     .ok()
                     .and_then(|v| v.as_f64())
@@ -397,8 +411,50 @@ pub fn App() -> impl IntoView {
 
                 let current_framing = framing.get_untracked();
 
-                let final_baud = current_baud;
-                // Removed unused final_framing_str variable
+                // Determine if we should auto-detect baud rate
+                let stored_vid = last_vid.get_untracked();
+                let stored_pid = last_pid.get_untracked();
+                let device_changed = stored_vid != vid || stored_pid != pid;
+                let fresh_session = stored_vid.is_none() || stored_pid.is_none();
+
+                // Auto-detect baud when:
+                // 1. Fresh session (no stored device)
+                // 2. Device swapped (different VID/PID)
+                // 3. User explicitly set baud=0 in UI
+                let final_baud = if fresh_session || device_changed {
+                    #[cfg(debug_assertions)]
+                    if fresh_session {
+                        web_sys::console::log_1(
+                            &"DEBUG: Fresh session detected, will auto-detect baud rate".into(),
+                        );
+                    } else {
+                        web_sys::console::log_1(
+                            &format!(
+                                "DEBUG: Device changed (stored {:04X?}:{:04X?}, selected {:04X?}:{:04X?}), will auto-detect baud",
+                                stored_vid, stored_pid, vid, pid
+                            )
+                            .into(),
+                        );
+                    }
+                    0 // Auto-detect
+                } else {
+                    current_baud // Use stored/UI baud
+                };
+
+                // Cache VID/PID for auto-reconnect (ALWAYS, regardless of auto-detect)
+                set_last_vid.set(vid);
+                set_last_pid.set(pid);
+
+                // Save to LocalStorage (same key as ReconnectActor)
+                // CRITICAL FIX: Save VID/PID for ALL connections, not just auto-detect
+                if let (Some(v), Some(p)) = (vid, pid) {
+                    if let Some(window) = web_sys::window() {
+                        if let Ok(Some(storage)) = window.local_storage() {
+                            let value = format!("{:04X}:{:04X}", v, p);
+                            let _ = storage.set_item("futureterm_last_device", &value);
+                        }
+                    }
+                }
 
                 // Resolve Auto to something concrete if needed, but Manager handles it now.
                 // if current_baud == 0 { final_baud = 115200; } // REMOVED (Regression Fix)
@@ -411,40 +467,33 @@ pub fn App() -> impl IntoView {
 
                     let manager_conn = manager.clone();
                     spawn_local(async move {
-                        // Manager handles detection if baud == 0
-                        match manager_conn
-                            .connect(port, current_baud, &current_framing)
-                            .await
-                        {
-                            Ok(_) => {
-                                // CRITICAL FIX: Cache VID/PID ONLY after connection succeeds
-                                // This prevents caching wrong device if probing fails
-                                set_last_vid.set(vid);
-                                set_last_pid.set(pid);
-
-                                // Save to LocalStorage
-                                if let (Some(v), Some(p)) = (vid, pid) {
-                                    if let Some(window) = web_sys::window() {
-                                        if let Ok(Some(storage)) = window.local_storage() {
-                                            let _ = storage.set_item("last_vid", &v.to_string());
-                                            let _ = storage.set_item("last_pid", &p.to_string());
-                                        }
-                                    }
-                                }
-                            }
-                            Err(_) => {
-                                // CRITICAL FIX: Clear cached VID/PID on connection failure
-                                // This prevents retry logic from searching for the wrong device
-                                set_last_vid.set(None);
-                                set_last_pid.set(None);
-
-                                // Status updated by manager
-                            }
-                        }
+                        // ActorBridge handles detection if baud == 0
+                        manager_conn
+                            .connect(port, final_baud, &current_framing)
+                            .await;
                     });
 
                     // --- Auto-Reconnect Listeners ---
                     // Delegated to ConnectionManager
+                    manager.setup_auto_reconnect(
+                        last_vid.into(),
+                        last_pid.into(),
+                        set_last_vid,
+                        set_last_pid,
+                        baud_rate.into(),
+                        detected_baud,
+                        framing.into(),
+                    );
+                } else {
+                    // Manual baud rate connection
+                    let manager_conn = manager.clone();
+                    spawn_local(async move {
+                        manager_conn
+                            .connect(port, final_baud, &current_framing)
+                            .await;
+                    });
+
+                    // --- Auto-Reconnect Listeners ---
                     manager.setup_auto_reconnect(
                         last_vid.into(),
                         last_pid.into(),
@@ -481,7 +530,7 @@ pub fn App() -> impl IntoView {
 
                 // Manager Reconfigure (Handles Close -> Open -> Loop)
                 // Pass `b` and `f` directly. If b=0, Manager detects. If f=Auto, Manager probes.
-                manager_r.reconfigure(b, &f).await;
+                manager_r.reconfigure(b, f);
             });
         }
     });
@@ -489,8 +538,8 @@ pub fn App() -> impl IntoView {
     // Auto-Switch View to MAVLink Dashboard
     create_effect(move |_| {
         let dec = manager.decoder_id.get();
-        if dec == "mavlink" && view_mode.get_untracked() != ViewMode::Hex {
-            set_view_mode.set(ViewMode::Hex);
+        if dec == "mavlink" && view_mode.get_untracked() != ViewMode::Mavlink {
+            set_view_mode.set(ViewMode::Mavlink);
             // History now persists across decoder switches
         }
     });
@@ -602,8 +651,12 @@ pub fn App() -> impl IntoView {
                     on:change={
                         let manager_framer = manager.clone();
                         move |ev| {
+                            use core_types::FramerId;
+                            use std::str::FromStr;
                             let val = event_target_value(&ev);
-                            manager_framer.set_framer(val);
+                            if let Ok(framer) = FramerId::from_str(&val) {
+                                manager_framer.set_framer_typed(framer);
+                            }
                         }
                     }
                 >
@@ -713,80 +766,23 @@ pub fn App() -> impl IntoView {
 
                     // Hex View Container
                     <Show when=move || view_mode.get() == ViewMode::Hex fallback=|| ()>
-                        {move || {
-                            if manager.decoder_id.get() == "mavlink" {
-                                view! { <mavlink_view::MavlinkView events_list=events_list connected=connected /> }
-                            } else {
-                                view! { <hex_view::HexView
-                                    raw_log=raw_log
-                                    cursor=hex_cursor
-                                    set_cursor=set_hex_cursor
-                                    global_selection=global_selection
-                                    set_global_selection=set_global_selection
-                                /> }
-                            }
-                        }}
+                        <hex_view::HexView
+                            raw_log=raw_log
+                            cursor=hex_cursor
+                            set_cursor=set_hex_cursor
+                            global_selection=global_selection
+                            set_global_selection=set_global_selection
+                        />
+                    </Show>
+
+                    // MAVLink View Container
+                    <Show when=move || view_mode.get() == ViewMode::Mavlink fallback=|| ()>
+                        <mavlink_view::MavlinkView events_list=events_list connected=connected />
                     </Show>
                 </div>
 
                  // Sidebar (Moved to Right)
-                 <div style="width: 50px; background: rgb(25, 25, 25); display: flex; flex-direction: column; align-items: center; padding-top: 10px; border-left: 1px solid rgb(45, 45, 45);">
-                    // Terminal Button
-                    <button
-                        title="Terminal View (UTF-8)"
-                        style=move || format!(
-                            "width: 40px; height: 40px; background: {}; color: white; border: none; cursor: pointer; border-radius: 4px; margin-bottom: 8px; display: flex; align-items: center; justify-content: center;",
-                            if view_mode.get() == ViewMode::Terminal { "rgb(45, 45, 45)" } else { "transparent" }
-                        )
-                        on:click={
-                            let m = manager.clone();
-                            move |_| {
-                                set_view_mode.set(ViewMode::Terminal);
-                                m.set_decoder("utf8".to_string());
-                            }
-                        }
-                    >
-                        {xterm::icon()}
-                    </button>
-
-                    // Hex Inspector Button
-                    <button
-                        title="Hex Inspector (Hex List)"
-                        style=move || format!(
-                            "width: 40px; height: 40px; background: {}; color: white; border: none; cursor: pointer; border-radius: 4px; margin-bottom: 8px; display: flex; align-items: center; justify-content: center;",
-                            if view_mode.get() == ViewMode::Hex && manager.decoder_id.get() != "mavlink" { "rgb(45, 45, 45)" } else { "transparent" }
-                        )
-                        on:click={
-                            let m = manager.clone();
-                            move |_| {
-                                set_view_mode.set(ViewMode::Hex);
-                                m.set_decoder("hex".to_string());
-                            }
-                        }
-                    >
-                         {hex_view::icon()}
-                    </button>
-
-                    // MAVLink Button
-                    <button
-                        title="MAVLink Decoder"
-                        style=move || format!(
-                            "width: 40px; height: 40px; background: {}; color: white; border: none; cursor: pointer; border-radius: 4px; margin-bottom: 8px; display: flex; align-items: center; justify-content: center; font-family: monospace; font-weight: bold; font-size: 0.8rem;",
-                            if manager.decoder_id.get() == "mavlink" { "rgb(45, 45, 45)" } else { "transparent" }
-                        )
-                        on:click={
-                            let m = manager.clone();
-                            move |_| {
-                                set_view_mode.set(ViewMode::Hex);
-                                m.set_decoder("mavlink".to_string());
-                            }
-                        }
-                    >
-                        MAV
-                    </button>
-
-
-                 </div>
+                 <Sidebar view_mode=view_mode.into() set_view_mode=set_view_mode manager=manager.clone() />
             </div>
         </div>
     }

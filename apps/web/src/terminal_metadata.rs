@@ -416,23 +416,35 @@ impl TerminalMetadata {
             return None;
         }
 
-        // Find span that CONTAINS (start_row, start_col)
-        // Multiple spans can be on the same line, so check column ranges too
-        let start_span = self.spans.iter().find(|s| {
-            let span_line_count = s.text.lines().count().max(1);
-            let span_end_line = s.terminal_line + span_line_count;
+        // Helper to find span for a position with fallback
+        // If exact column match fails (e.g. selection past end of line), returns the last span on that row.
+        let find_span_clamped = |row: usize, col: usize| -> Option<&TerminalSpan> {
+            // 1. Try exact match
+            if let Some(s) = self.spans.iter().find(|s| {
+                let span_line_count = s.text.lines().count().max(1);
+                let span_end_line = s.terminal_line + span_line_count;
+                if !(s.terminal_line <= row && row < span_end_line) {
+                    return false;
+                }
 
-            // Check if span contains the row
-            if !(s.terminal_line <= start_row && start_row < span_end_line) {
-                return false;
+                let line_in_span = row.saturating_sub(s.terminal_line);
+                s.char_to_byte_map
+                    .iter()
+                    .any(|m| m.line_in_span == line_in_span && m.terminal_column == col)
+            }) {
+                return Some(s);
             }
 
-            // Check if span contains the column (on line 0 of the span)
-            let line_in_span = start_row.saturating_sub(s.terminal_line);
-            s.char_to_byte_map
-                .iter()
-                .any(|m| m.line_in_span == line_in_span && m.terminal_column == start_col)
-        })?;
+            // 2. Fallback: Find last span on this row (handles overshoot)
+            self.spans.iter().rfind(|s| {
+                let span_line_count = s.text.lines().count().max(1);
+                let span_end_line = s.terminal_line + span_line_count;
+                s.terminal_line <= row && row < span_end_line
+            })
+        };
+
+        // Find start span
+        let start_span = find_span_clamped(start_row, start_col)?;
 
         #[cfg(all(debug_assertions, target_arch = "wasm32"))]
         web_sys::console::log_1(
@@ -463,22 +475,8 @@ impl TerminalMetadata {
             .into(),
         );
 
-        // Find span that CONTAINS (end_row, actual_end_col)
-        let end_span = self.spans.iter().find(|s| {
-            let span_line_count = s.text.lines().count().max(1);
-            let span_end_line = s.terminal_line + span_line_count;
-
-            // Check if span contains the row
-            if !(s.terminal_line <= end_row && end_row < span_end_line) {
-                return false;
-            }
-
-            // Check if span contains the ADJUSTED column
-            let line_in_span = end_row.saturating_sub(s.terminal_line);
-            s.char_to_byte_map
-                .iter()
-                .any(|m| m.line_in_span == line_in_span && m.terminal_column == actual_end_col)
-        })?;
+        // Find end span
+        let end_span = find_span_clamped(end_row, actual_end_col)?;
 
         #[cfg(all(debug_assertions, target_arch = "wasm32"))]
         web_sys::console::log_1(
@@ -513,9 +511,7 @@ impl TerminalMetadata {
             .iter()
             .find(|m| m.line_in_span == start_line_in_span && m.terminal_column == start_col)
             .or_else(|| {
-                #[cfg(target_arch = "wasm32")]
-                web_sys::console::log_1(&"Using fallback: last char on line".into());
-                // Fallback: find last character on this line
+                // Fallback: find last character on this line (clamped)
                 start_span
                     .char_to_byte_map
                     .iter()
@@ -557,9 +553,7 @@ impl TerminalMetadata {
             .iter()
             .find(|m| m.line_in_span == end_line_in_span && m.terminal_column == actual_end_col)
             .or_else(|| {
-                #[cfg(target_arch = "wasm32")]
-                web_sys::console::log_1(&"Using fallback: last char on line".into());
-                // Fallback: find last character on this line
+                // Fallback: find last character on this line (clamped)
                 end_span
                     .char_to_byte_map
                     .iter()
