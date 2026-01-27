@@ -1,0 +1,45 @@
+[package]
+name = "connection-actors"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+actor-protocol = { path = "../actor-protocol" }
+actor-runtime = { path = "../actor-runtime" }
+core-types = { path = "../core-types" }
+analysis = { path = "../analysis" }
+futures = "0.3"
+futures-channel = "0.3"
+
+[dependencies.mavlink]
+version = "0.13"
+default-features = false
+features = ["common", "embedded"]
+optional = true
+
+[features]
+default = []
+mavlink = ["dep:mavlink"]
+usb-debug = []  # Enable detailed USB device enumeration timing logs
+atomics = []    # Feature flag to prevent compilation with multi-threaded WASM
+
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+transport-webserial = { path = "../transport-webserial" }
+web-sys = { version = "0.3", features = [
+    "console",
+    "Navigator",
+    "Serial",
+    "SerialPort",
+    "Event",
+    "EventTarget",
+    "Window",
+    "Storage"
+] }
+wasm-bindgen = "0.2"
+wasm-bindgen-futures = "0.4"
+js-sys = "0.3"
+gloo-timers = { version = "0.3", features = ["futures"] }
+
+[dev-dependencies]
+tokio = { version = "1.0", features = ["macros", "rt", "time"] }
+wasm-bindgen-test = "0.3"

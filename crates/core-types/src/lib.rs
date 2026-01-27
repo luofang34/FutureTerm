@@ -1,7 +1,84 @@
 use serde::{Deserialize, Serialize};
+use std::str::FromStr;
 
 pub mod transport;
 pub use transport::{SerialConfig, SignalState, Transport, TransportError};
+
+/// Decoder protocol type - determines how raw bytes are interpreted
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub enum DecoderId {
+    /// UTF-8 text decoder (default for terminal view)
+    #[default]
+    Utf8,
+    /// Raw hexadecimal decoder
+    Hex,
+    /// MAVLink protocol decoder
+    Mavlink,
+}
+
+impl DecoderId {
+    /// Convert to string ID for backward compatibility with worker protocol
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            DecoderId::Utf8 => "utf8",
+            DecoderId::Hex => "hex",
+            DecoderId::Mavlink => "mavlink",
+        }
+    }
+}
+
+impl FromStr for DecoderId {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s {
+            "utf8" => Ok(DecoderId::Utf8),
+            "hex" => Ok(DecoderId::Hex),
+            "mavlink" => Ok(DecoderId::Mavlink),
+            _ => Err(format!("Invalid decoder ID: {}", s)),
+        }
+    }
+}
+
+/// Framing protocol type - determines how byte stream is split into frames
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub enum FramerId {
+    /// Line-based framing (newline delimited)
+    Lines,
+    /// Raw byte stream (no framing)
+    #[default]
+    Raw,
+    /// Consistent Overhead Byte Stuffing
+    Cobs,
+    /// Serial Line Internet Protocol
+    Slip,
+}
+
+impl FramerId {
+    /// Convert to string ID for backward compatibility with worker protocol
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            FramerId::Lines => "lines",
+            FramerId::Raw => "raw",
+            FramerId::Cobs => "cobs",
+            FramerId::Slip => "slip",
+        }
+    }
+}
+
+impl FromStr for FramerId {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s {
+            "lines" => Ok(FramerId::Lines),
+            "raw" => Ok(FramerId::Raw),
+            "cobs" => Ok(FramerId::Cobs),
+            "slip" => Ok(FramerId::Slip),
+            _ => Err(format!("Invalid framer ID: {}", s)),
+        }
+    }
+}
 
 /// Represents the direction of data flow.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -264,6 +341,7 @@ pub trait Decoder: Send {
 }
 
 #[cfg(test)]
+#[allow(clippy::panic, clippy::unwrap_used, clippy::indexing_slicing)]
 mod tests {
     use super::*;
 
@@ -295,5 +373,62 @@ mod tests {
             event.fields.iter().find(|(k, _)| k == "valid").unwrap().1,
             Value::Bool(true)
         );
+    }
+
+    #[test]
+    fn test_decoder_id_conversions() {
+        use std::str::FromStr;
+
+        assert_eq!(DecoderId::Utf8.as_str(), "utf8");
+        assert_eq!(DecoderId::Hex.as_str(), "hex");
+        assert_eq!(DecoderId::Mavlink.as_str(), "mavlink");
+
+        assert_eq!(DecoderId::from_str("utf8"), Ok(DecoderId::Utf8));
+        assert_eq!(DecoderId::from_str("hex"), Ok(DecoderId::Hex));
+        assert_eq!(DecoderId::from_str("mavlink"), Ok(DecoderId::Mavlink));
+        assert!(DecoderId::from_str("invalid").is_err());
+
+        assert_eq!(DecoderId::default(), DecoderId::Utf8);
+    }
+
+    #[test]
+    fn test_framer_id_conversions() {
+        use std::str::FromStr;
+
+        assert_eq!(FramerId::Lines.as_str(), "lines");
+        assert_eq!(FramerId::Raw.as_str(), "raw");
+        assert_eq!(FramerId::Cobs.as_str(), "cobs");
+        assert_eq!(FramerId::Slip.as_str(), "slip");
+
+        assert_eq!(FramerId::from_str("lines"), Ok(FramerId::Lines));
+        assert_eq!(FramerId::from_str("raw"), Ok(FramerId::Raw));
+        assert_eq!(FramerId::from_str("cobs"), Ok(FramerId::Cobs));
+        assert_eq!(FramerId::from_str("slip"), Ok(FramerId::Slip));
+        assert!(FramerId::from_str("invalid").is_err());
+
+        assert_eq!(FramerId::default(), FramerId::Raw);
+    }
+
+    #[test]
+    fn test_decoder_id_compile_time_exhaustiveness() {
+        // This test ensures we handle all decoder types at compile time
+        let decoder = DecoderId::Utf8;
+        match decoder {
+            DecoderId::Utf8 => {}
+            DecoderId::Hex => {}
+            DecoderId::Mavlink => {} // If a new variant is added, this will fail to compile
+        }
+    }
+
+    #[test]
+    fn test_framer_id_compile_time_exhaustiveness() {
+        // This test ensures we handle all framer types at compile time
+        let framer = FramerId::Raw;
+        match framer {
+            FramerId::Lines => {}
+            FramerId::Raw => {}
+            FramerId::Cobs => {}
+            FramerId::Slip => {} // If a new variant is added, this will fail to compile
+        }
     }
 }
