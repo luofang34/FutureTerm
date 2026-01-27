@@ -16,13 +16,36 @@ pub struct WebSerialTransport {
     pending_read: std::cell::RefCell<Option<js_sys::Promise>>,
 }
 
-// Safety: WebSerialTransport holds JsValues which are !Send / !Sync.
-// However, in a WASM environment (browser), we are single-threaded.
-// We implement these traits to satisfy the Transport trait bound,
-// assuming this struct will NOT actually be moved across threads
-// (or if it is, the runtime environment handles it via message passing,
-// but direct access would fail if not on the main thread).
+// SAFETY: WebSerialTransport is safe to Send/Sync ONLY in single-threaded WASM.
+//
+// WebSerialTransport holds JsValues which are !Send / !Sync by default because
+// JavaScript objects are not thread-safe. However:
+//
+// 1. In single-threaded WASM (without atomics), there is no true parallelism.
+//    All operations execute sequentially on the main thread via spawn_local.
+// 2. The Transport trait requires Send + Sync to work with async actors.
+// 3. If atomics feature is enabled (SharedArrayBuffer), this code MUST NOT compile
+//    because true multi-threading would violate JS memory safety.
+//
+// This implementation is conditionally compiled to fail if atomics are enabled,
+// preventing undefined behavior in multi-threaded WASM scenarios.
+
+// Compile-time safety check: prevent WebSerialTransport with WASM atomics
+#[cfg(feature = "atomics")]
+compile_error!(
+    "WebSerialTransport is unsafe with WASM atomics! \
+     JsValue types are not thread-safe. Use a different transport for multi-threaded WASM."
+);
+
+// SAFETY: WebSerialTransport is always compiled for WASM target (due to wasm-bindgen dependency).
+// This crate has no meaning on non-WASM platforms. The Send/Sync impls are safe because:
+// 1. WASM is single-threaded by default (without atomics feature)
+// 2. The atomics feature is explicitly checked above with compile_error!
+// 3. All async operations run on the main thread via spawn_local
+#[cfg(not(feature = "atomics"))]
 unsafe impl Send for WebSerialTransport {}
+
+#[cfg(not(feature = "atomics"))]
 unsafe impl Sync for WebSerialTransport {}
 
 impl WebSerialTransport {
@@ -92,9 +115,42 @@ impl WebSerialTransport {
         #[cfg(debug_assertions)]
         web_sys::console::log_1(&"WebSerialTransport: Invoking port.open()...".into());
         let promise = port.open(&serial_options);
-        JsFuture::from(promise)
-            .await
-            .map_err(|e| TransportError::ConnectionFailed(format!("{:?}", e)))?;
+        JsFuture::from(promise).await.map_err(|e| {
+            // Robust error detection via object properties
+            let mut is_invalid_state = false;
+            let mut msg = format!("{:?}", e);
+
+            if let Some(obj) = e.dyn_ref::<js_sys::Object>() {
+                // Try to get 'name'
+                if let Ok(name_val) = js_sys::Reflect::get(obj, &"name".into()) {
+                    if let Some(name_str) = name_val.as_string() {
+                        if name_str.contains("InvalidStateError") {
+                            is_invalid_state = true;
+                        }
+                    }
+                }
+                // Update msg from 'message' if available
+                if let Ok(m_val) = js_sys::Reflect::get(obj, &"message".into()) {
+                    if let Some(m_str) = m_val.as_string() {
+                        msg = m_str;
+                    }
+                }
+            } else {
+                // Fallback string checks
+                let s = format!("{:?}", e);
+                if s.contains("InvalidStateError") {
+                    is_invalid_state = true;
+                }
+            }
+
+            if is_invalid_state || msg.to_lowercase().contains("already open") {
+                // Map InvalidStateError explicitly to AlreadyOpen when regarding open()
+                // (Spec says InvalidStateError = port already open)
+                TransportError::AlreadyOpen
+            } else {
+                TransportError::ConnectionFailed(msg)
+            }
+        })?;
         #[cfg(debug_assertions)]
         web_sys::console::log_1(&"WebSerialTransport: port.open() resolved.".into());
 
@@ -163,19 +219,24 @@ impl Transport for WebSerialTransport {
 
     async fn close(&mut self) -> Result<(), TransportError> {
         // Release locks
+        #[cfg(debug_assertions)]
         let start_close = js_sys::Date::now();
         *self.pending_read.borrow_mut() = None; // Drop the promise ref
         if let Some(reader) = self.reader.take() {
+            #[cfg(debug_assertions)]
             let start_r = js_sys::Date::now();
             let _ = JsFuture::from(reader.cancel()).await;
             reader.release_lock();
-            let dur_r = js_sys::Date::now() - start_r;
             #[cfg(debug_assertions)]
-            web_sys::console::log_1(
-                &format!("WebSerialTransport: reader.cancel() took {:.1}ms", dur_r).into(),
-            );
+            {
+                let dur_r = js_sys::Date::now() - start_r;
+                web_sys::console::log_1(
+                    &format!("WebSerialTransport: reader.cancel() took {:.1}ms", dur_r).into(),
+                );
+            }
         }
         if let Some(writer) = self.writer.take() {
+            #[cfg(debug_assertions)]
             let start_w = js_sys::Date::now();
 
             // CRITICAL FIX: writer.close() can hang indefinitely if device disconnected
@@ -184,7 +245,7 @@ impl Transport for WebSerialTransport {
             let timeout_promise = js_sys::Promise::new(&mut |resolve, _reject| {
                 if let Some(window) = web_sys::window() {
                     let _ = window.set_timeout_with_callback_and_timeout_and_arguments_0(
-                        &resolve, 100, // 100ms timeout
+                        &resolve, 200, // 200ms timeout
                     );
                 }
             });
@@ -194,11 +255,13 @@ impl Transport for WebSerialTransport {
             let _ = JsFuture::from(race_result).await;
 
             writer.release_lock();
-            let dur_w = js_sys::Date::now() - start_w;
             #[cfg(debug_assertions)]
-            web_sys::console::log_1(
-                &format!("WebSerialTransport: writer.close() took {:.1}ms", dur_w).into(),
-            );
+            {
+                let dur_w = js_sys::Date::now() - start_w;
+                web_sys::console::log_1(
+                    &format!("WebSerialTransport: writer.close() took {:.1}ms", dur_w).into(),
+                );
+            }
         }
 
         if let Some(port) = self.port.take() {
@@ -210,9 +273,12 @@ impl Transport for WebSerialTransport {
                     match func.call0(&port) {
                         Ok(p) => {
                             #[cfg(debug_assertions)]
-                            web_sys::console::log_1(
-                                &"WebSerialTransport: port.close() invoking...".into(),
-                            );
+                            {
+                                web_sys::console::log_1(
+                                    &"WebSerialTransport: port.close() invoking...".into(),
+                                );
+                            }
+                            #[cfg(debug_assertions)]
                             let start_c = js_sys::Date::now();
 
                             // OPTIMIZATION: Use shorter timeout (50ms) for port.close()
@@ -222,7 +288,7 @@ impl Transport for WebSerialTransport {
                                 if let Some(window) = web_sys::window() {
                                     let _ = window
                                         .set_timeout_with_callback_and_timeout_and_arguments_0(
-                                            &resolve, 50,
+                                            &resolve, 600,
                                         );
                                 }
                             });
@@ -233,15 +299,17 @@ impl Transport for WebSerialTransport {
                             ));
                             let _ = JsFuture::from(race_result).await;
 
-                            let dur_c = js_sys::Date::now() - start_c;
                             #[cfg(debug_assertions)]
-                            web_sys::console::log_1(
-                                &format!(
-                                    "WebSerialTransport: port.close() resolved in {:.1}ms",
-                                    dur_c
-                                )
-                                .into(),
-                            );
+                            {
+                                let dur_c = js_sys::Date::now() - start_c;
+                                web_sys::console::log_1(
+                                    &format!(
+                                        "WebSerialTransport: port.close() resolved in {:.1}ms",
+                                        dur_c
+                                    )
+                                    .into(),
+                                );
+                            }
                         }
                         Err(_) => {
                             // Port already closed or other error - this is fine
@@ -257,15 +325,17 @@ impl Transport for WebSerialTransport {
             }
         }
 
-        let total_close = js_sys::Date::now() - start_close;
         #[cfg(debug_assertions)]
-        web_sys::console::log_1(
-            &format!(
-                "WebSerialTransport: close() complete in {:.1}ms",
-                total_close
-            )
-            .into(),
-        );
+        {
+            let total_close = js_sys::Date::now() - start_close;
+            web_sys::console::log_1(
+                &format!(
+                    "WebSerialTransport: close() complete in {:.1}ms",
+                    total_close
+                )
+                .into(),
+            );
+        }
         Ok(())
     }
 
