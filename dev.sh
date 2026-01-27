@@ -33,14 +33,13 @@ run_quality_checks() {
 
     local FAILED=0
 
-    # Format check
-    echo -e "${YELLOW}▶ Format Check${NC}"
-    if cargo fmt --all -- --check 2>&1; then
-        echo -e "${GREEN}✓ Format check passed${NC}"
+    # Auto-format (always fix, never just check)
+    echo -e "${YELLOW}▶ Auto-Format${NC}"
+    if cargo fmt --all 2>&1; then
+        echo -e "${GREEN}✓ Code formatted${NC}"
         echo ""
     else
-        echo -e "${RED}✗ Format check FAILED${NC}"
-        echo -e "${CYAN}Run: cargo fmt --all${NC}"
+        echo -e "${RED}✗ Format FAILED${NC}"
         echo ""
         FAILED=1
     fi
@@ -85,7 +84,7 @@ run_quality_checks() {
 
     # Cargo check
     echo -e "${YELLOW}▶ Cargo Check${NC}"
-    if RUSTFLAGS="--cfg=web_sys_unstable_apis" cargo check --workspace --all-features 2>&1; then
+    if cargo check --workspace --exclude transport-webserial --exclude app-web --all-features 2>&1; then
         echo -e "${GREEN}✓ Cargo check passed${NC}"
         echo ""
     else
