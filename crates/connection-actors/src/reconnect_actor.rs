@@ -19,6 +19,14 @@ pub struct DeviceIdentity {
     pub pid: u16,
 }
 
+/// Device state tracking for reconnection
+#[cfg(target_arch = "wasm32")]
+#[derive(Debug, Clone)]
+struct DeviceState {
+    identity: DeviceIdentity,
+    is_connected: bool,
+}
+
 /// Configuration to use when reconnecting
 #[derive(Debug, Clone)]
 pub struct ReconnectConfig {
@@ -53,7 +61,7 @@ pub struct ReconnectActor {
 
     // Shared state for USB event handlers (allows closures to access current device)
     #[cfg(target_arch = "wasm32")]
-    last_device_shared: Rc<RefCell<Option<DeviceIdentity>>>,
+    last_device_shared: Rc<RefCell<Option<DeviceState>>>,
 }
 
 impl ReconnectActor {
@@ -88,7 +96,10 @@ impl ReconnectActor {
         // Update shared state for USB event handlers
         #[cfg(target_arch = "wasm32")]
         {
-            *self.last_device_shared.borrow_mut() = Some(device_identity);
+            *self.last_device_shared.borrow_mut() = Some(DeviceState {
+                identity: device_identity,
+                is_connected: true,
+            });
         }
 
         #[cfg(debug_assertions)]
@@ -163,18 +174,28 @@ impl ReconnectActor {
                 #[cfg(target_arch = "wasm32")]
                 {
                     if let Some(handle) = port_handle {
-                        let _ = self.state_tx.try_send(StateMessage::DeviceReappeared {
-                            port,
-                            port_handle: handle,
-                        });
+                        self.state_tx
+                            .try_send(StateMessage::DeviceReappeared {
+                                port,
+                                port_handle: handle,
+                            })
+                            .map_err(|_| {
+                                ActorError::ChannelClosed(
+                                    "StateActor unavailable during DeviceReappeared".into(),
+                                )
+                            })?;
                     }
                 }
 
                 #[cfg(not(target_arch = "wasm32"))]
                 {
-                    let _ = self
-                        .state_tx
-                        .try_send(StateMessage::DeviceReappeared { port });
+                    self.state_tx
+                        .try_send(StateMessage::DeviceReappeared { port })
+                        .map_err(|_| {
+                            ActorError::ChannelClosed(
+                                "StateActor unavailable during DeviceReappeared".into(),
+                            )
+                        })?;
                 }
             }
         }
@@ -295,7 +316,7 @@ impl ReconnectActor {
 
                     // Check if we have a registered device to reconnect to
                     let target_device: DeviceIdentity = match last_device_shared.borrow().as_ref() {
-                        Some(dev) => dev.clone(),
+                        Some(dev_state) => dev_state.identity.clone(),
                         None => {
                             #[cfg(debug_assertions)]
                             web_sys::console::log_1(
@@ -523,12 +544,19 @@ impl ReconnectActor {
                     #[cfg(debug_assertions)]
                     web_sys::console::log_1(&"USB disconnect event received".into());
 
-                    // Only send ConnectionLost if we have a registered device
-                    // This prevents spurious state transitions when unrelated USB devices are unplugged
-                    if last_device_for_disconnect.borrow().is_some() {
-                        let _ = state_tx_for_disconnect
-                            .clone()
-                            .try_send(StateMessage::ConnectionLost);
+                    // Only send ConnectionLost if device was actually connected
+                    // This prevents false positives from unrelated USB devices
+                    if let Some(device_state) = last_device_for_disconnect.borrow().as_ref() {
+                        if device_state.is_connected {
+                            let _ = state_tx_for_disconnect
+                                .clone()
+                                .try_send(StateMessage::ConnectionLost);
+                        } else {
+                            #[cfg(debug_assertions)]
+                            web_sys::console::log_1(
+                                &"USB disconnect ignored - device not connected".into(),
+                            );
+                        }
                     } else {
                         #[cfg(debug_assertions)]
                         web_sys::console::log_1(
@@ -627,14 +655,26 @@ impl Actor for ReconnectActor {
                         if !serial_val.is_undefined() {
                             if let Ok(serial_obj) = serial_val.dyn_into::<web_sys::EventTarget>() {
                                 // Remove event listeners using the stored closure references
-                                let _ = serial_obj.remove_event_listener_with_callback(
+                                if let Err(e) = serial_obj.remove_event_listener_with_callback(
                                     "connect",
                                     closures._onconnect.as_ref().unchecked_ref(),
-                                );
-                                let _ = serial_obj.remove_event_listener_with_callback(
+                                ) {
+                                    #[cfg(debug_assertions)]
+                                    web_sys::console::warn_1(
+                                        &format!("Failed to remove 'connect' listener: {:?}", e)
+                                            .into(),
+                                    );
+                                }
+                                if let Err(e) = serial_obj.remove_event_listener_with_callback(
                                     "disconnect",
                                     closures._ondisconnect.as_ref().unchecked_ref(),
-                                );
+                                ) {
+                                    #[cfg(debug_assertions)]
+                                    web_sys::console::warn_1(
+                                        &format!("Failed to remove 'disconnect' listener: {:?}", e)
+                                            .into(),
+                                    );
+                                }
 
                                 #[cfg(debug_assertions)]
                                 web_sys::console::log_1(

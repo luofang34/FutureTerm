@@ -13,30 +13,11 @@ use core_types::Transport;
 #[cfg(feature = "mavlink")]
 use mavlink;
 
-/// Probe operation timeouts and delays
+// Import centralized constants
+use crate::constants::BAUD_CANDIDATES;
+
 #[cfg(target_arch = "wasm32")]
-mod constants {
-    /// Initial read timeout before receiving data (150ms)
-    pub const INITIAL_READ_TIMEOUT_MS: f64 = 150.0;
-
-    /// Extended read timeout after receiving first bytes (250ms)
-    pub const EXTENDED_READ_TIMEOUT_MS: f64 = 250.0;
-
-    /// Port open retry attempts (5 attempts)
-    pub const PORT_OPEN_MAX_RETRIES: u8 = 5;
-
-    /// Retry delay between port open attempts (200ms)
-    pub const PORT_OPEN_RETRY_DELAY_MS: u64 = 200;
-
-    /// Mandatory cooldown after port close (50ms)
-    pub const PORT_CLOSE_COOLDOWN_MS: u64 = 50;
-}
-
-/// Baud rate candidates for auto-detection
-/// Start with 115200 as baseline, then high speeds, then common rates
-const BAUD_CANDIDATES: &[u32] = &[
-    115200, 1500000, 1000000, 2000000, 921600, 57600, 460800, 230400, 38400, 19200, 9600,
-];
+use crate::constants;
 
 /// ProbeActor performs auto-detection of baud rate and protocols
 ///
@@ -124,6 +105,7 @@ impl ProbeActor {
                     // Transient/Network error (Unplugged, Busy-but-generic)
                     #[cfg(target_arch = "wasm32")]
                     {
+                        #[cfg(debug_assertions)]
                         web_sys::console::warn_1(
                             &format!("Probe: Error at {} baud: {}. Retrying next...", baud, msg)
                                 .into(),
@@ -148,6 +130,7 @@ impl ProbeActor {
             // Early break on perfect match or high confidence
             // Optimization: If "Perfect" match found, stop scanning remaining rates
             if best_score > 0.99 && buffer.len() > 64 {
+                #[cfg(debug_assertions)]
                 #[cfg(target_arch = "wasm32")]
                 web_sys::console::log_1(
                     &format!("AUTO: Perfect match found at {}. Stopping scan.", baud).into(),
@@ -158,6 +141,7 @@ impl ProbeActor {
             // High-Speed Optimization: Accept lower confidence for >= 1M baud
             let threshold = if baud >= 1_000_000 { 0.85 } else { 0.98 };
             if best_score > threshold {
+                #[cfg(debug_assertions)]
                 #[cfg(target_arch = "wasm32")]
                 web_sys::console::log_1(
                     &format!(
@@ -172,6 +156,7 @@ impl ProbeActor {
 
         // Report result to StateActor
         if best_score > 0.3 {
+            #[cfg(debug_assertions)]
             #[cfg(target_arch = "wasm32")]
             web_sys::console::log_1(
                 &format!(
@@ -181,13 +166,18 @@ impl ProbeActor {
                 .into(),
             );
 
-            let _ = self.state_tx.try_send(StateMessage::ProbeComplete {
-                baud: best_result.baud,
-                framing: best_result.framing.clone(),
-                protocol: best_result.protocol.clone(),
-                initial_data: best_result.initial_data.clone(),
-            });
+            self.state_tx
+                .try_send(StateMessage::ProbeComplete {
+                    baud: best_result.baud,
+                    framing: best_result.framing.clone(),
+                    protocol: best_result.protocol.clone(),
+                    initial_data: best_result.initial_data.clone(),
+                })
+                .map_err(|_| {
+                    ActorError::ChannelClosed("StateActor unavailable during ProbeComplete".into())
+                })?;
         } else {
+            #[cfg(debug_assertions)]
             #[cfg(target_arch = "wasm32")]
             web_sys::console::log_1(
                 &format!(
@@ -233,7 +223,7 @@ impl ProbeActor {
         let mut transport = transport_webserial::WebSerialTransport::new();
         let mut attempts = 0;
 
-        while attempts < constants::PORT_OPEN_MAX_RETRIES {
+        while attempts < constants::probe::PORT_OPEN_MAX_RETRIES {
             // Check for interruption before each attempt
             if self.interrupt_flag.load(Ordering::Acquire) {
                 return Err(ActorError::Other("Interrupted during port open".into()));
@@ -255,14 +245,14 @@ impl ProbeActor {
                     return Ok(transport);
                 }
                 Some(Err(core_types::TransportError::ConnectionFailed(_)))
-                    if attempts < constants::PORT_OPEN_MAX_RETRIES - 1 =>
+                    if attempts < constants::probe::PORT_OPEN_MAX_RETRIES - 1 =>
                 {
                     // Retry on generic connection failure
                     attempts += 1;
 
                     let sleep_result = race_with_cancellation(
                         gloo_timers::future::sleep(std::time::Duration::from_millis(
-                            constants::PORT_OPEN_RETRY_DELAY_MS,
+                            constants::probe::PORT_OPEN_RETRY_DELAY_MS,
                         )),
                         self.interrupt_flag.clone(),
                     )
@@ -311,7 +301,7 @@ impl ProbeActor {
         }
 
         let start = js_sys::Date::now();
-        let mut max_time = constants::INITIAL_READ_TIMEOUT_MS;
+        let mut max_time = constants::probe::INITIAL_READ_TIMEOUT_MS;
 
         loop {
             let elapsed = js_sys::Date::now() - start;
@@ -367,7 +357,7 @@ impl ProbeActor {
                         }
 
                         // Extend timeout after receiving data
-                        max_time = constants::EXTENDED_READ_TIMEOUT_MS;
+                        max_time = constants::probe::EXTENDED_READ_TIMEOUT_MS;
                     }
                 }
                 None => break, // Timeout
@@ -401,7 +391,7 @@ impl ProbeActor {
         // Mandatory cooldown to avoid port lock issues
         let cooldown_result = race_with_cancellation(
             gloo_timers::future::sleep(std::time::Duration::from_millis(
-                constants::PORT_CLOSE_COOLDOWN_MS,
+                constants::port::CLOSE_COOLDOWN_MS,
             )),
             self.interrupt_flag.clone(),
         )
@@ -506,7 +496,8 @@ impl ProbeActor {
         let score_7e1 = analysis::calculate_score_7e1(buffer) as f64;
         let score_mav = analysis::calculate_score_mavlink(buffer) as f64;
 
-        // ALWAYS log scoring for debugging (unconditional)
+        // Debug log scoring for development
+        #[cfg(debug_assertions)]
         #[cfg(target_arch = "wasm32")]
         web_sys::console::log_1(
             &format!(
@@ -523,6 +514,7 @@ impl ProbeActor {
         // MAVLink Priority Check (Robust) - Use integrity verification if available
         #[cfg(feature = "mavlink")]
         if self.verify_mavlink_integrity(buffer) {
+            #[cfg(debug_assertions)]
             #[cfg(target_arch = "wasm32")]
             web_sys::console::log_1(&"AUTO: MAVLink Verified (Magic+Parse)!".into());
 
@@ -537,6 +529,7 @@ impl ProbeActor {
 
         // Fallback to statistical score if verification inconclusive but score high
         if score_mav >= 0.99 {
+            #[cfg(debug_assertions)]
             #[cfg(target_arch = "wasm32")]
             web_sys::console::log_1(&"AUTO: MAVLink Detected (Statistical).".into());
 
@@ -575,6 +568,7 @@ impl ProbeActor {
         let threshold = if baud >= 1_000_000 { 0.85 } else { 0.98 };
 
         if best_score > threshold && buffer.len() > 64 {
+            #[cfg(debug_assertions)]
             #[cfg(target_arch = "wasm32")]
             web_sys::console::log_1(
                 &format!(

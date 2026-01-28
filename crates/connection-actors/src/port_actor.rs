@@ -3,6 +3,9 @@ use actor_runtime::{actor_debug, StateMessage};
 use futures_channel::mpsc;
 
 #[cfg(target_arch = "wasm32")]
+use crate::constants;
+
+#[cfg(target_arch = "wasm32")]
 use {
     actor_protocol::ActorError,
     actor_runtime::{Actor, PortMessage},
@@ -24,6 +27,13 @@ mod wasm_port_actor {
     /// This wrapper makes Rc<WebSerialTransport> Send to satisfy actor message passing.
     /// Rc is !Send by default because it uses non-atomic reference counting, which
     /// would cause data races in true multi-threaded environments.
+    ///
+    /// **Resource cleanup**: When Rc::try_unwrap() fails (multiple references exist),
+    /// we rely on the WebSerialTransport Drop implementation to clean up resources
+    /// when the last reference is dropped. This is safe because:
+    /// 1. PortActor's transport reference is dropped in handle_close()
+    /// 2. Read loop's reference is dropped when loop exits
+    /// 3. Drop implementation spawns async cleanup in background
     ///
     /// However, in single-threaded WASM:
     /// 1. All operations execute on the main thread via spawn_local (no parallelism)
@@ -100,25 +110,51 @@ impl PortActor {
     }
 
     #[cfg(target_arch = "wasm32")]
-    fn parse_framing(framing: &str, baud: u32) -> SerialConfig {
+    fn parse_framing(framing: &str, baud: u32) -> Result<SerialConfig, String> {
         // Parse framing string like "8N1" (8 data bits, No parity, 1 stop bit)
-        let data_bits = if framing.starts_with('7') { 7 } else { 8 };
-        let parity = if framing.contains('E') {
-            "even"
-        } else if framing.contains('O') {
-            "odd"
-        } else {
-            "none"
-        };
-        let stop_bits = if framing.ends_with('2') { 2 } else { 1 };
 
-        SerialConfig {
+        // Validate format: must be exactly 3 characters
+        if framing.len() != 3 {
+            return Err(format!(
+                "Invalid framing format '{}': must be 3 characters (e.g., '8N1')",
+                framing
+            ));
+        }
+
+        let chars: Vec<char> = framing.chars().collect();
+
+        // Parse data_bits (first character)
+        let data_bits = match chars.first() {
+            Some('7') => 7,
+            Some('8') => 8,
+            Some(c) => return Err(format!("Invalid data bits '{}': must be 7 or 8", c)),
+            None => return Err("Internal error: framing string unexpectedly empty".into()),
+        };
+
+        // Parse parity (second character, case insensitive)
+        let parity = match chars.get(1).map(|c| c.to_ascii_uppercase()) {
+            Some('N') => "none",
+            Some('E') => "even",
+            Some('O') => "odd",
+            Some(c) => return Err(format!("Invalid parity '{}': must be N, E, or O", c)),
+            None => return Err("Internal error: missing parity character".into()),
+        };
+
+        // Parse stop_bits (third character)
+        let stop_bits = match chars.get(2) {
+            Some('1') => 1,
+            Some('2') => 2,
+            Some(c) => return Err(format!("Invalid stop bits '{}': must be 1 or 2", c)),
+            None => return Err("Internal error: missing stop bits character".into()),
+        };
+
+        Ok(SerialConfig {
             baud_rate: baud,
             data_bits,
             flow_control: "none".into(),
             parity: parity.into(),
             stop_bits,
-        }
+        })
     }
 
     #[cfg(target_arch = "wasm32")]
@@ -154,13 +190,15 @@ impl PortActor {
         };
 
         // Parse framing to create SerialConfig
-        let config = Self::parse_framing(&framing, baud);
+        let config = Self::parse_framing(&framing, baud).map_err(|e| {
+            ActorError::Transport(format!("Failed to parse framing '{}': {}", framing, e))
+        })?;
 
         // Create transport and open with retry logic
         let mut transport = WebSerialTransport::new();
         let mut last_error = None;
 
-        for attempt in 1..=10 {
+        for attempt in 1..=constants::port::MAX_OPEN_RETRIES {
             match transport.open(port.clone(), config.clone()).await {
                 Ok(_) => {
                     actor_debug!(
@@ -176,9 +214,12 @@ impl PortActor {
 
                     // Send wakeup if requested (triggers shell prompt)
                     if send_wakeup {
-                        // Wait 100ms for device/UART to stabilize after open
+                        // Wait for device/UART to stabilize after open
                         #[cfg(target_arch = "wasm32")]
-                        gloo_timers::future::sleep(std::time::Duration::from_millis(100)).await;
+                        gloo_timers::future::sleep(std::time::Duration::from_millis(
+                            constants::port::STABILIZATION_MS,
+                        ))
+                        .await;
 
                         // FIX: Send only CR (\r) to avoid double-newline issues with some shells
                         let _ = sendable.0.write(b"\r").await;
@@ -225,7 +266,7 @@ impl PortActor {
                 }
                 Err(core_types::TransportError::AlreadyOpen)
                 | Err(core_types::TransportError::InvalidState(_))
-                    if attempt < 10 =>
+                    if attempt < constants::port::MAX_OPEN_RETRIES =>
                 {
                     actor_debug!("PortActor: Open failed (attempt {}), retrying...", attempt);
                     // Calculate delay using shared backoff logic
@@ -238,7 +279,9 @@ impl PortActor {
                     last_error = Some(ActorError::Transport("Connection retry".into()));
                     continue;
                 }
-                Err(core_types::TransportError::ConnectionFailed(ref msg)) if attempt < 10 => {
+                Err(core_types::TransportError::ConnectionFailed(ref msg))
+                    if attempt < constants::port::MAX_OPEN_RETRIES =>
+                {
                     // Only retry specific retriable errors
                     // WebSerial API errors are opaque, must match on string content
                     let is_retriable = msg.contains("NetworkError")
@@ -303,16 +346,47 @@ impl PortActor {
             actor_debug!("PortActor: Dropped transport reference");
         }
 
-        // Wait for read loop to complete cleanup
+        // Wait for read loop to complete cleanup with timeout
         // This ensures port is fully closed before sending ConnectionClosed
         if let Some(done_rx) = self.done_rx.take() {
-            match done_rx.await {
-                Ok(()) => {
-                    actor_debug!("PortActor: Read loop cleanup confirmed");
+            use futures::select;
+            use futures::FutureExt;
+
+            let mut timeout = gloo_timers::future::sleep(Duration::from_millis(
+                constants::port::CLEANUP_TIMEOUT_MS,
+            ))
+            .fuse();
+            let mut done = done_rx.fuse();
+
+            select! {
+                result = done => {
+                    match result {
+                        Ok(()) => {
+                            actor_debug!("PortActor: Read loop cleanup confirmed");
+                        }
+                        Err(_) => {
+                            actor_debug!("PortActor: Read loop done channel closed without signal");
+                        }
+                    }
                 }
-                Err(_) => {
-                    // Read loop dropped sender without signaling (shouldn't happen)
-                    actor_debug!("PortActor: Read loop done channel closed without signal");
+                _ = timeout => {
+                    // Timeout - read loop may be stuck
+                    actor_debug!("PortActor: Timeout waiting for read loop (500ms). Proceeding.");
+
+                    // Check for potential resource leaks
+                    if let Some(transport) = &self.transport {
+                        let count = std::rc::Rc::strong_count(&transport.0);
+                        if count > 1 {
+                            #[cfg(target_arch = "wasm32")]
+                            web_sys::console::warn_1(
+                                &format!(
+                                    "Port cleanup timeout - {} outstanding references. \
+                                     Resources will be cleaned by Drop implementation.",
+                                    count
+                                ).into()
+                            );
+                        }
+                    }
                 }
             }
         } else {
@@ -391,69 +465,68 @@ fn spawn_read_loop(
         let mut check_suppress = suppress_echo;
 
         loop {
-            // Create a future for the read operation
-            // We need to rebinding transport to satisfy borrow checker if needed,
-            // but here transport is a clean clone.
+            // Create futures for reading and shutdown
             let read_fut = transport.read_chunk().fuse();
             let shutdown_fut = shutdown_rx.next().fuse();
 
             futures::pin_mut!(read_fut, shutdown_fut);
 
-            futures::select! {
-                res = read_fut => {
-                    match res {
-                        Ok((mut data, timestamp_us)) if !data.is_empty() => {
-                            if check_suppress {
-                                // Strip leading whitespace (CR, LF) which are likely the echo of our wakeup
-                                let start = data.iter().position(|&b| b != b'\r' && b != b'\n' && b != 0).unwrap_or(data.len());
-                                if start > 0 {
-                                     actor_debug!("PortActor: Suppressed {} echo bytes", start);
-                                     data = data.split_off(start);
-                                }
-                                // Only disable check if we actually found data or stripped something?
-                                // Actually, if we got a packet, that's the response. Turn off check.
-                                check_suppress = false;
-                            }
+            let read_result = futures::select! {
+                res = read_fut => Some(res),
+                _ = shutdown_fut => None, // Shutdown signal
+            };
 
-                            if !data.is_empty() {
-                                let _ = event_tx.try_send(SystemEvent::DataReceived { data, timestamp_us });
-                                let _ = event_tx.try_send(SystemEvent::RxActivity);
-                            }
+            match read_result {
+                Some(Ok((mut data, timestamp_us))) if !data.is_empty() => {
+                    if check_suppress {
+                        // Strip leading whitespace (CR, LF) which are likely the echo of our wakeup
+                        let start = data
+                            .iter()
+                            .position(|&b| b != b'\r' && b != b'\n' && b != 0)
+                            .unwrap_or(data.len());
+                        if start > 0 {
+                            actor_debug!("PortActor: Suppressed {} echo bytes", start);
+                            data = data.split_off(start);
                         }
-                        Err(_) => {
-                            // Connection lost
-                            let _ = state_tx.try_send(StateMessage::ConnectionLost);
-                            let _ = event_tx.try_send(SystemEvent::Error {
-                                message: "Connection lost".to_string(),
-                            });
-                            break; // Exit read loop
-                        }
-                        _ => {} // Empty read is OK (timeout)
+                        // Only disable check if we actually found data or stripped something?
+                        // Actually, if we got a packet, that's the response. Turn off check.
+                        check_suppress = false;
+                    }
+
+                    if !data.is_empty() {
+                        let _ = event_tx.try_send(SystemEvent::DataReceived { data, timestamp_us });
+                        let _ = event_tx.try_send(SystemEvent::RxActivity);
                     }
                 }
-                _ = shutdown_fut => {
+                Some(Err(_)) => {
+                    // Connection lost
+                    let _ = state_tx.try_send(StateMessage::ConnectionLost);
+                    let _ = event_tx.try_send(SystemEvent::Error {
+                        message: "Connection lost".to_string(),
+                    });
+                    break; // Exit read loop
+                }
+                None => {
                     // Shutdown signal received
                     break;
                 }
+                _ => {} // Empty read is OK (timeout)
             }
         }
 
         // CRITICAL: Close the port when exiting loop
-        // Try to unwrap the Rc to get exclusive ownership
+        // Try to unwrap the Rc to get exclusive ownership for explicit close
         match std::rc::Rc::try_unwrap(transport.0) {
             Ok(mut t) => {
                 let _ = t.close().await;
                 actor_debug!("Read loop: Port closed (exclusive ownership)");
             }
             Err(rc) => {
-                // FIX: Cannot close port if Rc has multiple references
-                // This can happen if PortActor hasn't dropped its reference yet due to async timing.
-                // The port will be closed when the last Rc is dropped via Drop trait.
-                // This is an acceptable trade-off: worst case is the port remains open until
-                // PortActor's handle is dropped (typically within 100ms via handle_close).
+                // Cannot close explicitly - multiple references still exist
+                // The Drop implementation will handle cleanup when the last reference is dropped
                 actor_debug!(
                     "Read loop: Cannot force close - Rc still shared (strong_count={}). \
-                     Port will close when last reference drops.",
+                     Port will be cleaned by Drop implementation.",
                     std::rc::Rc::strong_count(&rc)
                 );
                 drop(rc);
@@ -679,7 +752,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_parse_framing_8n1() {
-        let config = PortActor::parse_framing("8N1", 115200);
+        let config = PortActor::parse_framing("8N1", 115200).unwrap();
         assert_eq!(config.baud_rate, 115200);
         assert_eq!(config.data_bits, 8);
         assert_eq!(config.parity, core_types::Parity::None);
@@ -688,7 +761,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_parse_framing_7e1() {
-        let config = PortActor::parse_framing("7E1", 9600);
+        let config = PortActor::parse_framing("7E1", 9600).unwrap();
         assert_eq!(config.baud_rate, 9600);
         assert_eq!(config.data_bits, 7);
         assert_eq!(config.parity, core_types::Parity::Even);
@@ -697,7 +770,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_parse_framing_8e1() {
-        let config = PortActor::parse_framing("8E1", 57600);
+        let config = PortActor::parse_framing("8E1", 57600).unwrap();
         assert_eq!(config.baud_rate, 57600);
         assert_eq!(config.data_bits, 8);
         assert_eq!(config.parity, core_types::Parity::Even);
@@ -705,12 +778,49 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_parse_framing_invalid_defaults_to_8n1() {
-        let config = PortActor::parse_framing("INVALID", 19200);
-        assert_eq!(config.baud_rate, 19200);
-        assert_eq!(config.data_bits, 8);
-        assert_eq!(config.parity, core_types::Parity::None);
-        assert_eq!(config.stop_bits, core_types::StopBits::One);
+    async fn test_parse_framing_invalid_format() {
+        let result = PortActor::parse_framing("INVALID", 19200);
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert!(err.contains("must be 3 characters"));
+    }
+
+    #[tokio::test]
+    async fn test_parse_framing_invalid_data_bits() {
+        let result = PortActor::parse_framing("5N1", 115200);
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert!(err.contains("must be 7 or 8"));
+    }
+
+    #[tokio::test]
+    async fn test_parse_framing_invalid_parity() {
+        let result = PortActor::parse_framing("8X1", 115200);
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert!(err.contains("must be N, E, or O"));
+    }
+
+    #[tokio::test]
+    async fn test_parse_framing_invalid_stop_bits() {
+        let result = PortActor::parse_framing("8N3", 115200);
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert!(err.contains("must be 1 or 2"));
+    }
+
+    #[tokio::test]
+    async fn test_parse_framing_case_insensitive() {
+        // Lowercase should work
+        let config_lower = PortActor::parse_framing("8n1", 115200).unwrap();
+        assert_eq!(config_lower.parity, core_types::Parity::None);
+
+        // Mixed case
+        let config_mixed = PortActor::parse_framing("7e1", 9600).unwrap();
+        assert_eq!(config_mixed.parity, core_types::Parity::Even);
+
+        let config_odd = PortActor::parse_framing("8o2", 57600).unwrap();
+        assert_eq!(config_odd.parity, core_types::Parity::Odd);
     }
 
     #[test]

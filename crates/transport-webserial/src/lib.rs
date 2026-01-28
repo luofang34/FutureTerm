@@ -6,6 +6,47 @@ use web_sys::{
     ReadableStreamDefaultReader, SerialOptions, SerialPort, WritableStreamDefaultWriter,
 };
 
+/// Timeout for Drop cleanup operations (milliseconds)
+///
+/// **Value**: 100ms
+///
+/// **Rationale**: Drop implementation spawns async cleanup task to release
+/// WebSerial API resources. This timeout prevents hanging indefinitely if:
+/// - Device was unplugged (close() promise never resolves)
+/// - Browser is shutting down (async tasks may be cancelled)
+///
+/// At 100ms: Fast enough to not block shutdown, long enough for clean disconnect.
+#[cfg(target_arch = "wasm32")]
+const DROP_CLEANUP_TIMEOUT_MS: i32 = 100;
+
+/// Timeout for writer.close() operations (milliseconds)
+///
+/// **Value**: 200ms
+///
+/// **Rationale**: WritableStream.close() can hang if device disconnected.
+/// Based on WebSerial API behavior:
+/// - Normal close: 10-50ms
+/// - Device disconnected: Hangs indefinitely
+///
+/// At 200ms: Allows clean shutdown while preventing reconnection delays.
+const WRITER_CLOSE_TIMEOUT_MS: i32 = 200;
+
+/// Timeout for port.close() operations (milliseconds)
+///
+/// **Value**: 600ms
+///
+/// **Rationale**: SerialPort.close() is slowest WebSerial operation:
+/// - Writer close: 200ms
+/// - Reader cancel: 50ms
+/// - Port lock release: 200ms
+/// - USB controller cleanup: 100-150ms
+///
+/// Total worst-case: ~600ms. This matches transport-webserial design goal
+/// of preventing reconnection delays beyond 1 second.
+///
+/// **Trade-off**: Longer timeout ensures clean close, shorter prevents UI hangs.
+const PORT_CLOSE_TIMEOUT_MS: i32 = 600;
+
 /// WebSerial Transport Implementation.
 ///
 /// Note: Usage requires RUSTFLAGS="--cfg=web_sys_unstable_apis"
@@ -62,6 +103,93 @@ impl WebSerialTransport {
 impl Default for WebSerialTransport {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+impl Drop for WebSerialTransport {
+    fn drop(&mut self) {
+        // CRITICAL: Ensure resources are released even if close() wasn't called explicitly
+        //
+        // WebSerial API requires async close(), but Drop is sync. This is a best-effort
+        // cleanup that spawns a detached async task to release streams and port.
+        //
+        // If the transport is already closed (port is None), skip cleanup.
+        if self.port.is_none() && self.reader.is_none() && self.writer.is_none() {
+            return;
+        }
+
+        // Warn if dropping while open (indicates potential bug where close() wasn't called)
+        #[cfg(debug_assertions)]
+        {
+            if self.port.is_some() || self.reader.is_some() || self.writer.is_some() {
+                #[cfg(target_arch = "wasm32")]
+                web_sys::console::warn_1(
+                    &"WebSerialTransport dropped while open - attempting cleanup".into(),
+                );
+            }
+        }
+
+        // Spawn detached async cleanup task
+        let _reader = self.reader.take();
+        let _writer = self.writer.take();
+        let _port = self.port.take();
+
+        #[cfg(target_arch = "wasm32")]
+        wasm_bindgen_futures::spawn_local(async move {
+            // Cancel and release reader
+            if let Some(r) = _reader {
+                let _ = JsFuture::from(r.cancel()).await;
+                r.release_lock();
+            }
+
+            // Close and release writer (with timeout to avoid hanging)
+            if let Some(w) = _writer {
+                let close_promise = w.close();
+                let timeout_promise = js_sys::Promise::new(&mut |resolve, _reject| {
+                    if let Some(window) = web_sys::window() {
+                        let _ = window.set_timeout_with_callback_and_timeout_and_arguments_0(
+                            &resolve,
+                            DROP_CLEANUP_TIMEOUT_MS,
+                        );
+                    }
+                });
+
+                let race_result =
+                    js_sys::Promise::race(&js_sys::Array::of2(&close_promise, &timeout_promise));
+                let _ = JsFuture::from(race_result).await;
+
+                w.release_lock();
+            }
+
+            // Close port (with timeout)
+            if let Some(p) = _port {
+                if let Ok(func_val) = js_sys::Reflect::get(&p, &"close".into()) {
+                    if let Ok(func) = func_val.dyn_into::<js_sys::Function>() {
+                        if let Ok(promise_val) = func.call0(&p) {
+                            let close_promise = js_sys::Promise::from(promise_val);
+                            let timeout_promise = js_sys::Promise::new(&mut |resolve, _reject| {
+                                if let Some(window) = web_sys::window() {
+                                    let _ = window
+                                        .set_timeout_with_callback_and_timeout_and_arguments_0(
+                                            &resolve,
+                                            DROP_CLEANUP_TIMEOUT_MS,
+                                        );
+                                }
+                            });
+
+                            let race_result = js_sys::Promise::race(&js_sys::Array::of2(
+                                &close_promise,
+                                &timeout_promise,
+                            ));
+                            let _ = JsFuture::from(race_result).await;
+                        }
+                    }
+                }
+            }
+
+            #[cfg(debug_assertions)]
+            web_sys::console::log_1(&"WebSerialTransport: Drop cleanup complete".into());
+        });
     }
 }
 
@@ -245,7 +373,8 @@ impl Transport for WebSerialTransport {
             let timeout_promise = js_sys::Promise::new(&mut |resolve, _reject| {
                 if let Some(window) = web_sys::window() {
                     let _ = window.set_timeout_with_callback_and_timeout_and_arguments_0(
-                        &resolve, 200, // 200ms timeout
+                        &resolve,
+                        WRITER_CLOSE_TIMEOUT_MS,
                     );
                 }
             });
@@ -281,14 +410,15 @@ impl Transport for WebSerialTransport {
                             #[cfg(debug_assertions)]
                             let start_c = js_sys::Date::now();
 
-                            // OPTIMIZATION: Use shorter timeout (50ms) for port.close()
-                            // If device disconnected, close() promise hangs - don't wait long
+                            // CRITICAL: port.close() can hang if device disconnected
+                            // Use timeout to prevent blocking reconnection
                             let close_promise = js_sys::Promise::from(p);
                             let timeout_promise = js_sys::Promise::new(&mut |resolve, _reject| {
                                 if let Some(window) = web_sys::window() {
                                     let _ = window
                                         .set_timeout_with_callback_and_timeout_and_arguments_0(
-                                            &resolve, 600,
+                                            &resolve,
+                                            PORT_CLOSE_TIMEOUT_MS,
                                         );
                                 }
                             });
