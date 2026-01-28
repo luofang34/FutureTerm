@@ -60,10 +60,17 @@ pub fn App() -> impl IntoView {
     // Framing Signal (String "8N1", "8E1", etc.)
     let (framing, set_framing) = create_signal("Auto".to_string());
 
-    // Auto-Detect Feedback Signals (Only for UI display when in Auto mode)
-    // These are now part of ConnectionManager
-    // let (detected_baud, set_detected_baud) = create_signal::<Option<u32>>(None);
-    // let (detected_framing, set_detected_framing) = create_signal::<Option<String>>(None);
+    // Active framing (actually detected value when framing="Auto")
+    // Preserved across baud rate changes to maintain detected framing
+    let (active_framing, set_active_framing) = create_signal("8N1".to_string());
+
+    // Sync active_framing when detection completes
+    create_effect(move |_| {
+        let detected = detected_framing.get();
+        if !detected.is_empty() {
+            set_active_framing.set(detected);
+        }
+    });
 
     // Direct Terminal Handle
     let (term_handle, set_term_handle) = create_signal::<Option<xterm::TerminalHandle>>(None);
@@ -514,6 +521,7 @@ pub fn App() -> impl IntoView {
     create_effect(move |_| {
         let b = baud_rate.get();
         let f = framing.get();
+        let af = active_framing.get();
 
         // Only reconfigure if already connected (Untracked to avoid triggering on connect)
         if connected.get_untracked() {
@@ -529,8 +537,9 @@ pub fn App() -> impl IntoView {
                 web_sys::console::log_1(&"Dynamically Reconfiguring Port...".into());
 
                 // Manager Reconfigure (Handles Close -> Open -> Loop)
-                // Pass `b` and `f` directly. If b=0, Manager detects. If f=Auto, Manager probes.
-                manager_r.reconfigure(b, f);
+                // Pass `b`, `f`, and `af` (active_framing).
+                // If f=Auto, active_framing preserves detected value across baud changes.
+                manager_r.reconfigure(b, f, af);
             });
         }
     });

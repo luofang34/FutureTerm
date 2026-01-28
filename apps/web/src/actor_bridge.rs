@@ -127,6 +127,14 @@ impl ActorBridge {
                         set_detected_baud.set(baud);
                         set_status.set(message);
                     }
+                    SystemEvent::ProbeComplete {
+                        baud,
+                        framing,
+                        protocol: _,
+                    } => {
+                        set_detected_baud.set(baud);
+                        set_detected_framing.set(framing);
+                    }
                     SystemEvent::RxActivity => {
                         set_rx_active.set(true);
                         spawn_local(async move {
@@ -296,22 +304,29 @@ impl ActorBridge {
     }
 
     /// Reconfigure connection parameters
-    pub fn reconfigure(&self, baud: u32, framing: String) {
+    pub fn reconfigure(&self, baud: u32, framing: String, active_framing: String) {
         // Pass port through command instead of global state
         #[cfg(target_arch = "wasm32")]
         {
             if let Some(port) = self.last_port.borrow().as_ref() {
-                let _ = self
-                    .manager
-                    .send_command_with_port(UiCommand::Reconfigure { baud, framing }, port.clone());
+                let _ = self.manager.send_command_with_port(
+                    UiCommand::Reconfigure {
+                        baud,
+                        framing,
+                        active_framing,
+                    },
+                    port.clone(),
+                );
                 return;
             }
         }
 
         // Fallback for non-WASM or if no port stored
-        let _ = self
-            .manager
-            .send_command(UiCommand::Reconfigure { baud, framing });
+        let _ = self.manager.send_command(UiCommand::Reconfigure {
+            baud,
+            framing,
+            active_framing,
+        });
     }
 
     /// Send worker configuration

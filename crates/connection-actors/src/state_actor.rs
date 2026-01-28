@@ -59,6 +59,8 @@ pub struct StateActor {
     pending_reconfigure_baud: Option<u32>,
     #[cfg(target_arch = "wasm32")]
     pending_reconfigure_framing: Option<String>,
+    #[cfg(target_arch = "wasm32")]
+    pending_reconfigure_active_framing: Option<String>,
 }
 
 impl StateActor {
@@ -87,6 +89,8 @@ impl StateActor {
             pending_reconfigure_baud: None,
             #[cfg(target_arch = "wasm32")]
             pending_reconfigure_framing: None,
+            #[cfg(target_arch = "wasm32")]
+            pending_reconfigure_active_framing: None,
         }
     }
 
@@ -425,6 +429,13 @@ impl StateActor {
 
         self.send_ui_event(SystemEvent::StatusUpdate { message: msg });
 
+        // Notify UI of probe results (for active_framing preservation)
+        self.send_ui_event(SystemEvent::ProbeComplete {
+            baud,
+            framing: framing.clone(),
+            protocol: protocol.clone(),
+        });
+
         // If protocol detected (e.g., MAVLink), change decoder automatically
         if let Some(ref proto) = protocol {
             self.send_ui_event(SystemEvent::DecoderChanged { id: proto.clone() });
@@ -518,6 +529,7 @@ impl StateActor {
         &mut self,
         baud: u32,
         framing: String,
+        active_framing: String,
         port_handle: Option<actor_runtime::channels::PortHandle>,
     ) -> Result<(), ActorError> {
         if self.state != ConnectionState::Connected {
@@ -531,6 +543,7 @@ impl StateActor {
         // (will be processed when ConnectionClosed is received)
         self.pending_reconfigure_baud = Some(baud);
         self.pending_reconfigure_framing = Some(framing);
+        self.pending_reconfigure_active_framing = Some(active_framing);
 
         // Use provided port_handle or fall back to stored one
         let handle = port_handle.or_else(|| self.pending_port_handle.clone());
@@ -556,6 +569,19 @@ impl StateActor {
             .pending_reconfigure_framing
             .take()
             .unwrap_or_else(|| "8N1".to_string());
+        let active_framing = self
+            .pending_reconfigure_active_framing
+            .take()
+            .unwrap_or_else(|| "8N1".to_string());
+
+        // Normalize framing:
+        // - If user selected "Auto", use previously detected active_framing
+        // - Otherwise use user's explicit selection
+        let actual_framing = if framing.eq_ignore_ascii_case("auto") {
+            active_framing
+        } else {
+            framing
+        };
 
         if let Some(port) = self.pending_port_handle.clone() {
             // Extract port info from SerialPort object
@@ -599,7 +625,7 @@ impl StateActor {
                 })?;
             } else {
                 // Direct connection with specified baud
-                actor_debug!("StateActor: Reconfigure to {}@{}", framing, baud);
+                actor_debug!("StateActor: Reconfigure to {}@{}", actual_framing, baud);
 
                 self.pending_port = Some(port_info.clone());
                 self.pending_baud = baud;
@@ -609,7 +635,7 @@ impl StateActor {
                 self.send_critical_port(PortMessage::Open {
                     port: port_info,
                     baud,
-                    framing,
+                    framing: actual_framing,
                     send_wakeup: false, // Reconfigure is manual, don't send wakeup
                     operation_id,
                     port_handle: port,
@@ -621,7 +647,12 @@ impl StateActor {
     }
 
     #[cfg(not(target_arch = "wasm32"))]
-    async fn handle_reconfigure(&mut self, baud: u32, framing: String) -> Result<(), ActorError> {
+    async fn handle_reconfigure(
+        &mut self,
+        baud: u32,
+        framing: String,
+        active_framing: String,
+    ) -> Result<(), ActorError> {
         if self.state != ConnectionState::Connected {
             return Err(ActorError::UnexpectedMessage {
                 state: format!("{:?}", self.state),
@@ -638,6 +669,15 @@ impl StateActor {
         // Transition to Disconnected
         self.transition(ConnectionState::Disconnected)?;
 
+        // Normalize framing:
+        // - If user selected "Auto", use previously detected active_framing
+        // - Otherwise use user's explicit selection
+        let actual_framing = if framing.eq_ignore_ascii_case("auto") {
+            active_framing
+        } else {
+            framing
+        };
+
         // Native implementation (without WASM-specific port handling)
         if let Some(port_info) = self.pending_port.clone() {
             if baud == 0 {
@@ -653,7 +693,7 @@ impl StateActor {
                 self.send_critical_port(PortMessage::Open {
                     port: port_info,
                     baud,
-                    framing,
+                    framing: actual_framing,
                     send_wakeup: false,
                     operation_id,
                 })?;
@@ -684,9 +724,18 @@ impl Actor for StateActor {
                     self.handle_connect(port, baud, framing, Some(port_handle))
                         .await?
                 }
-                UiCommand::Reconfigure { baud, framing } => {
-                    self.handle_reconfigure_with_port(baud, framing, Some(port_handle))
-                        .await?
+                UiCommand::Reconfigure {
+                    baud,
+                    framing,
+                    active_framing,
+                } => {
+                    self.handle_reconfigure_with_port(
+                        baud,
+                        framing,
+                        active_framing,
+                        Some(port_handle),
+                    )
+                    .await?
                 }
                 UiCommand::Disconnect => self.handle_disconnect().await?,
                 UiCommand::SetDecoder { .. } | UiCommand::SetFramer { .. } => {
@@ -715,15 +764,20 @@ impl Actor for StateActor {
                     }
                 }
                 UiCommand::Disconnect => self.handle_disconnect().await?,
-                UiCommand::Reconfigure { baud, framing } => {
+                UiCommand::Reconfigure {
+                    baud,
+                    framing,
+                    active_framing,
+                } => {
                     #[cfg(target_arch = "wasm32")]
                     {
-                        self.handle_reconfigure_with_port(baud, framing, None)
+                        self.handle_reconfigure_with_port(baud, framing, active_framing, None)
                             .await?
                     }
                     #[cfg(not(target_arch = "wasm32"))]
                     {
-                        self.handle_reconfigure(baud, framing).await?
+                        self.handle_reconfigure(baud, framing, active_framing)
+                            .await?
                     }
                 }
                 UiCommand::SetDecoder { .. } | UiCommand::SetFramer { .. } => {

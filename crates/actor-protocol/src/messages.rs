@@ -84,7 +84,13 @@ pub enum UiCommand {
     SetFramer { id: String },
 
     /// Reconfigure connection parameters
-    Reconfigure { baud: u32, framing: String },
+    Reconfigure {
+        baud: u32,
+        /// Framing selection from UI ("Auto", "8N1", "7E1", etc.)
+        framing: String,
+        /// Actually detected/active framing (used when framing="Auto")
+        active_framing: String,
+    },
 }
 
 /// Events from Actor system to UI
@@ -101,6 +107,13 @@ pub enum SystemEvent {
 
     /// Progress update during auto-detection
     ProbeProgress { baud: u32, message: String },
+
+    /// Auto-detection completed successfully
+    ProbeComplete {
+        baud: u32,
+        framing: String,
+        protocol: Option<String>,
+    },
 
     /// Error occurred
     Error { message: String },
