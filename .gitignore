@@ -43,3 +43,12 @@ socat.log
 
 # Important: dev.sh and scripts/ directory are version controlled
 # Add specific temp scripts to ignore here if needed
+.gid/
+
+# Backups
+*.backup
+
+# Markdown documentation
+*.md
+!DEVELOPMENT.md
+!CHANGELOG.md

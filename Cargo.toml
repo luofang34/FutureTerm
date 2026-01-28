@@ -1,5 +1,8 @@
 [workspace]
 members = [
+    "crates/actor-protocol",
+    "crates/actor-runtime",
+    "crates/connection-actors",
     "crates/core-types",
     "crates/framing",
     "crates/decoders",
@@ -7,7 +10,7 @@ members = [
     "crates/transport-webserial",
     # apps/web will be a separate npm project or part of workspace if using wasm-pack extensively
     # apps/native will be a cargo project
-    "apps/native", 
+    "apps/native",
     "apps/web", "crates/analysis",
 ]
 resolver = "2"
@@ -16,6 +19,7 @@ resolver = "2"
 lto = true
 opt-level = 3
 codegen-units = 1
+debug = 0  # Strip all debug symbols from WASM bundle
 
 [profile.release.package.app-web]
 opt-level = "z"
