@@ -271,8 +271,6 @@ impl ProbeActor {
                     return Err(ActorError::Other("Interrupted during port open".into()));
                 }
             }
-
-            attempts += 1;
         }
 
         Err(ActorError::Transport(
@@ -306,12 +304,6 @@ impl ProbeActor {
         loop {
             let elapsed = js_sys::Date::now() - start;
             if elapsed > max_time {
-                // Timeout - check exit conditions
-                if buffer.len() > 10
-                    || (buffer.len() > 64 && analysis::calculate_score_8n1(&buffer) as f64 > 0.90)
-                {
-                    break;
-                }
                 break;
             }
 

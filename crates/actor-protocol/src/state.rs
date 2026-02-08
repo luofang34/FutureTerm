@@ -114,6 +114,7 @@ impl ConnectionState {
             Self::Probing
                 | Self::Connecting
                 | Self::Connected
+                | Self::Reconfiguring
                 | Self::AutoReconnecting
                 | Self::DeviceLost
         )
@@ -187,6 +188,7 @@ impl ConnectionState {
 
             // From Reconfiguring
             (Reconfiguring, Connected) => true, // Reconfig complete
+            (Reconfiguring, Disconnecting) => true, // User cancels reconfigure
             (Reconfiguring, DeviceLost) => true, // USB unplugged during reconfig
 
             // From Disconnecting

@@ -372,21 +372,6 @@ impl PortActor {
                 _ = timeout => {
                     // Timeout - read loop may be stuck
                     actor_debug!("PortActor: Timeout waiting for read loop (500ms). Proceeding.");
-
-                    // Check for potential resource leaks
-                    if let Some(transport) = &self.transport {
-                        let count = std::rc::Rc::strong_count(&transport.0);
-                        if count > 1 {
-                            #[cfg(target_arch = "wasm32")]
-                            web_sys::console::warn_1(
-                                &format!(
-                                    "Port cleanup timeout - {} outstanding references. \
-                                     Resources will be cleaned by Drop implementation.",
-                                    count
-                                ).into()
-                            );
-                        }
-                    }
                 }
             }
         } else {

@@ -186,13 +186,21 @@ impl Decoder for MavlinkDecoder {
                     self.buffer.drain(0..total_len);
                 }
                 Err(_e) => {
-                    // CRC fail or parse error?
-                    // Log the error for visibility
-                    #[cfg(target_arch = "wasm32")]
+                    #[cfg(all(debug_assertions, target_arch = "wasm32"))]
                     web_sys::console::log_1(&format!("MAVLink parse failed: {:?}", _e).into());
 
-                    // Advance 1 byte to try resync
-                    self.buffer.drain(0..1);
+                    // Skip to next magic byte candidate for O(n) resync
+                    // (instead of advancing 1 byte which is O(n^2) on adversarial input)
+                    let skip = self
+                        .buffer
+                        .get(1..)
+                        .and_then(|rest| {
+                            rest.iter()
+                                .position(|&b| b == MAVLINK_V1_MAGIC || b == MAVLINK_V2_MAGIC)
+                                .map(|pos| pos + 1)
+                        })
+                        .unwrap_or(self.buffer.len());
+                    self.buffer.drain(0..skip);
                 }
             }
         }

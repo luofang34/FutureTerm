@@ -395,37 +395,42 @@ pub fn TerminalView(
                 let selection_callback = Closure::<dyn Fn()>::new(move || {
                     let handle = TerminalHandle(term_clone.clone());
 
-                    // Enhanced debug: Check if selection exists
-                    let has_sel = handle.has_selection();
                     let sel_text = handle.get_selection();
-                    web_sys::console::log_1(
-                        &format!(
-                            "Terminal onSelectionChange fired: has_selection={}, text_length={}",
-                            has_sel,
-                            sel_text.len()
-                        )
-                        .into(),
-                    );
 
-                    // Get raw position value for debugging
-                    let raw_pos = handle.get_selection_position();
-                    web_sys::console::log_2(&"Raw selection position:".into(), &raw_pos);
+                    #[cfg(debug_assertions)]
+                    {
+                        let has_sel = handle.has_selection();
+                        web_sys::console::log_1(
+                            &format!(
+                                "Terminal onSelectionChange fired: has_selection={}, text_length={}",
+                                has_sel,
+                                sel_text.len()
+                            )
+                            .into(),
+                        );
+
+                        let raw_pos = handle.get_selection_position();
+                        web_sys::console::log_2(&"Raw selection position:".into(), &raw_pos);
+                    }
 
                     // Get selection position
                     if let Some((start_row, start_col, end_row, end_col)) =
                         handle.get_selection_position_parsed()
                     {
-                        // Debug logging with all coordinates and selected text
-                        web_sys::console::log_1(
-                            &format!(
-                                "Terminal selection: rows {}-{}, cols {}-{}, selected_text={:?}",
-                                start_row, end_row, start_col, end_col, sel_text
-                            )
-                            .into(),
-                        );
+                        #[cfg(debug_assertions)]
+                        {
+                            web_sys::console::log_1(
+                                &format!(
+                                    "Terminal selection: rows {}-{}, cols {}-{}, selected_text={:?}",
+                                    start_row, end_row, start_col, end_col, sel_text
+                                )
+                                .into(),
+                            );
+                        }
 
                         // Map Terminal position (row+col) to byte range via metadata
                         let meta = metadata_signal.get_untracked();
+                        #[cfg(debug_assertions)]
                         web_sys::console::log_1(
                             &format!("Metadata span count: {}", meta.span_count()).into(),
                         );
@@ -436,6 +441,7 @@ pub fn TerminalView(
                             end_row as usize,
                             end_col as usize,
                         ) {
+                            #[cfg(debug_assertions)]
                             web_sys::console::log_1(
                                 &format!("Mapped to bytes: {}-{}", byte_start, byte_end).into(),
                             );
@@ -453,12 +459,14 @@ pub fn TerminalView(
                             );
                             set_global_sel.set(Some(range));
                         } else {
+                            #[cfg(debug_assertions)]
                             web_sys::console::log_1(
                                 &"Failed to map terminal lines to bytes".into(),
                             );
                         }
                     } else {
                         // Selection cleared
+                        #[cfg(debug_assertions)]
                         web_sys::console::log_1(&"Selection position is None (cleared)".into());
                         set_global_sel.set(None);
                     }
@@ -485,6 +493,7 @@ pub fn TerminalView(
         create_effect(move |prev_decoration: Option<Option<Decoration>>| {
             let current_decoration: Option<Decoration> = if let Some(range) = global_sel.get() {
                 if range.source_view == SelectionSource::HexView {
+                    #[cfg(debug_assertions)]
                     web_sys::console::log_1(
                         &format!(
                             "Hex selection: bytes {}-{}",
@@ -500,6 +509,7 @@ pub fn TerminalView(
                     if let Some((start_row, start_col, end_row, end_col)) = meta
                         .bytes_to_terminal_position(range.start_byte_offset, range.end_byte_offset)
                     {
+                        #[cfg(debug_assertions)]
                         web_sys::console::log_1(
                             &format!(
                                 "Mapped to position: ({}, {}) - ({}, {})",

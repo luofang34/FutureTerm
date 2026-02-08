@@ -108,10 +108,9 @@ pub fn HexView(
                     mouseleave_callback.as_ref().unchecked_ref(),
                 );
             }
-            // Note: Callbacks remain in memory after removal from DOM.
-            // This is a known limitation with wasm-bindgen event handlers.
-            mouseup_callback.forget();
-            mouseleave_callback.forget();
+            // Closures are dropped here after event listeners are removed
+            drop(mouseup_callback);
+            drop(mouseleave_callback);
         });
     });
 
@@ -278,6 +277,7 @@ pub fn HexView(
                     let byte_count = range.end_byte_offset - range.start_byte_offset;
                     let expected_rows = byte_count.div_ceil(bpr); // Ceiling division
 
+                    #[cfg(debug_assertions)]
                     web_sys::console::log_1(
                         &format!(
                             "HexView received selection from {:?}: bytes {}-{} (count: {}), \
@@ -409,9 +409,8 @@ pub fn HexView(
                 "selectionchange",
                 callback.as_ref().unchecked_ref(),
             );
-            // Note: Callback remains in memory after removal.
-            // This is a known limitation with wasm-bindgen event handlers.
-            callback.forget();
+            // Closure is dropped here after event listener is removed
+            drop(callback);
         });
     });
 
