@@ -69,53 +69,10 @@ pub fn HexView(
         Ascii,
     }
     let (active_origin, set_active_origin) = create_signal::<Option<SelectionOrigin>>(None);
-    // Lock signal for overflow protection: When one side is active, lock the other side.
-    let (selection_lock, set_selection_lock) = create_signal::<Option<SelectionOrigin>>(None);
 
     // Track previous selection range to optimize DOM updates
     let (prev_selection, set_prev_selection) =
         create_signal::<Option<(usize, usize, SelectionSource)>>(None);
-
-    // Clear lock on global mouseup and mouseleave (handles edge case of mouse leaving window)
-    create_effect(move |_| {
-        let Some(window) = web_sys::window() else {
-            return;
-        };
-
-        let mouseup_callback = Closure::wrap(Box::new(move || {
-            set_selection_lock.set(None);
-        }) as Box<dyn FnMut()>);
-
-        let mouseleave_callback = Closure::wrap(Box::new(move || {
-            set_selection_lock.set(None);
-        }) as Box<dyn FnMut()>);
-
-        let _ = window
-            .add_event_listener_with_callback("mouseup", mouseup_callback.as_ref().unchecked_ref());
-        let _ = window.add_event_listener_with_callback(
-            "mouseleave",
-            mouseleave_callback.as_ref().unchecked_ref(),
-        );
-
-        on_cleanup(move || {
-            if let Some(w) = web_sys::window() {
-                let _ = w.remove_event_listener_with_callback(
-                    "mouseup",
-                    mouseup_callback.as_ref().unchecked_ref(),
-                );
-                let _ = w.remove_event_listener_with_callback(
-                    "mouseleave",
-                    mouseleave_callback.as_ref().unchecked_ref(),
-                );
-            }
-            // Note: Callbacks remain in memory after removal from DOM.
-            // wasm-bindgen Closure::forget() prevents the destructor from
-            // invalidating the JS function wrapper, which is required for
-            // correct cleanup in WASM event handler lifecycle.
-            mouseup_callback.forget();
-            mouseleave_callback.forget();
-        });
-    });
 
     // Row height is defined as a module-level constant
 
@@ -326,6 +283,7 @@ pub fn HexView(
                 if let Some(selection) = window.get_selection().ok().flatten() {
                     // If no valid selection, clear global selection
                     if selection.is_collapsed() {
+                        set_active_origin.set(None);
                         if let Some(set_g) = set_global {
                             set_g.set(None);
                         }
@@ -339,7 +297,6 @@ pub fn HexView(
                         let get_info = |node: web_sys::Node| -> Option<(usize, bool)> {
                             let mut curr = Some(node);
                             let mut offset_found = None;
-                            let mut row_offset = None;
                             let mut is_ascii = None;
 
                             while let Some(n) = curr {
@@ -348,13 +305,6 @@ pub fn HexView(
                                         if let Some(off) = el.dataset().get("offset") {
                                             if let Ok(val) = off.parse::<usize>() {
                                                 offset_found = Some(val);
-                                            }
-                                        }
-                                    }
-                                    if row_offset.is_none() {
-                                        if let Some(off) = el.dataset().get("row-offset") {
-                                            if let Ok(val) = off.parse::<usize>() {
-                                                row_offset = Some(val);
                                             }
                                         }
                                     }
@@ -373,24 +323,106 @@ pub fn HexView(
                                 curr = n.parent_element().map(|e| e.into());
                             }
 
-                            match (is_ascii, offset_found, row_offset) {
-                                (Some(ascii), Some(off), _) => Some((off, ascii)),
-                                (Some(ascii), None, Some(r_off)) => Some((r_off, ascii)),
+                            // Require precise byte offset — no fallback to row offset
+                            // to prevent full-row expansion when anchor/focus lands on
+                            // a container element
+                            match (is_ascii, offset_found) {
+                                (Some(ascii), Some(off)) => Some((off, ascii)),
                                 _ => None,
                             }
                         };
 
-                        let start_info = get_info(anchor);
+                        let start_info = get_info(anchor.clone());
                         let end_info = get_info(focus);
 
-                        if let (Some((start_off, start_is_ascii)), Some((end_off, _))) =
+                        if let (Some((start_off, start_is_ascii)), Some((end_off, end_is_ascii))) =
                             (start_info, end_info)
                         {
+                            // Cross-column detected. Clamp focus to the anchor's column.
+                            if start_is_ascii != end_is_ascii {
+                                let container_class = if start_is_ascii {
+                                    "ascii-container"
+                                } else {
+                                    "hex-data-container"
+                                };
+                                let selector = format!(
+                                    ".{} .hex-byte[data-offset=\"{}\"]",
+                                    container_class, end_off
+                                );
+                                if let Some(document) = window.document() {
+                                    if let Ok(Some(target_el)) = document.query_selector(&selector)
+                                    {
+                                        if let Some(text_node) = target_el.first_child() {
+                                            let focus_offset = if start_off <= end_off {
+                                                target_el
+                                                    .text_content()
+                                                    .map(|t| t.len() as u32)
+                                                    .unwrap_or(1)
+                                            } else {
+                                                0
+                                            };
+                                            let _ = selection.set_base_and_extent(
+                                                &anchor,
+                                                selection.anchor_offset(),
+                                                &text_node,
+                                                focus_offset,
+                                            );
+                                        }
+                                    }
+                                }
+
+                                // Process the clamped range inline to avoid throttle swallowing re-fired event
+                                let (min, max) = if start_off < end_off {
+                                    (start_off, end_off)
+                                } else {
+                                    (end_off, start_off)
+                                };
+                                let max_exclusive = max + 1;
+
+                                if min < max_exclusive {
+                                    set_active_origin.set(Some(if start_is_ascii {
+                                        SelectionOrigin::Ascii
+                                    } else {
+                                        SelectionOrigin::Hex
+                                    }));
+
+                                    if let Some(set_g) = set_global {
+                                        set_g.set(Some(SelectionRange::new(
+                                            min,
+                                            max_exclusive,
+                                            0,
+                                            0,
+                                            SelectionSource::HexView,
+                                        )));
+                                    }
+                                }
+                                return;
+                            }
+
                             let (min, max) = if start_off < end_off {
                                 (start_off, end_off)
                             } else {
                                 (end_off, start_off)
                             };
+
+                            // Use Range API for precise end boundary:
+                            // When endOffset == 0, the browser selection ends just before
+                            // the focus node's text content (byte not visually selected).
+                            let range_end_offset = selection
+                                .get_range_at(0)
+                                .ok()
+                                .and_then(|r| r.end_offset().ok())
+                                .unwrap_or(1);
+
+                            let max_exclusive = if range_end_offset == 0 && min < max {
+                                max
+                            } else {
+                                max + 1
+                            };
+
+                            if min >= max_exclusive {
+                                return;
+                            }
 
                             // Valid HexView selection found
                             set_active_origin.set(Some(if start_is_ascii {
@@ -402,7 +434,7 @@ pub fn HexView(
                             if let Some(set_g) = set_global {
                                 set_g.set(Some(SelectionRange::new(
                                     min,
-                                    max + 1,
+                                    max_exclusive,
                                     0,
                                     0,
                                     SelectionSource::HexView,
@@ -458,33 +490,17 @@ pub fn HexView(
                         return;
                     }
 
-                    // Clear only previously highlighted elements
-                    if let Some((prev_start, prev_end, _)) = prev {
-                        // Use more specific selector to limit scope
-                        if let Ok(elements) =
-                            document.query_selector_all(".hex-byte.bg-sync, .hex-byte.bg-term")
-                        {
-                            for i in 0..elements.length() {
-                                if let Some(el) = elements.get(i) {
-                                    if let Some(el) = el.dyn_ref::<web_sys::HtmlElement>() {
-                                        if let Some(offset_str) = el.dataset().get("offset") {
-                                            if let Ok(offset) = offset_str.parse::<usize>() {
-                                                // Only clear if outside new range
-                                                let in_new_range = range_opt
-                                                    .as_ref()
-                                                    .map(|r| r.contains_offset(offset))
-                                                    .unwrap_or(false);
-                                                if !in_new_range
-                                                    && offset >= prev_start
-                                                    && offset < prev_end
-                                                {
-                                                    let _ = el
-                                                        .class_list()
-                                                        .remove_2("bg-sync", "bg-term");
-                                                }
-                                            }
-                                        }
-                                    }
+                    // Clear all highlight classes unconditionally before reapplying.
+                    // This ensures stale classes from previous origin changes are removed
+                    // (e.g., switching from Hex→Ascii selection would leave bg-sync on
+                    // hex-column elements that overlap the new range).
+                    if let Ok(elements) =
+                        document.query_selector_all(".hex-byte.bg-sync, .hex-byte.bg-term")
+                    {
+                        for i in 0..elements.length() {
+                            if let Some(el) = elements.get(i) {
+                                if let Some(el) = el.dyn_ref::<web_sys::HtmlElement>() {
+                                    let _ = el.class_list().remove_2("bg-sync", "bg-term");
                                 }
                             }
                         }
@@ -723,11 +739,10 @@ pub fn HexView(
                  .bg-sync::selection {
                      background-color: transparent;
                  }
-                 .selection-locked {
-                     user-select: none !important;
-                 }
-                 .selection-locked * {
-                     user-select: none !important;
+                 .hex-data-container::selection,
+                 .hex-data-container > div::selection,
+                 .ascii-container::selection {
+                     background-color: transparent;
                  }"
             </style>
 
@@ -826,9 +841,10 @@ pub fn HexView(
                                 // Hex Groups (Padded)
                                 <div
                                     class="hex-data-container"
-                                    class:selection-locked=move || selection_lock.get() == Some(SelectionOrigin::Ascii)
-                                    on:mousedown=move |_| set_selection_lock.set(Some(SelectionOrigin::Hex))
-                                    style="display: flex; gap: 16px; user-select: text;"
+                                    style=move || format!(
+                                        "display: flex; gap: 16px; user-select: {};",
+                                        if active_origin.get() == Some(SelectionOrigin::Ascii) { "none" } else { "text" }
+                                    )
                                 >
                                     {
                                         let total_groups = bpr / 4;
@@ -900,9 +916,10 @@ pub fn HexView(
                                 // ASCII
                                 <div
                                     class="ascii-container"
-                                    class:selection-locked=move || selection_lock.get() == Some(SelectionOrigin::Hex)
-                                    on:mousedown=move |_| set_selection_lock.set(Some(SelectionOrigin::Ascii)) // Lock Hex when clicking ASCII
-                                    style="color: #b5cea8; white-space: pre; overflow: hidden; letter-spacing: 0; display: inline-flex; user-select: text;">
+                                    style=move || format!(
+                                        "color: #b5cea8; white-space: pre; overflow: hidden; letter-spacing: 0; display: inline-flex; user-select: {};",
+                                        if active_origin.get() == Some(SelectionOrigin::Hex) { "none" } else { "text" }
+                                    )>
                                     {
                                         // Render each ASCII character separately for selection
                                         row.bytes.iter().enumerate().map(|(idx, &b)| {
