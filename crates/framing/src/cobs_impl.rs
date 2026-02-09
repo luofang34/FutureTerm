@@ -1,6 +1,11 @@
 use crate::Framer;
 use core_types::Frame;
 
+/// Maximum buffer size for COBS framing. If the buffer exceeds this limit
+/// before a delimiter is found, the contents are emitted as a truncated frame
+/// and the buffer is cleared.
+const MAX_BUFFER_SIZE: usize = 8192;
+
 pub struct CobsFramer {
     buffer: Vec<u8>,
     timestamp_us: Option<u64>,
@@ -49,6 +54,13 @@ impl Framer for CobsFramer {
                 self.timestamp_us = None;
             } else {
                 self.buffer.push(b);
+                // Safety: emit raw buffer if it exceeds max size without a delimiter
+                if self.buffer.len() >= MAX_BUFFER_SIZE {
+                    let ts = self.timestamp_us.unwrap_or(timestamp_us);
+                    frames.push(Frame::new_rx(self.buffer.clone(), ts));
+                    self.buffer.clear();
+                    self.timestamp_us = None;
+                }
             }
         }
 
@@ -104,6 +116,18 @@ mod tests {
         assert_eq!(frames.len(), 1);
         assert_eq!(frames[0].bytes, b"World");
         // Timestamp should be start time
+        assert_eq!(frames[0].timestamp_us, 100);
+    }
+
+    #[test]
+    fn test_cobs_buffer_overflow() {
+        let mut framer = CobsFramer::new();
+        // Push data exceeding MAX_BUFFER_SIZE without any 0x00 delimiter
+        let data = vec![0x42; MAX_BUFFER_SIZE + 100];
+        let frames = framer.push(&data, 100);
+        // Should emit at least one frame when buffer hits the limit
+        assert!(!frames.is_empty());
+        assert_eq!(frames[0].bytes.len(), MAX_BUFFER_SIZE);
         assert_eq!(frames[0].timestamp_us, 100);
     }
 }

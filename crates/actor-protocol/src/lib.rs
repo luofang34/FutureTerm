@@ -11,13 +11,12 @@
 //!
 //! - **UiCommand**: Messages from UI → Actor System
 //! - **SystemEvent**: Messages from Actor System → UI
-//! - **InternalMessage**: Messages between actors (not serialized)
 //! - **ConnectionState**: FSM state machine (pure logic, no side effects)
 //!
 //! ## Message Flow
 //!
 //! ```text
-//! UI → UiCommand → StateActor → InternalMessage → Other Actors
+//! UI → UiCommand → StateActor → ActorMessages → Other Actors
 //!                      ↓
 //!                 SystemEvent → UI
 //! ```
@@ -36,7 +35,6 @@ pub mod state;
 
 pub use errors::ActorError;
 pub use messages::{
-    FlowControl, InternalMessage, ParityMode, ProbeResult, SerialConfig, SerialPortInfo,
-    SystemEvent, UiCommand,
+    FlowControl, ParityMode, ProbeResult, SerialConfig, SerialPortInfo, SystemEvent, UiCommand,
 };
 pub use state::{ConnectionState, LOCK_FLAG, STATE_MASK};

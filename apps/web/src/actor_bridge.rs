@@ -472,29 +472,6 @@ impl ActorBridge {
         None
     }
 
-    // === Auto-Reconnect (handled by ReconnectActor) ===
-
-    /// Setup auto-reconnect (compatibility method - actors handle this automatically)
-    #[allow(clippy::too_many_arguments)] // API compatibility with ConnectionManager
-    pub fn setup_auto_reconnect(
-        &self,
-        _last_vid: Signal<Option<u16>>,
-        _last_pid: Signal<Option<u16>>,
-        _set_last_vid: WriteSignal<Option<u16>>,
-        _set_last_pid: WriteSignal<Option<u16>>,
-        _baud: Signal<u32>,
-        _detected_baud: ReadSignal<u32>,
-        _framing: Signal<String>,
-    ) {
-        // ReconnectActor handles this automatically via USB events
-        // This method exists only for API compatibility with ConnectionManager
-    }
-
-    /// Clear auto-reconnect device
-    pub fn clear_auto_reconnect_device(&self) {
-        // Handled by ReconnectActor
-    }
-
     // === Activity Indicators ===
 
     /// Trigger RX activity indicator

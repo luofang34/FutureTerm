@@ -54,14 +54,17 @@ pub fn MavlinkView(
             // With cursor=0, we process new events cleanly without rollover spam.
             set_processed_cursor.set(0);
 
-            if is_connected {
-                web_sys::console::log_1(
-                    &"MAVLink: Cleared state and reset cursor to 0 on (re)connection".into(),
-                );
-            } else {
-                web_sys::console::log_1(
-                    &"MAVLink: Cleared state and reset cursor to 0 on disconnection".into(),
-                );
+            #[cfg(debug_assertions)]
+            {
+                if is_connected {
+                    web_sys::console::log_1(
+                        &"MAVLink: Cleared state and reset cursor to 0 on (re)connection".into(),
+                    );
+                } else {
+                    web_sys::console::log_1(
+                        &"MAVLink: Cleared state and reset cursor to 0 on disconnection".into(),
+                    );
+                }
             }
         }
 
@@ -87,6 +90,7 @@ pub fn MavlinkView(
             let timestamp_rollover = last_ts > 0 && latest_event_ts < last_ts / 2;
 
             if timestamp_rollover {
+                #[cfg(debug_assertions)]
                 web_sys::console::log_1(
                     &format!(
                         "MAVLink: Timestamp rollover detected (cursor={}, latest={}). Resetting \

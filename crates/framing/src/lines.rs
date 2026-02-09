@@ -1,6 +1,11 @@
 use crate::Framer;
 use core_types::Frame;
 
+/// Maximum buffer size for line framing. If the buffer exceeds this limit
+/// before a newline is found, the contents are emitted as a truncated line
+/// and the buffer is cleared.
+const MAX_BUFFER_SIZE: usize = 16384;
+
 /// Buffers input and emits a frame whenever a newline is encountered.
 /// Supports configurable delimiters, defaulting to \n.
 /// NOTE: Dealing with mixed line endings (CRLF vs LF) in a streaming fashion
@@ -40,6 +45,16 @@ impl Framer for LineFramer {
 
         for &b in bytes {
             self.buffer.push(b);
+
+            // Safety: emit buffer as a truncated line if it exceeds max size
+            if self.buffer.len() >= MAX_BUFFER_SIZE && b != b'\n' {
+                let ts = self.start_timestamp_us.unwrap_or(timestamp_us);
+                let frame_bytes = self.buffer.clone();
+                frames.push(Frame::new_rx(frame_bytes, ts));
+                self.buffer.clear();
+                self.start_timestamp_us = None;
+            }
+
             if b == b'\n' {
                 // Determine timestamp: use the start time of this line
                 let ts = self.start_timestamp_us.unwrap_or(timestamp_us);
@@ -165,5 +180,17 @@ mod tests {
         let f2 = framer.push(b"\n", 200);
         assert_eq!(f2.len(), 1);
         assert_eq!(f2[0].bytes, b"NoNewline\n");
+    }
+
+    #[test]
+    fn test_lines_buffer_overflow() {
+        let mut framer = LineFramer::new();
+        // Push data exceeding MAX_BUFFER_SIZE without any newline
+        let data = vec![b'A'; MAX_BUFFER_SIZE + 100];
+        let frames = framer.push(&data, 100);
+        // Should emit at least one frame when buffer hits the limit
+        assert!(!frames.is_empty());
+        assert_eq!(frames[0].bytes.len(), MAX_BUFFER_SIZE);
+        assert_eq!(frames[0].timestamp_us, 100);
     }
 }

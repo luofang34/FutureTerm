@@ -411,7 +411,7 @@ impl TerminalMetadata {
         );
 
         if self.spans.is_empty() {
-            #[cfg(target_arch = "wasm32")]
+            #[cfg(all(debug_assertions, target_arch = "wasm32"))]
             web_sys::console::log_1(&"No spans available".into());
             return None;
         }

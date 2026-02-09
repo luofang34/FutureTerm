@@ -253,6 +253,7 @@ pub fn App() -> impl IntoView {
                         }
                         WorkerToUi::AnalyzeResult { baud_rate, score } => {
                             // Received analysis from worker (if we used worker mode)
+                            #[cfg(debug_assertions)]
                             web_sys::console::log_1(
                                 &format!("Worker Analysis: Baud {} Score {:.2}", baud_rate, score)
                                     .into(),
@@ -468,6 +469,7 @@ pub fn App() -> impl IntoView {
                 if final_baud == 0 || current_framing == "Auto" {
                     manager.set_status.set("Auto-Detecting Config...".into());
 
+                    #[cfg(debug_assertions)]
                     web_sys::console::log_1(
                         &format!("Smart Port Check: VID={:?} PID={:?}", vid, pid).into(),
                     );
@@ -479,18 +481,6 @@ pub fn App() -> impl IntoView {
                             .connect(port, final_baud, &current_framing)
                             .await;
                     });
-
-                    // --- Auto-Reconnect Listeners ---
-                    // Delegated to ConnectionManager
-                    manager.setup_auto_reconnect(
-                        last_vid.into(),
-                        last_pid.into(),
-                        set_last_vid,
-                        set_last_pid,
-                        baud_rate.into(),
-                        detected_baud,
-                        framing.into(),
-                    );
                 } else {
                     // Manual baud rate connection
                     let manager_conn = manager.clone();
@@ -499,17 +489,6 @@ pub fn App() -> impl IntoView {
                             .connect(port, final_baud, &current_framing)
                             .await;
                     });
-
-                    // --- Auto-Reconnect Listeners ---
-                    manager.setup_auto_reconnect(
-                        last_vid.into(),
-                        last_pid.into(),
-                        set_last_vid,
-                        set_last_pid,
-                        baud_rate.into(),
-                        detected_baud,
-                        framing.into(),
-                    );
                 }
             }
         });
@@ -572,6 +551,7 @@ pub fn App() -> impl IntoView {
                 let active_manager = manager_tx.clone();
                 spawn_local(async move {
                     if let Err(e) = active_manager.write(&bytes).await {
+                        #[cfg(debug_assertions)]
                         web_sys::console::log_1(&format!("TX Error: {:?}", e).into());
                     }
                 });

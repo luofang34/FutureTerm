@@ -431,9 +431,7 @@ name = "dec-mavlink"
 version = "0.1.0"
 dependencies = [
  "core-types",
- "embedded-hal",
  "mavlink 0.12.2",
- "nb 1.1.0",
  "web-sys",
 ]
 

@@ -128,58 +128,6 @@ pub enum SystemEvent {
     DecoderChanged { id: String },
 }
 
-/// Internal messages between actors (not serialized, only used in-process)
-///
-/// **NOTE**: This enum is not actively used in the current implementation.
-/// The system uses actor-specific message types (StateMessage, PortMessage, etc.)
-/// defined in actor-runtime instead. This is kept for API compatibility.
-#[derive(Debug, Clone)]
-pub enum InternalMessage {
-    // StateActor → PortActor
-    StartConnection {
-        port: SerialPortInfo,
-        config: SerialConfig,
-    },
-    StopConnection,
-
-    // PortActor → StateActor
-    ConnectionEstablished,
-    ConnectionFailed {
-        reason: String,
-    },
-    ConnectionLost,
-
-    // ProbeActor → StateActor
-    ProbeComplete {
-        baud: u32,
-        framing: String,
-        protocol: Option<String>,
-        initial_data: Vec<u8>,
-    },
-    ProbeFailed {
-        reason: String,
-    },
-
-    // ReconnectActor → StateActor
-    DeviceReappeared {
-        port: SerialPortInfo,
-    },
-
-    // StateActor → ProbeActor
-    StartProbe {
-        port: SerialPortInfo,
-    },
-    AbortProbe,
-
-    // StateActor → ReconnectActor
-    RegisterDevice {
-        vid: u16,
-        pid: u16,
-        config: SerialConfig,
-    },
-    ClearDevice,
-}
-
 /// Result of auto-detection probing
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct ProbeResult {

@@ -564,15 +564,18 @@ impl StateActor {
     #[cfg(target_arch = "wasm32")]
     async fn complete_reconfigure(&mut self) -> Result<(), ActorError> {
         // Extract stored parameters
-        let baud = self.pending_reconfigure_baud.take().unwrap_or(0);
+        let baud = self
+            .pending_reconfigure_baud
+            .take()
+            .ok_or_else(|| ActorError::Other("Missing reconfigure baud parameter".into()))?;
         let framing = self
             .pending_reconfigure_framing
             .take()
-            .unwrap_or_else(|| "8N1".to_string());
+            .ok_or_else(|| ActorError::Other("Missing reconfigure framing parameter".into()))?;
         let active_framing = self
             .pending_reconfigure_active_framing
             .take()
-            .unwrap_or_else(|| "8N1".to_string());
+            .unwrap_or_else(|| "8N1".into());
 
         // Normalize framing:
         // - If user selected "Auto", use previously detected active_framing
@@ -933,6 +936,7 @@ impl Actor for StateActor {
                 match self.state {
                     ConnectionState::Probing
                     | ConnectionState::Connecting
+                    | ConnectionState::Reconfiguring
                     | ConnectionState::AutoReconnecting => {
                         // Failed to establish connection - go to Disconnected (CRITICAL operations)
                         self.send_critical_port(PortMessage::Close)?;
