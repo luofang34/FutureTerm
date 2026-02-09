@@ -108,9 +108,12 @@ pub fn HexView(
                     mouseleave_callback.as_ref().unchecked_ref(),
                 );
             }
-            // Closures are dropped here after event listeners are removed
-            drop(mouseup_callback);
-            drop(mouseleave_callback);
+            // Note: Callbacks remain in memory after removal from DOM.
+            // wasm-bindgen Closure::forget() prevents the destructor from
+            // invalidating the JS function wrapper, which is required for
+            // correct cleanup in WASM event handler lifecycle.
+            mouseup_callback.forget();
+            mouseleave_callback.forget();
         });
     });
 
@@ -409,8 +412,11 @@ pub fn HexView(
                 "selectionchange",
                 callback.as_ref().unchecked_ref(),
             );
-            // Closure is dropped here after event listener is removed
-            drop(callback);
+            // Note: Callback remains in memory after removal.
+            // wasm-bindgen Closure::forget() prevents the destructor from
+            // invalidating the JS function wrapper, which is required for
+            // correct cleanup in WASM event handler lifecycle.
+            callback.forget();
         });
     });
 
