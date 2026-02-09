@@ -197,19 +197,20 @@ pub fn HexView(
     // Process raw events into rows based on current bytes_per_row
     let all_hex_rows = create_memo(move |_| {
         let mut rows = Vec::new();
-        let mut current_offset = 0;
         let bpr = bytes_per_row.get();
 
-        // Process all events from raw log (cursor used for tail-follow, not filtering)
-        for raw_event in raw_log.get() {
-            let bytes = &raw_event.bytes;
-            for chunk in bytes.chunks(bpr) {
-                rows.push(HexRow {
-                    offset: current_offset,
-                    bytes: chunk.to_vec(),
-                });
-                current_offset += chunk.len();
-            }
+        // Accumulate all bytes across events, then chunk uniformly
+        let all_bytes: Vec<u8> = raw_log
+            .get()
+            .iter()
+            .flat_map(|ev| ev.bytes.iter().copied())
+            .collect();
+
+        for (i, chunk) in all_bytes.chunks(bpr).enumerate() {
+            rows.push(HexRow {
+                offset: i * bpr,
+                bytes: chunk.to_vec(),
+            });
         }
         rows
     });
@@ -337,31 +338,46 @@ pub fn HexView(
                     if let (Some(anchor), Some(focus)) = (anchor_node, focus_node) {
                         let get_info = |node: web_sys::Node| -> Option<(usize, bool)> {
                             let mut curr = Some(node);
-                            // Cache element lookups for performance
                             let mut offset_found = None;
-                            let mut is_ascii_found = None;
+                            let mut row_offset = None;
+                            let mut is_ascii = None;
 
                             while let Some(n) = curr {
                                 if let Some(el) = n.dyn_ref::<web_sys::HtmlElement>() {
                                     if offset_found.is_none() {
-                                        if let Some(bg) = el.dataset().get("offset") {
-                                            if let Ok(offset) = bg.parse::<usize>() {
-                                                offset_found = Some(offset);
+                                        if let Some(off) = el.dataset().get("offset") {
+                                            if let Ok(val) = off.parse::<usize>() {
+                                                offset_found = Some(val);
                                             }
                                         }
                                     }
-                                    if is_ascii_found.is_none()
-                                        && el.class_list().contains("ascii-char")
-                                    {
-                                        is_ascii_found = Some(true);
+                                    if row_offset.is_none() {
+                                        if let Some(off) = el.dataset().get("row-offset") {
+                                            if let Ok(val) = off.parse::<usize>() {
+                                                row_offset = Some(val);
+                                            }
+                                        }
                                     }
-                                    if offset_found.is_some() && is_ascii_found.is_some() {
+                                    // Check container class for reliable column detection
+                                    if is_ascii.is_none() {
+                                        if el.class_list().contains("ascii-container") {
+                                            is_ascii = Some(true);
+                                        } else if el.class_list().contains("hex-data-container") {
+                                            is_ascii = Some(false);
+                                        }
+                                    }
+                                    if offset_found.is_some() && is_ascii.is_some() {
                                         break;
                                     }
                                 }
                                 curr = n.parent_element().map(|e| e.into());
                             }
-                            offset_found.map(|off| (off, is_ascii_found.unwrap_or(false)))
+
+                            match (is_ascii, offset_found, row_offset) {
+                                (Some(ascii), Some(off), _) => Some((off, ascii)),
+                                (Some(ascii), None, Some(r_off)) => Some((r_off, ascii)),
+                                _ => None,
+                            }
                         };
 
                         let start_info = get_info(anchor);
@@ -696,13 +712,16 @@ pub fn HexView(
                      padding: 0;
                  }
                  .bg-sync {
-                     background-color: rgba(80, 150, 250, 0.4);
+                     background-color: rgba(80, 150, 250, 0.35);
                  }
                  .bg-term {
                      background-color: rgba(86, 156, 214, 0.3);
                  }
                  .hex-byte::selection, .ascii-char::selection {
                      background-color: rgba(80, 150, 250, 0.4);
+                 }
+                 .bg-sync::selection {
+                     background-color: transparent;
                  }
                  .selection-locked {
                      user-select: none !important;
@@ -823,15 +842,25 @@ pub fn HexView(
                                             let bytes_for_group = group.clone();
                                             let _group_len = bytes_for_group.len();
                                             let byte_views = (0..4).map(|byte_idx| {
+                                                let has_data = bytes_for_group.get(byte_idx).is_some();
                                                 let byte_offset = offset + (group_idx * 4) + byte_idx;
                                                 let hex_str = bytes_for_group.get(byte_idx)
                                                     .map(|b| format!("{:02X}", b))
-                                                    .unwrap_or_else(|| "  ".to_string());
+                                                    .unwrap_or_else(|| "  ".into());
+
+                                                // Only set data-offset for real bytes, not padding
+                                                let offset_attr = if has_data {
+                                                    Some(byte_offset.to_string())
+                                                } else {
+                                                    None
+                                                };
 
                                                 view! {
                                                     <span
                                                         class="hex-byte"
-                                                        data-offset={byte_offset.to_string()}
+                                                        class:hex-pad=move || !has_data
+                                                        data-offset=offset_attr
+                                                        style=if has_data { "" } else { "user-select: none;" }
                                                     >
                                                         {hex_str}
                                                     </span>
@@ -866,7 +895,7 @@ pub fn HexView(
                                 </div>
 
                                 // Separator
-                                <div style="background: rgba(255, 255, 255, 0.2); width: 1px; height: 100%;"></div>
+                                <div style="background: rgba(255, 255, 255, 0.2); width: 1px; height: 100%; user-select: none;"></div>
 
                                 // ASCII
                                 <div

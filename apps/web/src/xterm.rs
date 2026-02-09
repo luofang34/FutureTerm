@@ -67,6 +67,9 @@ extern "C" {
     #[wasm_bindgen(method, js_name = selectLines)]
     pub fn select_lines(this: &Terminal, start: u32, end: u32);
 
+    #[wasm_bindgen(method, getter)]
+    pub fn cols(this: &Terminal) -> u32;
+
     #[wasm_bindgen(method, js_name = hasSelection)]
     pub fn has_selection(this: &Terminal) -> bool;
 
@@ -291,6 +294,9 @@ pub fn TerminalView(
     let (internal_term_handle, set_internal_term_handle) =
         create_signal::<Option<TerminalHandle>>(None);
 
+    // Guard flag to prevent feedback loop when hex view sets terminal selection programmatically
+    let (is_programmatic_select, set_is_programmatic_select) = create_signal(false);
+
     let on_mount_clone = on_mount;
     let on_terminal_ready_clone = on_terminal_ready;
 
@@ -393,6 +399,12 @@ pub fn TerminalView(
             {
                 let term_clone = term.clone();
                 let selection_callback = Closure::<dyn Fn()>::new(move || {
+                    // Skip selection changes triggered by programmatic hex → terminal sync
+                    if is_programmatic_select.get_untracked() {
+                        set_is_programmatic_select.set(false);
+                        return;
+                    }
+
                     let handle = TerminalHandle(term_clone.clone());
 
                     let sel_text = handle.get_selection();
@@ -518,15 +530,33 @@ pub fn TerminalView(
                             .into(),
                         );
 
-                        let start_u32 = start_row as u32;
-                        let end_u32 = end_row as u32;
+                        // Set guard before programmatic selection to prevent feedback loop
+                        set_is_programmatic_select.set(true);
 
-                        term_handle.0.select_lines(start_u32, end_u32);
+                        // Use column-precise select() instead of select_lines()
+                        // length = (delta_rows * cols) + end_col - start_col
+                        // Evaluation order (left-to-right) ensures no usize underflow
+                        let cols = term_handle.0.cols() as usize;
+                        if cols > 0 {
+                            let length = (end_row - start_row) * cols + end_col - start_col;
+                            if length > 0 {
+                                term_handle.0.select(
+                                    start_col as u32,
+                                    start_row as u32,
+                                    length as u32,
+                                );
+                            }
+                        }
                     }
                 }
 
                 None
             } else {
+                // Selection cleared, remove terminal programmatic highlight
+                if let Some(term_handle) = internal_term_handle.get() {
+                    set_is_programmatic_select.set(true);
+                    term_handle.0.clear_selection();
+                }
                 None
             };
 
