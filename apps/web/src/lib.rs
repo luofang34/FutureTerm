@@ -419,35 +419,10 @@ pub fn App() -> impl IntoView {
 
                 let current_framing = framing.get_untracked();
 
-                // Determine if we should auto-detect baud rate
-                let stored_vid = last_vid.get_untracked();
-                let stored_pid = last_pid.get_untracked();
-                let device_changed = stored_vid != vid || stored_pid != pid;
-                let fresh_session = stored_vid.is_none() || stored_pid.is_none();
-
-                // Auto-detect baud when:
-                // 1. Fresh session (no stored device)
-                // 2. Device swapped (different VID/PID)
-                // 3. User explicitly set baud=0 in UI
-                let final_baud = if fresh_session || device_changed {
-                    #[cfg(debug_assertions)]
-                    if fresh_session {
-                        web_sys::console::log_1(
-                            &"DEBUG: Fresh session detected, will auto-detect baud rate".into(),
-                        );
-                    } else {
-                        web_sys::console::log_1(
-                            &format!(
-                                "DEBUG: Device changed (stored {:04X?}:{:04X?}, selected {:04X?}:{:04X?}), will auto-detect baud",
-                                stored_vid, stored_pid, vid, pid
-                            )
-                            .into(),
-                        );
-                    }
-                    0 // Auto-detect
-                } else {
-                    current_baud // Use stored/UI baud
-                };
+                // Use the baud rate the user selected in the dropdown.
+                // baud_rate=0 means "Auto Baudrate" -> actor system will probe.
+                // Any non-zero value means the user explicitly chose a baud rate.
+                let final_baud = current_baud;
 
                 // Cache VID/PID for auto-reconnect (ALWAYS, regardless of auto-detect)
                 set_last_vid.set(vid);
@@ -464,8 +439,6 @@ pub fn App() -> impl IntoView {
                     }
                 }
 
-                // Resolve Auto to something concrete if needed, but Manager handles it now.
-                // if current_baud == 0 { final_baud = 115200; } // REMOVED (Regression Fix)
                 if final_baud == 0 || current_framing == "Auto" {
                     manager.set_status.set("Auto-Detecting Config...".into());
 
@@ -473,23 +446,14 @@ pub fn App() -> impl IntoView {
                     web_sys::console::log_1(
                         &format!("Smart Port Check: VID={:?} PID={:?}", vid, pid).into(),
                     );
-
-                    let manager_conn = manager.clone();
-                    spawn_local(async move {
-                        // ActorBridge handles detection if baud == 0
-                        manager_conn
-                            .connect(port, final_baud, &current_framing)
-                            .await;
-                    });
-                } else {
-                    // Manual baud rate connection
-                    let manager_conn = manager.clone();
-                    spawn_local(async move {
-                        manager_conn
-                            .connect(port, final_baud, &current_framing)
-                            .await;
-                    });
                 }
+
+                let manager_conn = manager.clone();
+                spawn_local(async move {
+                    manager_conn
+                        .connect(port, final_baud, &current_framing)
+                        .await;
+                });
             }
         });
     };
