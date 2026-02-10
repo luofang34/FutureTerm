@@ -13,14 +13,23 @@ const AUTO_SCROLL_THRESHOLD: f64 = 100.0;
 /// Number of buffer rows to prevent white flashes during scroll
 const SCROLL_BUFFER_ROWS: usize = 5;
 
-// Responsive layout breakpoints
+// Responsive layout breakpoints (with 30px hysteresis dead zones)
 /// Minimum width in pixels for 32-byte row layout
 const WIDE_LAYOUT_MIN_WIDTH: f64 = 1150.0;
-
-/// Width hysteresis threshold to prevent flickering
+/// Width below which we switch from 32 to 16 bytes/row
 const WIDE_LAYOUT_HYSTERESIS: f64 = 1120.0;
 
-/// Represents a single hex dump row (16 or 32 bytes)
+/// Minimum width in pixels for 16-byte row layout
+const MEDIUM_LAYOUT_MIN_WIDTH: f64 = 650.0;
+/// Width below which we switch from 16 to 8 bytes/row
+const MEDIUM_LAYOUT_HYSTERESIS: f64 = 620.0;
+
+/// Minimum width in pixels for 8-byte row layout
+const NARROW_LAYOUT_MIN_WIDTH: f64 = 400.0;
+/// Width below which we switch from 8 to 4 bytes/row
+const NARROW_LAYOUT_HYSTERESIS: f64 = 370.0;
+
+/// Represents a single hex dump row (4, 8, 16, or 32 bytes)
 #[derive(Clone, Debug, PartialEq)]
 struct HexRow {
     offset: usize,
@@ -87,11 +96,14 @@ pub fn HexView(
             let initial_height = container.client_height() as f64;
             set_h.set(initial_height);
 
-            // 32 bytes needs ~1150px. 16 bytes needs ~700px.
             if initial_width >= WIDE_LAYOUT_MIN_WIDTH {
                 set_bytes_per_row.set(32);
-            } else {
+            } else if initial_width >= MEDIUM_LAYOUT_MIN_WIDTH {
                 set_bytes_per_row.set(16);
+            } else if initial_width >= NARROW_LAYOUT_MIN_WIDTH {
+                set_bytes_per_row.set(8);
+            } else {
+                set_bytes_per_row.set(4);
             }
 
             let callback = Closure::wrap(Box::new(move |entries: js_sys::Array| {
@@ -105,11 +117,18 @@ pub fn HexView(
                         // Use try_set to avoid warnings when signals are disposed
                         let _ = set_h.try_set(height);
 
-                        // Hysteresis to prevent flickering
+                        // Hysteresis to prevent flickering at breakpoints
                         if width >= WIDE_LAYOUT_MIN_WIDTH {
                             let _ = set_bpr.try_set(32);
-                        } else if width < WIDE_LAYOUT_HYSTERESIS {
+                        } else if (MEDIUM_LAYOUT_MIN_WIDTH..WIDE_LAYOUT_HYSTERESIS).contains(&width)
+                        {
                             let _ = set_bpr.try_set(16);
+                        } else if (NARROW_LAYOUT_MIN_WIDTH..MEDIUM_LAYOUT_HYSTERESIS)
+                            .contains(&width)
+                        {
+                            let _ = set_bpr.try_set(8);
+                        } else if width < NARROW_LAYOUT_HYSTERESIS {
+                            let _ = set_bpr.try_set(4);
                         }
                     }
                 }
