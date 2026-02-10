@@ -280,6 +280,47 @@ fn fit_terminal(addon: &JsValue) {
     }
 }
 
+const MIN_TERMINAL_COLS: u32 = 80;
+const DEFAULT_FONT_SIZE: f64 = 14.0;
+const MIN_FONT_SIZE: f64 = 6.0;
+
+/// Fit terminal, scaling font size down on narrow screens to maintain minimum columns.
+/// On wider screens, restores the default font size if it was previously scaled down.
+fn fit_terminal_with_scaling(addon: &JsValue, term: &Terminal) {
+    // First pass: fit with current font size
+    fit_terminal(addon);
+
+    let cols = term.cols();
+
+    if cols < MIN_TERMINAL_COLS && cols > 0 {
+        // Container too narrow for 80 cols at current font; scale down
+        let new_size =
+            (DEFAULT_FONT_SIZE * (cols as f64 / MIN_TERMINAL_COLS as f64)).max(MIN_FONT_SIZE);
+
+        if let Ok(options) = js_sys::Reflect::get(term, &"options".into()) {
+            let _ = js_sys::Reflect::set(&options, &"fontSize".into(), &new_size.into());
+        }
+        // Re-fit with smaller font to actually get >= 80 cols
+        fit_terminal(addon);
+    } else if cols >= MIN_TERMINAL_COLS {
+        // Enough room; restore default font if it was scaled down
+        if let Ok(options) = js_sys::Reflect::get(term, &"options".into()) {
+            if let Ok(current_size_val) = js_sys::Reflect::get(&options, &"fontSize".into()) {
+                if let Some(current_size) = current_size_val.as_f64() {
+                    if (current_size - DEFAULT_FONT_SIZE).abs() > 0.01 {
+                        let _ = js_sys::Reflect::set(
+                            &options,
+                            &"fontSize".into(),
+                            &DEFAULT_FONT_SIZE.into(),
+                        );
+                        fit_terminal(addon);
+                    }
+                }
+            }
+        }
+    }
+}
+
 #[component]
 pub fn TerminalView(
     #[prop(optional)] on_mount: Option<Callback<()>>,
@@ -289,6 +330,7 @@ pub fn TerminalView(
     #[prop(optional)] set_global_selection: Option<WriteSignal<Option<SelectionRange>>>,
 ) -> impl IntoView {
     let div_ref = create_node_ref::<html::Div>();
+    let outer_ref = create_node_ref::<html::Div>();
 
     // Internal signal to share terminal handle with other effects
     let (internal_term_handle, set_internal_term_handle) =
@@ -350,8 +392,9 @@ pub fn TerminalView(
 
             // Defer fit() to ensure layout is ready
             if let Some(fa) = fit_addon_instance {
-                // Initial deferred fit
+                // Initial deferred fit with scaling
                 let fa_clone1 = fa.clone();
+                let term_clone1 = term.clone();
                 wasm_bindgen_futures::spawn_local(async move {
                     let _ =
                         wasm_bindgen_futures::JsFuture::from(js_sys::Promise::new(&mut |r, _| {
@@ -361,32 +404,42 @@ pub fn TerminalView(
                             }
                         }))
                         .await;
-                    fit_terminal(&fa_clone1);
+                    fit_terminal_with_scaling(&fa_clone1, &term_clone1);
                 });
 
-                // Add resize listener
-                if let Some(window) = web_sys::window() {
+                // Setup ResizeObserver on outer container div for re-fit on visibility/size changes
+                if let Some(outer_div) = outer_ref.get() {
                     let fa_clone2 = fa.clone();
-                    let on_resize = Closure::wrap(Box::new(move || {
-                        fit_terminal(&fa_clone2);
-                    }) as Box<dyn FnMut()>);
+                    let term_clone2 = term.clone();
 
-                    let _ = window.add_event_listener_with_callback(
-                        "resize",
-                        on_resize.as_ref().unchecked_ref(),
-                    );
-
-                    // Cleanup listener when scope is dropped
-                    on_cleanup(move || {
-                        // Note: We need window here again.
-                        // To be perfectly safe we should clone window or look it up.
-                        if let Some(w) = web_sys::window() {
-                            let _ = w.remove_event_listener_with_callback(
-                                "resize",
-                                on_resize.as_ref().unchecked_ref(),
-                            );
+                    let callback = Closure::wrap(Box::new(move |entries: js_sys::Array| {
+                        // Check that container has real dimensions before fitting.
+                        // When parent is display:none, ResizeObserver fires with 0x0
+                        // and calling fit() on a zero-size container corrupts xterm state.
+                        for entry in entries.iter() {
+                            if let Ok(entry) = entry.dyn_into::<web_sys::ResizeObserverEntry>() {
+                                let rect = entry.content_rect();
+                                if rect.width() > 0.0 && rect.height() > 0.0 {
+                                    fit_terminal_with_scaling(&fa_clone2, &term_clone2);
+                                }
+                            }
                         }
-                    });
+                    })
+                        as Box<dyn FnMut(js_sys::Array)>);
+
+                    if let Ok(observer) =
+                        web_sys::ResizeObserver::new(callback.as_ref().unchecked_ref())
+                    {
+                        observer.observe(&outer_div);
+
+                        let observer_clone = observer.clone();
+                        on_cleanup(move || {
+                            observer_clone.disconnect();
+                        });
+
+                        // Intentionally keep callback alive for observer lifetime
+                        callback.forget();
+                    }
                 }
             }
 
@@ -570,7 +623,7 @@ pub fn TerminalView(
     }
 
     view! {
-        <div style="width: 100%; height: 100%; background: #191919; padding: 10px 10px 0 10px; box-sizing: border-box; position: relative;">
+        <div _ref=outer_ref style="width: 100%; height: 100%; background: #191919; padding: 10px 10px 0 10px; box-sizing: border-box; position: relative;">
             <div _ref=div_ref style="width: 100%; height: 100%; overflow: hidden;" />
         </div>
     }
