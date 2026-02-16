@@ -372,11 +372,71 @@ pub fn App() -> impl IntoView {
             let nav = window.navigator();
             let serial = nav.serial();
 
+            // Phase 3: WebSocket fallback for Safari/Firefox
             if serial.is_undefined() {
+                // WebSerial not available - try WebSocket bridge
                 manager
                     .set_status
-                    .set("Error: WebSerial not supported.".into());
-                return;
+                    .set("WebSerial not available, trying bridge...".into());
+
+                // Try direct WebSocket connection first (daemon already running)
+                let ws_url = "wss://127.0.0.1:9876";
+                let mut ws_transport = transport_websocket::WebSocketTransport::new();
+
+                match ws_transport.connect(ws_url).await {
+                    Ok(_) => {
+                        // Successfully connected to bridge daemon
+                        manager.set_status.set("Connected to bridge daemon".into());
+                        // TODO: Send serial port list request to daemon
+                        // For now, show error requiring manual setup
+                        manager.set_status.set(
+                            "Bridge connected. Manual setup required: daemon must be running."
+                                .into(),
+                        );
+                        return;
+                    }
+                    Err(_) => {
+                        // Daemon not running - try to launch via URL scheme
+                        manager.set_status.set("Launching bridge helper...".into());
+
+                        // Trigger futureterm://launch?port=9876
+                        let launch_url = "futureterm://launch?port=9876";
+                        match window.location().set_href(launch_url) {
+                            Ok(_) => {
+                                // Wait 200ms for daemon to start
+                                gloo_timers::future::TimeoutFuture::new(200).await;
+
+                                // Retry WebSocket connection
+                                match ws_transport.connect(ws_url).await {
+                                    Ok(_) => {
+                                        manager
+                                            .set_status
+                                            .set("Bridge launched successfully".into());
+                                        // TODO: Send serial port list request
+                                        manager
+                                            .set_status
+                                            .set("Bridge ready. Manual setup required.".into());
+                                        return;
+                                    }
+                                    Err(_) => {
+                                        // Failed to connect after launch
+                                        manager.set_status.set(
+                                            "Bridge launch failed. Please install FutureTerm helper from https://futureterm.com/safari-helper".into()
+                                        );
+                                        return;
+                                    }
+                                }
+                            }
+                            Err(_) => {
+                                // URL scheme not registered or user cancelled
+                                manager.set_status.set(
+                                    "Bridge not installed. Download from https://futureterm.com/safari-helper".into()
+                                );
+                                return;
+                            }
+                        }
+                    }
+                }
             }
 
             let mut final_port: Option<web_sys::SerialPort> = None;
