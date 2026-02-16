@@ -20,13 +20,14 @@ impl SerialManager {
 
     /// List available serial ports
     pub fn list_ports() -> Result<Vec<PortInfo>, String> {
-        let ports = tokio_serial::available_ports()
-            .map_err(|e| format!("Failed to list ports: {}", e))?;
+        let ports =
+            tokio_serial::available_ports().map_err(|e| format!("Failed to list ports: {}", e))?;
 
         Ok(ports
             .into_iter()
             .map(|p| {
-                let (port_type, vid, pid, serial_number, manufacturer, product) = match &p.port_type {
+                let (port_type, vid, pid, serial_number, manufacturer, product) = match &p.port_type
+                {
                     tokio_serial::SerialPortType::UsbPort(info) => (
                         PortType::UsbSerial,
                         Some(info.vid),
@@ -93,7 +94,13 @@ impl SerialManager {
                         break;
                     }
                     Ok(n) => {
-                        let data = buffer[..n].to_vec();
+                        let data = match buffer.get(..n) {
+                            Some(slice) => slice.to_vec(),
+                            None => {
+                                eprintln!("Buffer slice error: invalid range 0..{}", n);
+                                break;
+                            }
+                        };
                         if data_tx.send(data).is_err() {
                             eprintln!("Data channel closed, stopping read task");
                             break;
@@ -115,10 +122,7 @@ impl SerialManager {
 
     /// Write data to the serial port
     pub async fn write(&mut self, data: &[u8]) -> Result<usize, String> {
-        let port = self
-            .port
-            .as_ref()
-            .ok_or("No port open".to_string())?;
+        let port = self.port.as_ref().ok_or("No port open".to_string())?;
 
         let mut port_guard = port.lock().await;
         port_guard
@@ -137,15 +141,13 @@ impl SerialManager {
         stop_bits: Option<u8>,
         parity: Option<String>,
     ) -> Result<(), String> {
-        let port = self
-            .port
-            .as_ref()
-            .ok_or("No port open".to_string())?;
+        let port = self.port.as_ref().ok_or("No port open".to_string())?;
 
         let mut port_guard = port.lock().await;
 
         if let Some(baud) = baud_rate {
-            port_guard.set_baud_rate(baud)
+            port_guard
+                .set_baud_rate(baud)
                 .map_err(|e| format!("Failed to set baud rate: {}", e))?;
         }
 
@@ -157,7 +159,8 @@ impl SerialManager {
                 8 => tokio_serial::DataBits::Eight,
                 _ => return Err(format!("Invalid data bits: {}", bits)),
             };
-            port_guard.set_data_bits(data_bits)
+            port_guard
+                .set_data_bits(data_bits)
                 .map_err(|e| format!("Failed to set data bits: {}", e))?;
         }
 
@@ -167,7 +170,8 @@ impl SerialManager {
                 2 => tokio_serial::StopBits::Two,
                 _ => return Err(format!("Invalid stop bits: {}", bits)),
             };
-            port_guard.set_stop_bits(stop_bits)
+            port_guard
+                .set_stop_bits(stop_bits)
                 .map_err(|e| format!("Failed to set stop bits: {}", e))?;
         }
 
@@ -178,7 +182,8 @@ impl SerialManager {
                 "even" => tokio_serial::Parity::Even,
                 _ => return Err(format!("Invalid parity: {}", p)),
             };
-            port_guard.set_parity(parity)
+            port_guard
+                .set_parity(parity)
                 .map_err(|e| format!("Failed to set parity: {}", e))?;
         }
 
@@ -197,6 +202,7 @@ impl SerialManager {
     }
 
     /// Check if a port is currently open
+    #[allow(dead_code)] // May be used in future
     pub fn is_open(&self) -> bool {
         self.port.is_some()
     }

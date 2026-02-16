@@ -84,7 +84,7 @@ run_quality_checks() {
 
     # Cargo check
     echo -e "${YELLOW}▶ Cargo Check${NC}"
-    if cargo check --workspace --exclude transport-webserial --exclude app-web --all-features 2>&1; then
+    if cargo check --workspace --exclude transport-webserial --exclude transport-websocket --exclude app-web --all-features 2>&1; then
         echo -e "${GREEN}✓ Cargo check passed${NC}"
         echo ""
     else
@@ -118,6 +118,7 @@ run_unit_tests() {
     # Run non-WASM tests (excluding WASM-only packages)
     cargo test --workspace \
         --exclude transport-webserial \
+        --exclude transport-websocket \
         --exclude app-web
 
     # Run app-web tests (lib tests, not requiring browser)

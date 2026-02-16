@@ -15,6 +15,7 @@ const ALLOWED_ORIGINS: &[&str] = &[
     "http://127.0.0.1:8080",
 ];
 
+#[allow(dead_code)] // Used in tests
 const IDLE_TIMEOUT: Duration = Duration::from_secs(300); // 5 minutes
 const IDLE_CHECK_INTERVAL: Duration = Duration::from_secs(60); // Check every 60 seconds
 
@@ -25,7 +26,10 @@ pub async fn serve(
     _key: Vec<u8>,
     idle_timeout: Duration,
 ) -> Result<(), String> {
-    eprintln!("WebSocket server listening on {}", listener.local_addr().map_err(|e| e.to_string())?);
+    eprintln!(
+        "WebSocket server listening on {}",
+        listener.local_addr().map_err(|e| e.to_string())?
+    );
 
     let last_activity = Arc::new(RwLock::new(Instant::now()));
     let last_activity_clone = last_activity.clone();
@@ -65,32 +69,34 @@ async fn handle_connection(
     last_activity: Arc<RwLock<Instant>>,
 ) -> Result<(), String> {
     // Validate Origin header during WebSocket handshake
-    let callback = |req: &tokio_tungstenite::tungstenite::handshake::server::Request,
-                    response: tokio_tungstenite::tungstenite::handshake::server::Response| {
-        let origin = req
-            .headers()
-            .get("Origin")
-            .and_then(|h| h.to_str().ok());
+    let callback =
+        |req: &tokio_tungstenite::tungstenite::handshake::server::Request,
+         response: tokio_tungstenite::tungstenite::handshake::server::Response| {
+            let origin = req.headers().get("Origin").and_then(|h| h.to_str().ok());
 
-        match origin {
-            Some(o) if ALLOWED_ORIGINS.contains(&o) => {
-                eprintln!("Accepted connection from origin: {}", o);
-                Ok(response)
+            match origin {
+                Some(o) if ALLOWED_ORIGINS.contains(&o) => {
+                    eprintln!("Accepted connection from origin: {}", o);
+                    Ok(response)
+                }
+                Some(o) => {
+                    eprintln!("Rejected connection from unauthorized origin: {}", o);
+                    Err(
+                        tokio_tungstenite::tungstenite::handshake::server::ErrorResponse::new(
+                            Some("Unauthorized origin".into()),
+                        ),
+                    )
+                }
+                None => {
+                    eprintln!("Rejected connection with missing Origin header");
+                    Err(
+                        tokio_tungstenite::tungstenite::handshake::server::ErrorResponse::new(
+                            Some("Missing Origin header".into()),
+                        ),
+                    )
+                }
             }
-            Some(o) => {
-                eprintln!("Rejected connection from unauthorized origin: {}", o);
-                Err(tokio_tungstenite::tungstenite::handshake::server::ErrorResponse::new(
-                    Some("Unauthorized origin".into()),
-                ))
-            }
-            None => {
-                eprintln!("Rejected connection with missing Origin header");
-                Err(tokio_tungstenite::tungstenite::handshake::server::ErrorResponse::new(
-                    Some("Missing Origin header".into()),
-                ))
-            }
-        }
-    };
+        };
 
     let ws_stream = tokio_tungstenite::accept_hdr_async(stream, callback)
         .await
@@ -151,7 +157,8 @@ async fn handle_websocket(
 
         match msg {
             Message::Text(text) => {
-                let response = handle_client_message(&text, &mut serial_manager, data_tx.clone()).await;
+                let response =
+                    handle_client_message(&text, &mut serial_manager, data_tx.clone()).await;
                 let json = response.to_json()?;
                 ws_tx
                     .send(json)
@@ -184,12 +191,10 @@ async fn handle_client_message(
     let _id = msg.id();
 
     match msg {
-        ClientMessage::ListPorts { id } => {
-            match SerialManager::list_ports() {
-                Ok(ports) => ServerMessage::PortsList { id, ports },
-                Err(e) => ServerMessage::error(Some(id), e),
-            }
-        }
+        ClientMessage::ListPorts { id } => match SerialManager::list_ports() {
+            Ok(ports) => ServerMessage::PortsList { id, ports },
+            Err(e) => ServerMessage::error(Some(id), e),
+        },
         ClientMessage::Open {
             id,
             path,
@@ -219,7 +224,10 @@ async fn handle_client_message(
             data_bits,
             stop_bits,
             parity,
-        } => match serial_manager.set_config(baud_rate, data_bits, stop_bits, parity).await {
+        } => match serial_manager
+            .set_config(baud_rate, data_bits, stop_bits, parity)
+            .await
+        {
             Ok(()) => ServerMessage::ConfigSet { id },
             Err(e) => ServerMessage::error(Some(id), e),
         },
@@ -231,7 +239,8 @@ fn base64_encode(data: &[u8]) -> String {
     use std::io::Write;
     let mut buf = Vec::new();
     {
-        let mut encoder = base64::write::EncoderWriter::new(&mut buf, &base64::engine::general_purpose::STANDARD);
+        let mut encoder =
+            base64::write::EncoderWriter::new(&mut buf, &base64::engine::general_purpose::STANDARD);
         encoder.write_all(data).unwrap_or_default();
     }
     String::from_utf8(buf).unwrap_or_default()

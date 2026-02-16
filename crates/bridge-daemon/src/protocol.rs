@@ -134,7 +134,11 @@ mod tests {
         let json = r#"{"type":"open","id":2,"path":"/dev/cu.usbserial","baud_rate":115200}"#;
         let msg = ClientMessage::from_json(json).unwrap();
         match msg {
-            ClientMessage::Open { id, path, baud_rate } => {
+            ClientMessage::Open {
+                id,
+                path,
+                baud_rate,
+            } => {
                 assert_eq!(id, 2);
                 assert_eq!(path, "/dev/cu.usbserial");
                 assert_eq!(baud_rate, 115200);
