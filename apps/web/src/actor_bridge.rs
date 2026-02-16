@@ -472,6 +472,20 @@ impl ActorBridge {
         None
     }
 
+    // === Bridge Mode Helpers ===
+
+    /// Set connection state directly (for bridge mode which bypasses actor system)
+    pub fn set_connection_state(&self, state: ConnectionState) {
+        self.set_state.set(state);
+    }
+
+    /// Send a message directly to the worker (for bridge mode data injection)
+    pub fn send_worker_message(&self, msg: crate::protocol::UiToWorker) {
+        if let Some(worker) = self.worker_signal.get_untracked() {
+            send_to_worker(&worker, msg, self.set_status);
+        }
+    }
+
     // === Activity Indicators ===
 
     /// Trigger RX activity indicator

@@ -20,12 +20,7 @@ const IDLE_TIMEOUT: Duration = Duration::from_secs(300); // 5 minutes
 const IDLE_CHECK_INTERVAL: Duration = Duration::from_secs(60); // Check every 60 seconds
 
 /// WebSocket server with Origin validation and auto-shutdown
-pub async fn serve(
-    listener: TcpListener,
-    _cert: Vec<u8>,
-    _key: Vec<u8>,
-    idle_timeout: Duration,
-) -> Result<(), String> {
+pub async fn serve(listener: TcpListener, idle_timeout: Duration) -> Result<(), String> {
     eprintln!(
         "WebSocket server listening on {}",
         listener.local_addr().map_err(|e| e.to_string())?

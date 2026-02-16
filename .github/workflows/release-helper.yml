@@ -1,0 +1,141 @@
+name: Build & Release Safari Helper
+
+on:
+  push:
+    tags:
+      - 'helper-v*'
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Version tag (e.g. 0.1.0)'
+        required: true
+
+permissions:
+  contents: write
+
+jobs:
+  build-macos:
+    strategy:
+      matrix:
+        include:
+          - target: aarch64-apple-darwin
+            runner: macos-latest
+            arch: arm64
+          - target: x86_64-apple-darwin
+            runner: macos-latest
+            arch: x86_64
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Build bridge-daemon
+        run: cargo build --release -p bridge-daemon --target ${{ matrix.target }}
+
+      - name: Create app bundle
+        run: |
+          APP_BUNDLE="FutureTerm.app"
+          rm -rf "${APP_BUNDLE}"
+          mkdir -p "${APP_BUNDLE}/Contents/MacOS" "${APP_BUNDLE}/Contents/Resources"
+          cp "target/${{ matrix.target }}/release/bridge-daemon" "${APP_BUNDLE}/Contents/MacOS/bridge-daemon-bin"
+          cp "apps/bridge-macos/Info.plist" "${APP_BUNDLE}/Contents/"
+          # Create launcher script (prevents macOS "not responding" on URL scheme launch)
+          cat > "${APP_BUNDLE}/Contents/MacOS/bridge-daemon" << 'LAUNCHER'
+          #!/bin/bash
+          DIR="$(cd "$(dirname "$0")" && pwd)"
+          mkdir -p ~/Library/Logs/FutureTerm
+          nohup "${DIR}/bridge-daemon-bin" "$@" >> ~/Library/Logs/FutureTerm/bridge.log 2>&1 &
+          LAUNCHER
+          chmod +x "${APP_BUNDLE}/Contents/MacOS/bridge-daemon" "${APP_BUNDLE}/Contents/MacOS/bridge-daemon-bin"
+
+      - name: Code sign
+        run: |
+          SIGN_IDENTITY="${CODESIGN_IDENTITY:--}"
+          if [ "${SIGN_IDENTITY}" != "-" ]; then
+            codesign --force --options runtime \
+              --sign "${SIGN_IDENTITY}" \
+              --entitlements apps/bridge-macos/bridge-daemon.entitlements \
+              FutureTerm.app/Contents/MacOS/bridge-daemon-bin
+            codesign --force --options runtime \
+              --sign "${SIGN_IDENTITY}" \
+              --entitlements apps/bridge-macos/bridge-daemon.entitlements \
+              FutureTerm.app
+          else
+            codesign --deep --force --sign "-" FutureTerm.app
+          fi
+        env:
+          CODESIGN_IDENTITY: ${{ secrets.CODESIGN_IDENTITY }}
+
+      - name: Create DMG
+        run: |
+          STAGING_DIR=$(mktemp -d)
+          cp -R FutureTerm.app "${STAGING_DIR}/"
+          ln -s /Applications "${STAGING_DIR}/Applications"
+          hdiutil create -volname "FutureTerm Helper" \
+            -srcfolder "${STAGING_DIR}" -ov -format UDZO \
+            "FutureTerm-Helper-${{ matrix.arch }}.dmg"
+          rm -rf "${STAGING_DIR}"
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: helper-${{ matrix.arch }}
+          path: "FutureTerm-Helper-${{ matrix.arch }}.dmg"
+
+  create-universal:
+    needs: build-macos
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download arm64 artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: helper-arm64
+
+      - name: Download x86_64 artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: helper-x86_64
+
+      - name: List artifacts
+        run: ls -la *.dmg
+
+      - name: Upload all DMGs
+        uses: actions/upload-artifact@v4
+        with:
+          name: helper-all
+          path: "*.dmg"
+
+  release:
+    needs: create-universal
+    runs-on: ubuntu-latest
+    if: startsWith(github.ref, 'refs/tags/')
+    steps:
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          name: helper-all
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          name: "FutureTerm Helper ${{ github.ref_name }}"
+          body: |
+            ## FutureTerm Safari/Firefox Helper
+
+            This helper app enables serial port access in Safari and Firefox.
+
+            **Download:**
+            - `FutureTerm-Helper-arm64.dmg` - Apple Silicon (M1/M2/M3/M4)
+            - `FutureTerm-Helper-x86_64.dmg` - Intel Mac
+
+            **Install:** Open DMG, drag FutureTerm.app to /Applications, done.
+
+            The helper launches automatically when needed and shuts down after 5 minutes of inactivity.
+          files: "*.dmg"
+          draft: false
+          prerelease: false

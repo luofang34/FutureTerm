@@ -200,6 +200,84 @@ build_release() {
 }
 
 # ============================================================
+# BRIDGE DAEMON (macOS only)
+# ============================================================
+build_bridge() {
+    echo ""
+    echo -e "${BLUE}================================================${NC}"
+    echo -e "${BLUE}Building macOS Bridge Daemon${NC}"
+    echo -e "${BLUE}================================================${NC}"
+    echo ""
+
+    if [[ "$(uname)" != "Darwin" ]]; then
+        echo -e "${RED}Bridge build requires macOS (codesign + hdiutil)${NC}"
+        exit 1
+    fi
+
+    local BRIDGE_DIR="apps/bridge-macos"
+    local APP_BUNDLE="${BRIDGE_DIR}/FutureTerm.app"
+    local DMG_PATH="${BRIDGE_DIR}/FutureTerm-Helper.dmg"
+    local SIGN_IDENTITY="${CODESIGN_IDENTITY:--}"
+
+    # Build
+    echo -e "${YELLOW}Building bridge-daemon (release)...${NC}"
+    cargo build --release -p bridge-daemon
+
+    # Create app bundle
+    echo -e "${YELLOW}Creating app bundle...${NC}"
+    rm -rf "${APP_BUNDLE}"
+    mkdir -p "${APP_BUNDLE}/Contents/MacOS" "${APP_BUNDLE}/Contents/Resources"
+    cp target/release/bridge-daemon "${APP_BUNDLE}/Contents/MacOS/bridge-daemon-bin"
+    cp "${BRIDGE_DIR}/Info.plist" "${APP_BUNDLE}/Contents/"
+
+    # Create launcher script (prevents macOS "not responding" dialog on URL scheme launch)
+    cat > "${APP_BUNDLE}/Contents/MacOS/bridge-daemon" << 'LAUNCHER'
+#!/bin/bash
+DIR="$(cd "$(dirname "$0")" && pwd)"
+mkdir -p ~/Library/Logs/FutureTerm
+nohup "${DIR}/bridge-daemon-bin" "$@" >> ~/Library/Logs/FutureTerm/bridge.log 2>&1 &
+LAUNCHER
+    chmod +x "${APP_BUNDLE}/Contents/MacOS/bridge-daemon" "${APP_BUNDLE}/Contents/MacOS/bridge-daemon-bin"
+
+    # Code sign (inside-out for proper entitlements support)
+    echo -e "${YELLOW}Code signing (identity: ${SIGN_IDENTITY})...${NC}"
+    if [ "${SIGN_IDENTITY}" != "-" ]; then
+        codesign --force --options runtime \
+            --sign "${SIGN_IDENTITY}" \
+            --entitlements "${BRIDGE_DIR}/bridge-daemon.entitlements" \
+            "${APP_BUNDLE}/Contents/MacOS/bridge-daemon-bin"
+        codesign --force --options runtime \
+            --sign "${SIGN_IDENTITY}" \
+            --entitlements "${BRIDGE_DIR}/bridge-daemon.entitlements" \
+            "${APP_BUNDLE}"
+    else
+        codesign --deep --force --sign "-" "${APP_BUNDLE}" 2>/dev/null || true
+    fi
+
+    # Create DMG with Applications symlink for drag-to-install
+    echo -e "${YELLOW}Creating DMG...${NC}"
+    rm -f "${DMG_PATH}"
+    local STAGING_DIR
+    STAGING_DIR=$(mktemp -d)
+    cp -R "${APP_BUNDLE}" "${STAGING_DIR}/"
+    ln -s /Applications "${STAGING_DIR}/Applications"
+    hdiutil create -volname "FutureTerm Helper" \
+        -srcfolder "${STAGING_DIR}" -ov -format UDZO "${DMG_PATH}" > /dev/null
+    rm -rf "${STAGING_DIR}"
+
+    # Copy to safari-helper for local serving
+    local SAFARI_DIR="apps/web/safari-helper"
+    if [ -d "${SAFARI_DIR}" ]; then
+        cp "${DMG_PATH}" "${SAFARI_DIR}/"
+    fi
+
+    echo ""
+    echo -e "${GREEN}Bridge build complete: ${DMG_PATH}${NC}"
+    echo -e "${CYAN}Install: cp -R ${APP_BUNDLE} /Applications/${NC}"
+    echo -e "${CYAN}Test:    open futureterm://launch${NC}"
+}
+
+# ============================================================
 # DEV SERVER
 # ============================================================
 run_dev_server() {
@@ -237,12 +315,15 @@ show_usage() {
     echo "Usage: ./dev.sh [command]"
     echo ""
     echo "Commands:"
-    echo "  test       🎯 Full test suite (check + unit tests + WASM tests) - RECOMMENDED"
-    echo "  serve      🚀 Run checks + start dev server (default)"
-    echo "  build      🏗️  Full test suite + release build"
+    echo "  test       Full test suite (check + unit tests + WASM tests) - RECOMMENDED"
+    echo "  serve      Run checks + start dev server (default)"
+    echo "  build      Full test suite + release build"
+    echo "  bridge     Build macOS bridge daemon + app bundle + DMG (macOS only)"
     echo ""
-    echo "  check      🔍 Quality checks only (fmt, clippy, cargo check)"
-    echo "  wasm-test  🌐 WASM browser tests only"
+    echo "  check      Quality checks only (fmt, clippy, cargo check)"
+    echo "  wasm-test  WASM browser tests only"
+    echo ""
+    echo "Bridge signing: CODESIGN_IDENTITY='Developer ID Application: ...' ./dev.sh bridge"
     echo ""
     echo "If no command is specified, 'serve' is assumed for local development."
 }
@@ -265,6 +346,10 @@ case "$COMMAND" in
         # Full validation before release
         run_all_tests
         build_release
+        ;;
+    bridge)
+        # Build macOS bridge daemon + app bundle + DMG
+        build_bridge
         ;;
     serve)
         # Local development: check quality then start dev server

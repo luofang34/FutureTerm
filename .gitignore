@@ -48,6 +48,11 @@ socat.log
 # Backups
 *.backup
 
+# Build artifacts (DMG, app bundles)
+*.dmg
+apps/bridge-macos/FutureTerm.app/
+apps/web/safari-helper/*.dmg
+
 # Markdown documentation
 *.md
 !DEVELOPMENT.md

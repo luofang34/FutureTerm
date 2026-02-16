@@ -54,10 +54,6 @@
 	<key>LSApplicationCategoryType</key>
 	<string>public.app-category.developer-tools</string>
 
-	<!-- Permissions -->
-	<key>NSAppleEventsUsageDescription</key>
-	<string>FutureTerm Bridge provides serial port access for the FutureTerm web application.</string>
-
 	<!-- Development Language -->
 	<key>CFBundleDevelopmentRegion</key>
 	<string>en</string>

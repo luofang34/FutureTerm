@@ -11,18 +11,8 @@ path = "src/main.rs"
 [dependencies]
 tokio = { version = "1.41", features = ["rt-multi-thread", "net", "io-util", "time", "macros", "sync"] }
 tokio-serial = "5.4"
-tokio-tungstenite = { version = "0.26", features = ["native-tls"] }
+tokio-tungstenite = "0.26"
 futures-util = "0.3"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
-rcgen = { version = "0.14", features = ["pem"] }
-rustls = "0.23"
-tokio-rustls = "0.26"
 base64 = "0.22"
-
-[profile.release]
-opt-level = "z"     # Optimize for size
-lto = true
-codegen-units = 1
-strip = true
-panic = "abort"
