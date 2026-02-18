@@ -472,16 +472,40 @@ impl ActorBridge {
         None
     }
 
-    // === Activity Indicators ===
+    // === Bridge Mode Helpers ===
 
-    /// Trigger RX activity indicator
-    pub fn trigger_rx(&self) {
-        self.set_rx_active.set(true);
+    /// Set connection state directly (for bridge mode which bypasses actor system)
+    pub fn set_connection_state(&self, state: ConnectionState) {
+        self.set_state.set(state);
     }
 
-    /// Trigger TX activity indicator
+    /// Send a message directly to the worker (for bridge mode data injection)
+    pub fn send_worker_message(&self, msg: crate::protocol::UiToWorker) {
+        if let Some(worker) = self.worker_signal.get_untracked() {
+            send_to_worker(&worker, msg, self.set_status);
+        }
+    }
+
+    // === Activity Indicators ===
+
+    /// Trigger RX activity indicator (flashes for 100ms, matches WebSerial behavior)
+    pub fn trigger_rx(&self) {
+        let set_rx = self.set_rx_active;
+        let _ = set_rx.try_set(true);
+        spawn_local(async move {
+            gloo_timers::future::sleep(std::time::Duration::from_millis(100)).await;
+            let _ = set_rx.try_set(false);
+        });
+    }
+
+    /// Trigger TX activity indicator (flashes for 100ms, matches WebSerial behavior)
     pub fn trigger_tx(&self) {
-        self.set_tx_active.set(true);
+        let set_tx = self.set_tx_active;
+        let _ = set_tx.try_set(true);
+        spawn_local(async move {
+            gloo_timers::future::sleep(std::time::Duration::from_millis(100)).await;
+            let _ = set_tx.try_set(false);
+        });
     }
 
     // ═══════════════════════════════════════════════════════════════

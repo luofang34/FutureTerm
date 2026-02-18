@@ -1,0 +1,226 @@
+name: Build & Release Safari Helper
+
+on:
+  push:
+    tags:
+      - 'helper-v*'
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Version tag (e.g. 0.1.0)'
+        required: true
+
+jobs:
+  build-macos:
+    strategy:
+      matrix:
+        include:
+          - target: aarch64-apple-darwin
+            runner: macos-latest
+            arch: arm64
+          - target: x86_64-apple-darwin
+            runner: macos-latest
+            arch: x86_64
+    runs-on: ${{ matrix.runner }}
+    # Signing secrets are scoped to this environment — fork PRs cannot access them
+    environment: signing
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Import Developer ID certificate
+        run: |
+          if [ -z "$MACOS_CERTIFICATE" ]; then
+            echo "No MACOS_CERTIFICATE secret set — skipping certificate import (ad-hoc signing)"
+            exit 0
+          fi
+          # Decode P12 certificate from base64 secret and import into temp keychain
+          # Trap ensures key material is removed even if subsequent steps fail
+          trap 'rm -f /tmp/certificate.p12' EXIT
+          echo "$MACOS_CERTIFICATE" | base64 --decode > /tmp/certificate.p12
+          KEYCHAIN_PWD=$(openssl rand -hex 32)
+          security create-keychain -p "$KEYCHAIN_PWD" build.keychain
+          security default-keychain -s build.keychain
+          security unlock-keychain -p "$KEYCHAIN_PWD" build.keychain
+          security import /tmp/certificate.p12 -k build.keychain \
+            -P "$MACOS_CERTIFICATE_PWD" -T /usr/bin/codesign
+          security set-key-partition-list -S apple-tool:,apple: -s -k "$KEYCHAIN_PWD" build.keychain
+          rm /tmp/certificate.p12
+        env:
+          MACOS_CERTIFICATE: ${{ secrets.MACOS_CERTIFICATE }}
+          MACOS_CERTIFICATE_PWD: ${{ secrets.MACOS_CERTIFICATE_PWD }}
+
+      - name: Build bridge-daemon
+        run: cargo build --release -p bridge-daemon --target ${{ matrix.target }}
+
+      - name: Generate app icon
+        run: |
+          brew install librsvg || { echo "ERROR: Failed to install librsvg"; exit 1; }
+          ICONSET_DIR=$(mktemp -d)/FutureTerm.iconset
+          mkdir -p "${ICONSET_DIR}"
+          SVG_SRC="apps/bridge-macos/icon.svg"
+          for size in 16 32 64 128 256 512 1024; do
+            rsvg-convert -w "$size" -h "$size" "${SVG_SRC}" \
+              -o "${ICONSET_DIR}/icon_${size}x${size}.png" \
+              || { echo "ERROR: rsvg-convert failed for size ${size}"; exit 1; }
+          done
+          cp "${ICONSET_DIR}/icon_32x32.png"     "${ICONSET_DIR}/icon_16x16@2x.png"
+          cp "${ICONSET_DIR}/icon_64x64.png"     "${ICONSET_DIR}/icon_32x32@2x.png"
+          cp "${ICONSET_DIR}/icon_256x256.png"   "${ICONSET_DIR}/icon_128x128@2x.png"
+          cp "${ICONSET_DIR}/icon_512x512.png"   "${ICONSET_DIR}/icon_256x256@2x.png"
+          cp "${ICONSET_DIR}/icon_1024x1024.png" "${ICONSET_DIR}/icon_512x512@2x.png"
+          rm -f "${ICONSET_DIR}/icon_64x64.png" "${ICONSET_DIR}/icon_1024x1024.png"
+          iconutil -c icns "${ICONSET_DIR}" -o "apps/bridge-macos/AppIcon.icns"
+          rm -rf "$(dirname "${ICONSET_DIR}")"
+
+      - name: Create app bundle
+        run: |
+          APP_BUNDLE="FutureTerm.app"
+          rm -rf "${APP_BUNDLE}"
+          mkdir -p "${APP_BUNDLE}/Contents/MacOS" "${APP_BUNDLE}/Contents/Resources"
+          cp "target/${{ matrix.target }}/release/bridge-daemon" "${APP_BUNDLE}/Contents/MacOS/bridge-daemon-bin"
+          cp "apps/bridge-macos/Info.plist" "${APP_BUNDLE}/Contents/"
+          # Copy icon if generated
+          if [ -f "apps/bridge-macos/AppIcon.icns" ]; then
+            cp "apps/bridge-macos/AppIcon.icns" "${APP_BUNDLE}/Contents/Resources/"
+          fi
+          # Create launcher script (prevents macOS "not responding" on URL scheme launch)
+          cat > "${APP_BUNDLE}/Contents/MacOS/bridge-daemon" << 'LAUNCHER'
+          #!/bin/bash
+          DIR="$(cd "$(dirname "$0")" && pwd)"
+          mkdir -p ~/Library/Logs/FutureTerm
+          nohup "${DIR}/bridge-daemon-bin" "$@" >> ~/Library/Logs/FutureTerm/bridge.log 2>&1 &
+          LAUNCHER
+          chmod +x "${APP_BUNDLE}/Contents/MacOS/bridge-daemon" "${APP_BUNDLE}/Contents/MacOS/bridge-daemon-bin"
+
+      - name: Code sign
+        run: |
+          SIGN_IDENTITY="${CODESIGN_IDENTITY:--}"
+          if [ "${SIGN_IDENTITY}" != "-" ]; then
+            codesign --force --options runtime \
+              --sign "${SIGN_IDENTITY}" \
+              --entitlements apps/bridge-macos/bridge-daemon.entitlements \
+              FutureTerm.app/Contents/MacOS/bridge-daemon-bin
+            codesign --force --options runtime \
+              --sign "${SIGN_IDENTITY}" \
+              --entitlements apps/bridge-macos/bridge-daemon.entitlements \
+              FutureTerm.app
+          else
+            codesign --deep --force --sign "-" FutureTerm.app
+          fi
+        env:
+          CODESIGN_IDENTITY: ${{ secrets.CODESIGN_IDENTITY }}
+
+      - name: Create DMG
+        run: |
+          STAGING_DIR=$(mktemp -d)
+          trap "rm -rf '${STAGING_DIR}'" EXIT
+          cp -R FutureTerm.app "${STAGING_DIR}/"
+          ln -s /Applications "${STAGING_DIR}/Applications"
+          hdiutil create -volname "FutureTerm Helper" \
+            -srcfolder "${STAGING_DIR}" -ov -format UDZO \
+            "FutureTerm-Helper-${{ matrix.arch }}.dmg"
+
+      - name: Notarize and staple DMG
+        run: |
+          DMG="FutureTerm-Helper-${{ matrix.arch }}.dmg"
+          if [ -z "$APPLE_NOTARY_USER" ] || [ -z "$APPLE_NOTARY_TEAM" ] || [ -z "$APPLE_NOTARY_PASSWORD" ]; then
+            echo "Notarization secrets not set — skipping (DMG will show Gatekeeper warning)"
+            exit 0
+          fi
+          echo "Submitting $DMG for notarization..."
+          xcrun notarytool submit "$DMG" \
+            --apple-id "$APPLE_NOTARY_USER" \
+            --team-id "$APPLE_NOTARY_TEAM" \
+            --password "$APPLE_NOTARY_PASSWORD" \
+            --wait \
+            --timeout 20m || { echo "ERROR: Notarization failed or timed out"; exit 1; }
+          echo "Stapling notarization ticket..."
+          xcrun stapler staple "$DMG" || { echo "ERROR: Stapling failed — DMG would ship without notarization ticket"; exit 1; }
+          echo "Notarization complete."
+        env:
+          APPLE_NOTARY_USER: ${{ secrets.APPLE_NOTARY_USER }}
+          APPLE_NOTARY_TEAM: ${{ secrets.APPLE_NOTARY_TEAM }}
+          APPLE_NOTARY_PASSWORD: ${{ secrets.APPLE_NOTARY_PASSWORD }}
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: helper-${{ matrix.arch }}
+          path: "FutureTerm-Helper-${{ matrix.arch }}.dmg"
+
+  create-universal:
+    needs: build-macos
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download arm64 artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: helper-arm64
+
+      - name: Download x86_64 artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: helper-x86_64
+
+      - name: List artifacts
+        run: ls -la *.dmg
+
+      - name: Upload all DMGs
+        uses: actions/upload-artifact@v4
+        with:
+          name: helper-all
+          path: "*.dmg"
+
+  release:
+    needs: create-universal
+    runs-on: ubuntu-latest
+    if: startsWith(github.ref, 'refs/tags/')
+    permissions:
+      contents: write
+    steps:
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          name: helper-all
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          name: "FutureTerm Helper ${{ github.ref_name }}"
+          body: |
+            ## FutureTerm Safari/Firefox Helper
+
+            This helper app enables serial port access in Safari and Firefox.
+
+            **Download:**
+            - `FutureTerm-Helper-arm64.dmg` - Apple Silicon (M1/M2/M3/M4)
+            - `FutureTerm-Helper-x86_64.dmg` - Intel Mac
+
+            **Install:** Open DMG, drag FutureTerm.app to /Applications, done.
+
+            The helper launches automatically when needed and shuts down after 5 minutes of inactivity.
+          files: "*.dmg"
+          draft: false
+          prerelease: false
+
+  # Trigger a pages redeploy so the new signed DMG is picked up immediately
+  redeploy-pages:
+    needs: release
+    runs-on: ubuntu-latest
+    if: startsWith(github.ref, 'refs/tags/')
+    permissions:
+      actions: write
+    steps:
+      - name: Trigger pages redeploy
+        run: |
+          gh workflow run deploy-pages.yml \
+            --repo "${{ github.repository }}" \
+            --ref main
+        env:
+          GH_TOKEN: ${{ github.token }}

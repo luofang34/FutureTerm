@@ -84,7 +84,7 @@ run_quality_checks() {
 
     # Cargo check
     echo -e "${YELLOW}▶ Cargo Check${NC}"
-    if cargo check --workspace --exclude transport-webserial --exclude app-web --all-features 2>&1; then
+    if cargo check --workspace --exclude transport-webserial --exclude transport-websocket --exclude app-web --all-features 2>&1; then
         echo -e "${GREEN}✓ Cargo check passed${NC}"
         echo ""
     else
@@ -118,6 +118,7 @@ run_unit_tests() {
     # Run non-WASM tests (excluding WASM-only packages)
     cargo test --workspace \
         --exclude transport-webserial \
+        --exclude transport-websocket \
         --exclude app-web
 
     # Run app-web tests (lib tests, not requiring browser)
@@ -199,6 +200,140 @@ build_release() {
 }
 
 # ============================================================
+# BRIDGE DAEMON (macOS only)
+# ============================================================
+build_bridge() {
+    echo ""
+    echo -e "${BLUE}================================================${NC}"
+    echo -e "${BLUE}Building macOS Bridge Daemon${NC}"
+    echo -e "${BLUE}================================================${NC}"
+    echo ""
+
+    if [[ "$(uname)" != "Darwin" ]]; then
+        echo -e "${RED}Bridge build requires macOS (codesign + hdiutil)${NC}"
+        exit 1
+    fi
+
+    local BRIDGE_DIR="apps/bridge-macos"
+    local APP_BUNDLE="${BRIDGE_DIR}/FutureTerm.app"
+    local DMG_PATH="${BRIDGE_DIR}/FutureTerm-Helper.dmg"
+    local SIGN_IDENTITY="${CODESIGN_IDENTITY:--}"
+    # Notarization keychain profile (created once with: xcrun notarytool store-credentials)
+    local NOTARY_PROFILE="${APPLE_NOTARY_KEYCHAIN_PROFILE:-futureterm-notary}"
+
+    # Build
+    echo -e "${YELLOW}Building bridge-daemon (release)...${NC}"
+    cargo build --release -p bridge-daemon
+
+    # Generate app icon from SVG source (requires rsvg-convert: brew install librsvg)
+    echo -e "${YELLOW}Generating app icon...${NC}"
+    local ICONSET_DIR
+    ICONSET_DIR=$(mktemp -d)/FutureTerm.iconset
+    mkdir -p "${ICONSET_DIR}"
+    if ! command -v rsvg-convert &>/dev/null; then
+        echo -e "${RED}rsvg-convert not found — skipping icon (brew install librsvg)${NC}"
+    else
+        local SVG_SRC="${BRIDGE_DIR}/icon.svg"
+        # Render all required macOS icon sizes from the single SVG source
+        for size in 16 32 64 128 256 512 1024; do
+            rsvg-convert -w "$size" -h "$size" "${SVG_SRC}" \
+                -o "${ICONSET_DIR}/icon_${size}x${size}.png" 2>/dev/null
+        done
+        # @2x (HiDPI) variants — copy from next size up
+        cp "${ICONSET_DIR}/icon_32x32.png"   "${ICONSET_DIR}/icon_16x16@2x.png"
+        cp "${ICONSET_DIR}/icon_64x64.png"   "${ICONSET_DIR}/icon_32x32@2x.png"
+        cp "${ICONSET_DIR}/icon_256x256.png" "${ICONSET_DIR}/icon_128x128@2x.png"
+        cp "${ICONSET_DIR}/icon_512x512.png" "${ICONSET_DIR}/icon_256x256@2x.png"
+        cp "${ICONSET_DIR}/icon_1024x1024.png" "${ICONSET_DIR}/icon_512x512@2x.png"
+        # Remove non-standard sizes used only for @2x sources
+        rm -f "${ICONSET_DIR}/icon_64x64.png" "${ICONSET_DIR}/icon_1024x1024.png"
+        iconutil -c icns "${ICONSET_DIR}" -o "${BRIDGE_DIR}/AppIcon.icns"
+        rm -rf "$(dirname "${ICONSET_DIR}")"
+        echo -e "${GREEN}Icon generated: ${BRIDGE_DIR}/AppIcon.icns${NC}"
+    fi
+
+    # Create app bundle
+    echo -e "${YELLOW}Creating app bundle...${NC}"
+    rm -rf "${APP_BUNDLE}"
+    mkdir -p "${APP_BUNDLE}/Contents/MacOS" "${APP_BUNDLE}/Contents/Resources"
+    cp target/release/bridge-daemon "${APP_BUNDLE}/Contents/MacOS/bridge-daemon-bin"
+    cp "${BRIDGE_DIR}/Info.plist" "${APP_BUNDLE}/Contents/"
+    # Copy icon if generated
+    if [ -f "${BRIDGE_DIR}/AppIcon.icns" ]; then
+        cp "${BRIDGE_DIR}/AppIcon.icns" "${APP_BUNDLE}/Contents/Resources/"
+    fi
+
+    # Create launcher script (prevents macOS "not responding" dialog on URL scheme launch)
+    cat > "${APP_BUNDLE}/Contents/MacOS/bridge-daemon" << 'LAUNCHER'
+#!/bin/bash
+DIR="$(cd "$(dirname "$0")" && pwd)"
+mkdir -p ~/Library/Logs/FutureTerm
+nohup "${DIR}/bridge-daemon-bin" "$@" >> ~/Library/Logs/FutureTerm/bridge.log 2>&1 &
+LAUNCHER
+    chmod +x "${APP_BUNDLE}/Contents/MacOS/bridge-daemon" "${APP_BUNDLE}/Contents/MacOS/bridge-daemon-bin"
+
+    # Code sign (inside-out for proper entitlements support)
+    echo -e "${YELLOW}Code signing (identity: ${SIGN_IDENTITY})...${NC}"
+    if [ "${SIGN_IDENTITY}" != "-" ]; then
+        codesign --force --options runtime \
+            --sign "${SIGN_IDENTITY}" \
+            --entitlements "${BRIDGE_DIR}/bridge-daemon.entitlements" \
+            "${APP_BUNDLE}/Contents/MacOS/bridge-daemon-bin"
+        codesign --force --options runtime \
+            --sign "${SIGN_IDENTITY}" \
+            --entitlements "${BRIDGE_DIR}/bridge-daemon.entitlements" \
+            "${APP_BUNDLE}"
+    else
+        codesign --deep --force --sign "-" "${APP_BUNDLE}" 2>/dev/null || true
+    fi
+
+    # Create DMG with Applications symlink for drag-to-install
+    echo -e "${YELLOW}Creating DMG...${NC}"
+    rm -f "${DMG_PATH}"
+    local STAGING_DIR
+    STAGING_DIR=$(mktemp -d)
+    cp -R "${APP_BUNDLE}" "${STAGING_DIR}/"
+    ln -s /Applications "${STAGING_DIR}/Applications"
+    hdiutil create -volname "FutureTerm Helper" \
+        -srcfolder "${STAGING_DIR}" -ov -format UDZO "${DMG_PATH}" > /dev/null
+    rm -rf "${STAGING_DIR}"
+
+    # Notarize and staple (only when signed with real Developer ID)
+    if [ "${SIGN_IDENTITY}" != "-" ]; then
+        echo -e "${YELLOW}Notarizing DMG (this may take 1-5 minutes)...${NC}"
+        if xcrun notarytool submit "${DMG_PATH}" \
+            --keychain-profile "${NOTARY_PROFILE}" \
+            --wait \
+            --timeout 10m 2>&1; then
+            echo -e "${YELLOW}Stapling notarization ticket...${NC}"
+            xcrun stapler staple "${DMG_PATH}"
+            echo -e "${GREEN}Notarization complete and stapled${NC}"
+        else
+            echo -e "${RED}Notarization FAILED — DMG is unsigned for distribution${NC}"
+            echo -e "${YELLOW}To set up notarization credentials:${NC}"
+            echo -e "${CYAN}  xcrun notarytool store-credentials futureterm-notary \\${NC}"
+            echo -e "${CYAN}    --apple-id YOUR_APPLE_ID \\${NC}"
+            echo -e "${CYAN}    --team-id YOUR_TEAM_ID \\${NC}"
+            echo -e "${CYAN}    --password APP_SPECIFIC_PASSWORD${NC}"
+        fi
+    fi
+
+    # Copy to bridge-helper for local serving
+    local BRIDGE_HELPER_DIR="apps/web/bridge-helper"
+    if [ -d "${BRIDGE_HELPER_DIR}" ]; then
+        cp "${DMG_PATH}" "${BRIDGE_HELPER_DIR}/"
+    fi
+
+    echo ""
+    echo -e "${GREEN}Bridge build complete: ${DMG_PATH}${NC}"
+    echo -e "${CYAN}Install: cp -R ${APP_BUNDLE} /Applications/${NC}"
+    echo -e "${CYAN}Test:    open futureterm://launch${NC}"
+    if [ "${SIGN_IDENTITY}" != "-" ]; then
+        echo -e "${CYAN}Sign:    CODESIGN_IDENTITY='Developer ID Application: Name (TEAMID)' ./dev.sh bridge${NC}"
+    fi
+}
+
+# ============================================================
 # DEV SERVER
 # ============================================================
 run_dev_server() {
@@ -236,12 +371,17 @@ show_usage() {
     echo "Usage: ./dev.sh [command]"
     echo ""
     echo "Commands:"
-    echo "  test       🎯 Full test suite (check + unit tests + WASM tests) - RECOMMENDED"
-    echo "  serve      🚀 Run checks + start dev server (default)"
-    echo "  build      🏗️  Full test suite + release build"
+    echo "  test       Full test suite (check + unit tests + WASM tests) - RECOMMENDED"
+    echo "  serve      Run checks + start dev server (default)"
+    echo "  build      Full test suite + release build"
+    echo "  bridge     Build macOS bridge daemon + app bundle + DMG (macOS only)"
     echo ""
-    echo "  check      🔍 Quality checks only (fmt, clippy, cargo check)"
-    echo "  wasm-test  🌐 WASM browser tests only"
+    echo "  check      Quality checks only (fmt, clippy, cargo check)"
+    echo "  wasm-test  WASM browser tests only"
+    echo ""
+    echo "Bridge signing:      CODESIGN_IDENTITY='Developer ID Application: Name (TEAMID)' ./dev.sh bridge"
+    echo "Bridge notarize:     CODESIGN_IDENTITY='...' APPLE_NOTARY_KEYCHAIN_PROFILE=futureterm-notary ./dev.sh bridge"
+    echo "  (one-time setup)   xcrun notarytool store-credentials futureterm-notary --apple-id ID --team-id TEAM --password PASS"
     echo ""
     echo "If no command is specified, 'serve' is assumed for local development."
 }
@@ -264,6 +404,10 @@ case "$COMMAND" in
         # Full validation before release
         run_all_tests
         build_release
+        ;;
+    bridge)
+        # Build macOS bridge daemon + app bundle + DMG
+        build_bridge
         ;;
     serve)
         # Local development: check quality then start dev server

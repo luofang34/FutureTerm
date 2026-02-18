@@ -1,0 +1,65 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<!-- Bundle Identification -->
+	<key>CFBundleIdentifier</key>
+	<string>com.futureterm.bridge</string>
+
+	<key>CFBundleName</key>
+	<string>FutureTerm Bridge</string>
+
+	<key>CFBundleDisplayName</key>
+	<string>FutureTerm</string>
+
+	<key>CFBundleExecutable</key>
+	<string>bridge-daemon</string>
+
+	<!-- Version Information -->
+	<key>CFBundleVersion</key>
+	<string>1.0.0</string>
+
+	<key>CFBundleShortVersionString</key>
+	<string>1.0.0</string>
+
+	<key>CFBundleInfoDictionaryVersion</key>
+	<string>6.0</string>
+
+	<!-- App Icon (generated from icon.svg at build time) -->
+	<key>CFBundleIconFile</key>
+	<string>AppIcon</string>
+
+	<!-- Package Type -->
+	<key>CFBundlePackageType</key>
+	<string>APPL</string>
+
+	<!-- URL Scheme Registration -->
+	<key>CFBundleURLTypes</key>
+	<array>
+		<dict>
+			<key>CFBundleURLSchemes</key>
+			<array>
+				<string>futureterm</string>
+			</array>
+			<key>CFBundleURLName</key>
+			<string>com.futureterm.bridge</string>
+		</dict>
+	</array>
+
+	<!-- Launch Configuration -->
+	<key>LSBackgroundOnly</key>
+	<true/>
+
+	<!-- Minimum System Requirements -->
+	<key>LSMinimumSystemVersion</key>
+	<string>10.15</string>
+
+	<!-- Category -->
+	<key>LSApplicationCategoryType</key>
+	<string>public.app-category.developer-tools</string>
+
+	<!-- Development Language -->
+	<key>CFBundleDevelopmentRegion</key>
+	<string>en</string>
+</dict>
+</plist>

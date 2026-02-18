@@ -1,11 +1,12 @@
-use crate::protocol::WorkerToUi;
-use core_types::{DecodedEvent, RawEvent, SelectionRange};
+use crate::protocol::{UiToWorker, WorkerToUi};
+use core_types::{DecodedEvent, RawEvent, SelectionRange, Transport};
 use leptos::*;
+use std::cell::{Cell, RefCell};
+use std::rc::Rc;
 use wasm_bindgen::prelude::*;
 use wasm_bindgen::JsCast;
 use wasm_bindgen_futures::spawn_local;
 use web_sys::{MessageEvent, Worker};
-// Imports Cleaned
 
 // Actor system (replaces ConnectionManager)
 mod actor_bridge;
@@ -37,7 +38,7 @@ const MAX_DECODED_EVENTS: usize = 2500;
 #[component]
 pub fn App() -> impl IntoView {
     let (_terminal_ready, set_terminal_ready) = create_signal(false);
-    let (is_webserial_supported, set_is_webserial_supported) = create_signal(true);
+    let (show_bridge_install, set_show_bridge_install) = create_signal(false);
 
     // Worker Signal (Used by ActorBridge)
     let (worker, set_worker) = create_signal::<Option<Worker>>(None);
@@ -116,20 +117,25 @@ pub fn App() -> impl IntoView {
     // Legacy signals removed/replaced by manager:
     // status, connected, transport, active_port, is_reconfiguring
 
-    create_effect(move |_| {
-        if let Some(window) = web_sys::window() {
-            let nav = window.navigator();
-            let serial = nav.serial();
-            if serial.is_undefined() {
-                set_is_webserial_supported.set(false);
-            }
-        }
-    });
+    // Bridge mode shared state (for Safari/Firefox WebSocket bridge)
+    let bridge_active: Rc<Cell<bool>> = Rc::new(Cell::new(false));
+    let bridge_closing: Rc<Cell<bool>> = Rc::new(Cell::new(false));
+    let bridge_tx_queue: Rc<RefCell<Vec<Vec<u8>>>> = Rc::new(RefCell::new(Vec::new()));
+    // Pending baud rate change for bridge mode (0 = no pending change).
+    // Written by the reconfigure effect, read+cleared by the bridge loop.
+    let bridge_pending_baud: Rc<Cell<u32>> = Rc::new(Cell::new(0));
+    // Bridge port picker signals (Copy signals, no clone needed)
+    let (bridge_ports, set_bridge_ports) = create_signal::<Vec<(String, String)>>(Vec::new());
+    let (bridge_port_pick, set_bridge_port_pick) = create_signal::<Option<String>>(None);
 
     // Worker Logic
     let manager_worker_init = manager.clone();
+    let bridge_active_worker = bridge_active.clone();
+    let bridge_tx_queue_worker = bridge_tx_queue.clone();
     create_effect(move |_| {
         let manager = manager_worker_init.clone();
+        let bridge_active_tx = bridge_active_worker.clone();
+        let bridge_tx_queue_tx = bridge_tx_queue_worker.clone();
         if let Ok(w) = Worker::new("worker_bootstrap.js") {
             // Restore TextDecoder for RX to Main Thread (if we ever want to decode locally? No,
             // worker does that) But wait, worker sends BACK a 'DataBatch' with frames.
@@ -260,10 +266,16 @@ pub fn App() -> impl IntoView {
                             );
                         }
                         WorkerToUi::TxData { data } => {
-                            let m = manager.clone();
-                            spawn_local(async move {
-                                let _ = m.write(&data).await;
-                            });
+                            if bridge_active_tx.get() {
+                                // Bridge mode - queue for WS send
+                                bridge_tx_queue_tx.borrow_mut().push(data);
+                            } else {
+                                // WebSerial mode
+                                let m = manager.clone();
+                                spawn_local(async move {
+                                    let _ = m.write(&data).await;
+                                });
+                            }
                         }
                     }
                 }
@@ -282,9 +294,20 @@ pub fn App() -> impl IntoView {
     // Use manager for disconnect
     let manager_disc = manager.clone();
 
+    // Bridge mode clones - all clones must happen before any move closure
+    let bridge_active_disc = bridge_active.clone();
+    let bridge_closing_disc = bridge_closing.clone();
+    let bridge_active_for_connect = bridge_active.clone();
+    let bridge_closing_for_connect = bridge_closing.clone();
+    let bridge_tx_queue_for_connect = bridge_tx_queue.clone();
+    let bridge_pending_baud_for_connect = bridge_pending_baud.clone();
+    let bridge_active_reconf = bridge_active.clone();
+    let bridge_pending_baud_reconf = bridge_pending_baud.clone();
+    let bridge_active_term = bridge_active.clone();
+    let bridge_tx_queue_term = bridge_tx_queue.clone();
+
     let on_connect = move |force_picker: bool| {
         let shift_held = force_picker;
-        // Use state machine to determine button behavior
         let current_state = manager_disc.state.get();
 
         #[cfg(debug_assertions)]
@@ -298,9 +321,18 @@ pub fn App() -> impl IntoView {
             .into(),
         );
 
-        // Allow disconnect if state allows it (Connected, AutoReconnecting, or DeviceLost)
+        // Allow disconnect if state allows it
         if current_state.can_disconnect() && !force_picker {
-            // Disconnect Logic - cancels auto-reconnect OR disconnects active connection
+            // Check if we're in bridge mode
+            if bridge_active_disc.get() {
+                // Bridge disconnect - signal the read loop to stop
+                // Set closing flag so connect flow waits for cleanup to finish
+                bridge_closing_disc.set(true);
+                bridge_active_disc.set(false);
+                return;
+            }
+
+            // WebSerial disconnect
             #[cfg(debug_assertions)]
             web_sys::console::log_1(&"DEBUG: Executing disconnect logic".into());
             let manager_d = manager_disc.clone();
@@ -362,6 +394,12 @@ pub fn App() -> impl IntoView {
         let (last_pid, set_last_pid) = create_signal::<Option<u16>>(init_pid);
         let manager = manager_con_main.clone();
 
+        // Bridge mode clones for the async block
+        let bridge_active_connect = bridge_active_for_connect.clone();
+        let bridge_closing_connect = bridge_closing_for_connect.clone();
+        let bridge_tx_queue_connect = bridge_tx_queue_for_connect.clone();
+        let bridge_pending_baud_connect = bridge_pending_baud_for_connect.clone();
+
         spawn_local(async move {
             let Some(window) = web_sys::window() else {
                 manager
@@ -372,10 +410,436 @@ pub fn App() -> impl IntoView {
             let nav = window.navigator();
             let serial = nav.serial();
 
+            // Phase 3: WebSocket fallback for Safari/Firefox
             if serial.is_undefined() {
+                // Wait for any in-progress bridge cleanup to finish.
+                // This prevents the race where Disconnect→Connect fires
+                // before the old session's close_port() completes on the daemon,
+                // causing "Device or resource busy" errors.
+                if bridge_closing_connect.get() {
+                    manager.set_status.set("Waiting for disconnect...".into());
+                    let mut waited = 0u32;
+                    while bridge_closing_connect.get() && waited < 3000 {
+                        gloo_timers::future::TimeoutFuture::new(10).await;
+                        waited += 10;
+                    }
+                }
+
+                // If already in bridge mode, disconnect first (hot-swap / manual select)
+                if bridge_active_connect.get() {
+                    bridge_closing_connect.set(true);
+                    bridge_active_connect.set(false);
+                    // Wait for old read loop to exit and cleanup
+                    let mut waited = 0u32;
+                    while bridge_closing_connect.get() && waited < 3000 {
+                        gloo_timers::future::TimeoutFuture::new(10).await;
+                        waited += 10;
+                    }
+                }
+
+                // WebSerial not available - try WebSocket bridge
                 manager
                     .set_status
-                    .set("Error: WebSerial not supported.".into());
+                    .set("WebSerial not available, trying bridge...".into());
+
+                // ws:// (not wss://) is intentional: 127.0.0.1 is a "potentially
+                // trustworthy URL" per W3C Secure Contexts spec, so browsers exempt
+                // it from mixed-content blocking even when the page is on HTTPS.
+                let ws_url = "ws://127.0.0.1:9876";
+                let mut ws_transport = transport_websocket::WebSocketTransport::new();
+
+                // Try direct connection first (daemon already running)
+                let connected = match ws_transport.connect(ws_url).await {
+                    Ok(_) => true,
+                    Err(_) => {
+                        // Daemon not running - try URL scheme launch
+                        manager.set_status.set("Launching helper...".into());
+
+                        // Launch via hidden iframe (avoids navigating away)
+                        let launch_url = "futureterm://launch?port=9876";
+                        if let Some(doc) = window.document() {
+                            if let Ok(iframe) = doc.create_element("iframe") {
+                                let _ = iframe.set_attribute("style", "display:none");
+                                let _ = iframe.set_attribute("src", launch_url);
+                                if let Some(body) = doc.body() {
+                                    let _ = body.append_child(&iframe);
+                                    let body_clone = body.clone();
+                                    let iframe_clone = iframe.clone();
+                                    let cleanup = wasm_bindgen::closure::Closure::once(move || {
+                                        let _ = body_clone.remove_child(&iframe_clone);
+                                    });
+                                    let _ = window
+                                        .set_timeout_with_callback_and_timeout_and_arguments_0(
+                                            cleanup.as_ref().unchecked_ref(),
+                                            1000,
+                                        );
+                                    cleanup.forget();
+                                }
+                            }
+                        }
+
+                        // Show install dialog immediately so users who don't have the
+                        // helper can act right away rather than watching a countdown.
+                        // The dialog auto-dismisses if a retry succeeds.
+                        set_show_bridge_install.set(true);
+                        manager.set_status.set("Starting helper app...".into());
+
+                        // Retry while macOS processes the URL scheme and the user
+                        // may be clicking "Allow" in the security dialog.
+                        // Total window: ~4 s (enough for open + Allow + startup).
+                        let retry_delays_ms: &[u32] = &[400, 800, 1200, 1500];
+                        let mut success = false;
+                        for &delay in retry_delays_ms.iter() {
+                            gloo_timers::future::TimeoutFuture::new(delay).await;
+                            ws_transport = transport_websocket::WebSocketTransport::new();
+                            if ws_transport.connect(ws_url).await.is_ok() {
+                                set_show_bridge_install.set(false); // auto-dismiss
+                                success = true;
+                                break;
+                            }
+                        }
+                        success
+                    }
+                };
+
+                if !connected {
+                    // Install dialog is already visible (shown when URL scheme fired).
+                    // Update status so the user knows what to do next.
+                    manager
+                        .set_status
+                        .set("Install the helper app and click Connect again".into());
+                    return;
+                }
+
+                // Check daemon version — warn if helper needs an update.
+                // daemon_version() returns None only for daemons built before Hello was added.
+                // All released binaries (v0.1.0+) send Hello.
+                if ws_transport.daemon_version().is_none() {
+                    manager.set_status.set(
+                        "Helper app outdated — please download the latest version from the help page".into()
+                    );
+                    set_show_bridge_install.set(true);
+                    return;
+                }
+
+                // Bridge connected - list available serial ports
+                manager.set_status.set("Listing serial ports...".into());
+
+                let ports = match ws_transport.list_ports().await {
+                    Ok(p) => p,
+                    Err(e) => {
+                        manager
+                            .set_status
+                            .set(format!("Failed to list ports: {}", e));
+                        return;
+                    }
+                };
+
+                // Deduplicate: macOS lists both /dev/cu.* and /dev/tty.* per device.
+                // Prefer cu.* (calling unit) - tty.* blocks on DCD which breaks probing.
+                let deduped_ports: Vec<_> = ports
+                    .iter()
+                    .filter(|p| {
+                        if p.path.starts_with("/dev/tty.") {
+                            // Skip tty.* if corresponding cu.* exists
+                            let cu_path = p.path.replace("/dev/tty.", "/dev/cu.");
+                            !ports.iter().any(|other| other.path == cu_path)
+                        } else {
+                            true
+                        }
+                    })
+                    .collect();
+
+                // ── Port Selection ──
+                let port_path = if shift_held {
+                    // Triangle button: show ALL ports in picker (manual selection)
+                    let display: Vec<(String, String)> = deduped_ports
+                        .iter()
+                        .map(|p| {
+                            let label = match (&p.product, &p.manufacturer) {
+                                (Some(prod), Some(mfr)) => {
+                                    format!("{} - {} ({})", prod, mfr, p.path)
+                                }
+                                (Some(prod), None) => format!("{} ({})", prod, p.path),
+                                _ => p.path.clone(),
+                            };
+                            (p.path.clone(), label)
+                        })
+                        .collect();
+
+                    if display.is_empty() {
+                        manager.set_status.set("No serial ports found.".into());
+                        return;
+                    }
+
+                    set_bridge_ports.set(display);
+                    set_bridge_port_pick.set(None);
+                    manager.set_status.set("Select a serial port...".into());
+
+                    loop {
+                        if let Some(path) = bridge_port_pick.get_untracked() {
+                            set_bridge_ports.set(Vec::new());
+                            if path.is_empty() {
+                                manager
+                                    .set_status
+                                    .set("Cancelled — click Connect to try again".into());
+                                return;
+                            }
+                            break path;
+                        }
+                        gloo_timers::future::TimeoutFuture::new(50).await;
+                    }
+                } else {
+                    // Connect button: auto-select USB serial port
+                    let usb_ports: Vec<_> = deduped_ports
+                        .iter()
+                        .filter(|p| p.port_type == "usb_serial")
+                        .collect();
+
+                    if usb_ports.len() == 1 {
+                        // Single USB device - auto-select (like Chrome behavior)
+                        usb_ports
+                            .first()
+                            .map(|p| p.path.clone())
+                            .unwrap_or_default()
+                    } else if usb_ports.len() > 1 {
+                        // Multiple USB devices - show picker with USB ports only
+                        let display: Vec<(String, String)> = usb_ports
+                            .iter()
+                            .map(|p| {
+                                let label = match (&p.product, &p.manufacturer) {
+                                    (Some(prod), Some(mfr)) => {
+                                        format!("{} - {} ({})", prod, mfr, p.path)
+                                    }
+                                    (Some(prod), None) => format!("{} ({})", prod, p.path),
+                                    _ => p.path.clone(),
+                                };
+                                (p.path.clone(), label)
+                            })
+                            .collect();
+
+                        set_bridge_ports.set(display);
+                        set_bridge_port_pick.set(None);
+                        manager.set_status.set("Select a serial port...".into());
+
+                        loop {
+                            if let Some(path) = bridge_port_pick.get_untracked() {
+                                set_bridge_ports.set(Vec::new());
+                                if path.is_empty() {
+                                    manager
+                                        .set_status
+                                        .set("Cancelled — click Connect to try again".into());
+                                    return;
+                                }
+                                break path;
+                            }
+                            gloo_timers::future::TimeoutFuture::new(50).await;
+                        }
+                    } else {
+                        // No USB devices found
+                        manager
+                            .set_status
+                            .set("No USB serial devices found. Plug in a device and retry.".into());
+                        return;
+                    }
+                };
+
+                // ── Open Port ──
+                // Initial baud rate (will be changed during probing if baud=0)
+                let initial_baud = if current_baud == 0 {
+                    115200
+                } else {
+                    current_baud
+                };
+
+                manager.set_status.set(format!("Opening {}...", port_path));
+
+                if let Err(e) = ws_transport.open_port(&port_path, initial_baud).await {
+                    manager
+                        .set_status
+                        .set(format!("Failed to open {}: {}", port_path, e));
+                    return;
+                }
+
+                // ── Auto-Probe Baud Rate ──
+                let mut final_baud = if current_baud == 0 {
+                    match bridge_auto_probe(&ws_transport, &manager).await {
+                        Ok(baud) => baud,
+                        Err(e) => {
+                            #[cfg(debug_assertions)]
+                            web_sys::console::log_1(
+                                &format!("Bridge auto-probe failed: {}", e).into(),
+                            );
+                            manager
+                                .set_status
+                                .set(format!("Auto-detect failed: {}. Using 115200.", e));
+                            let _ = ws_transport.set_baud_rate(115200).await;
+                            115200
+                        }
+                    }
+                } else {
+                    current_baud
+                };
+
+                // ── Connected ──
+                manager
+                    .set_status
+                    .set(format!("Connected: {} @ {}", port_path, final_baud));
+                manager.set_connection_state(ConnectionState::Connected);
+                manager.send_worker_message(UiToWorker::Connect {
+                    baud_rate: final_baud,
+                });
+                manager.set_detected_baud.set(final_baud);
+                bridge_active_connect.set(true);
+
+                #[cfg(debug_assertions)]
+                web_sys::console::log_1(
+                    &format!(
+                        "Bridge: serial port {} opened at {} baud, starting read loop",
+                        port_path, final_baud
+                    )
+                    .into(),
+                );
+
+                // Bridge read/write loop with auto-reconnect
+                'bridge: loop {
+                    // Inner read/write loop
+                    loop {
+                        // Check if bridge was deactivated (user disconnect)
+                        if !bridge_active_connect.get() {
+                            break 'bridge;
+                        }
+
+                        // Apply pending baud rate change (set by reconfigure effect)
+                        {
+                            let pending = bridge_pending_baud_connect.get();
+                            if pending > 0 {
+                                bridge_pending_baud_connect.set(0);
+                                if ws_transport.set_baud_rate(pending).await.is_ok() {
+                                    final_baud = pending;
+                                    manager.set_detected_baud.set(final_baud);
+                                    manager.send_worker_message(UiToWorker::Connect {
+                                        baud_rate: final_baud,
+                                    });
+                                    manager.set_status.set(format!(
+                                        "Reconfigured: {} @ {}",
+                                        port_path, final_baud
+                                    ));
+                                }
+                            }
+                        }
+
+                        // Drain TX queue and send to daemon
+                        {
+                            let tx_data: Vec<Vec<u8>> =
+                                bridge_tx_queue_connect.borrow_mut().drain(..).collect();
+                            if !tx_data.is_empty() {
+                                #[cfg(debug_assertions)]
+                                web_sys::console::log_1(
+                                    &format!(
+                                        "Bridge TX: sending {} chunks to daemon",
+                                        tx_data.len()
+                                    )
+                                    .into(),
+                                );
+                                let mut sent_any = false;
+                                for data in tx_data {
+                                    if ws_transport.write(&data).await.is_err() {
+                                        #[cfg(debug_assertions)]
+                                        web_sys::console::error_1(
+                                            &"Bridge TX: write to daemon failed".into(),
+                                        );
+                                        break;
+                                    }
+                                    sent_any = true;
+                                }
+                                if sent_any {
+                                    manager.trigger_tx();
+                                }
+                            }
+                        }
+
+                        // Read serial data from bridge
+                        match ws_transport.read_chunk().await {
+                            Ok((data, ts)) if !data.is_empty() => {
+                                manager.trigger_rx();
+                                manager.send_worker_message(UiToWorker::IngestData {
+                                    data,
+                                    timestamp_us: ts,
+                                });
+                            }
+                            Err(_e) => {
+                                #[cfg(debug_assertions)]
+                                web_sys::console::log_1(
+                                    &format!("Bridge: port lost: {}", _e).into(),
+                                );
+                                break; // Exit inner loop, enter retry
+                            }
+                            _ => {}
+                        }
+
+                        // Small yield to prevent busy-spinning
+                        gloo_timers::future::TimeoutFuture::new(5).await;
+                    }
+
+                    // Device lost - try to reconnect (same as WebSerial behavior)
+                    if !bridge_active_connect.get() {
+                        break 'bridge;
+                    }
+
+                    // Transition to DeviceLost state (triggers orange pulsing indicator)
+                    manager.set_connection_state(ConnectionState::DeviceLost);
+                    manager
+                        .set_status
+                        .set("Device lost. Reconnecting...".into());
+                    let _ = ws_transport.close_port().await;
+
+                    // Retry re-opening the same port with backoff
+                    manager.set_connection_state(ConnectionState::AutoReconnecting);
+                    let retry_delays_ms: &[u32] = &[500, 1000, 1500, 2000, 2000, 2000];
+                    let mut reconnected = false;
+                    for (i, &delay) in retry_delays_ms.iter().enumerate() {
+                        if !bridge_active_connect.get() {
+                            break; // User clicked disconnect
+                        }
+                        gloo_timers::future::TimeoutFuture::new(delay).await;
+
+                        // Clear error state so open_port can work
+                        ws_transport.clear_error();
+
+                        if ws_transport.open_port(&port_path, final_baud).await.is_ok() {
+                            reconnected = true;
+                            manager.set_connection_state(ConnectionState::Connected);
+                            manager
+                                .set_status
+                                .set(format!("Reconnected: {} @ {}", port_path, final_baud));
+                            break;
+                        }
+                        manager.set_status.set(format!(
+                            "Device lost. Retrying... ({}/{})",
+                            i + 1,
+                            retry_delays_ms.len()
+                        ));
+                    }
+
+                    if !reconnected {
+                        manager.set_status.set(
+                            "Device not found after retries. Click Connect to try again.".into(),
+                        );
+                        break 'bridge; // Give up after all retries
+                    }
+                    // Reconnected - continue outer loop (resume read/write)
+                }
+
+                // Cleanup - close_port on daemon first, then WebSocket connection
+                bridge_closing_connect.set(true);
+                let _ = ws_transport.close_port().await;
+                let _ = ws_transport.close().await;
+                bridge_active_connect.set(false);
+                manager.set_connection_state(ConnectionState::Disconnected);
+                manager.set_status.set("Disconnected".into());
+                // Signal that cleanup is complete - connect flow can proceed
+                bridge_closing_connect.set(false);
                 return;
             }
 
@@ -466,24 +930,22 @@ pub fn App() -> impl IntoView {
         let f = framing.get();
         let af = active_framing.get();
 
-        // Only reconfigure if already connected (Untracked to avoid triggering on connect)
         if connected.get_untracked() {
-            let manager_r = manager_reconf.clone();
-
-            spawn_local(async move {
-                // If b=0 and f=Auto, we assume it's the "Auto" state and don't force reconfig
-                // (unless we add a "Re-Scan" button later, but for now this prevents redundant
-                // loops if both set to Auto) Allow Auto (0 / Auto) to trigger
-                // reconfiguration too
-
-                #[cfg(debug_assertions)]
-                web_sys::console::log_1(&"Dynamically Reconfiguring Port...".into());
-
-                // Manager Reconfigure (Handles Close -> Open -> Loop)
-                // Pass `b`, `f`, and `af` (active_framing).
-                // If f=Auto, active_framing preserves detected value across baud changes.
-                manager_r.reconfigure(b, f, af);
-            });
+            if bridge_active_reconf.get() {
+                // Bridge mode: signal pending baud change; bridge loop applies it.
+                // Only baud changes are supported; framing is handled by the worker.
+                if b > 0 {
+                    bridge_pending_baud_reconf.set(b);
+                }
+            } else {
+                // WebSerial mode: use existing reconfigure path
+                let manager_r = manager_reconf.clone();
+                spawn_local(async move {
+                    #[cfg(debug_assertions)]
+                    web_sys::console::log_1(&"Dynamically Reconfiguring Port...".into());
+                    manager_r.reconfigure(b, f, af);
+                });
+            }
         }
     });
 
@@ -507,18 +969,29 @@ pub fn App() -> impl IntoView {
 
         // Bind TX
         let manager_tx = manager_tx_cb.clone();
+        let bridge_active_tx = bridge_active_term.clone();
+        let bridge_tx_queue_tx = bridge_tx_queue_term.clone();
         let on_data_cb = Closure::wrap(Box::new(move |data: JsValue| {
             if let Some(text) = data.as_string() {
                 let bytes = text.into_bytes();
 
-                // Direct TX on Main Thread
-                let active_manager = manager_tx.clone();
-                spawn_local(async move {
-                    if let Err(e) = active_manager.write(&bytes).await {
-                        #[cfg(debug_assertions)]
-                        web_sys::console::log_1(&format!("TX Error: {:?}", e).into());
-                    }
-                });
+                if bridge_active_tx.get() {
+                    // Bridge mode - queue for WS send
+                    #[cfg(debug_assertions)]
+                    web_sys::console::log_1(
+                        &format!("Bridge TX: queuing {} bytes", bytes.len()).into(),
+                    );
+                    bridge_tx_queue_tx.borrow_mut().push(bytes);
+                } else {
+                    // WebSerial mode
+                    let active_manager = manager_tx.clone();
+                    spawn_local(async move {
+                        if let Err(e) = active_manager.write(&bytes).await {
+                            #[cfg(debug_assertions)]
+                            web_sys::console::log_1(&format!("TX Error: {:?}", e).into());
+                        }
+                    });
+                }
             }
         }) as Box<dyn FnMut(JsValue)>);
 
@@ -527,25 +1000,62 @@ pub fn App() -> impl IntoView {
 
     view! {
         <div style="display: flex; flex-direction: column; height: 100vh; background: rgb(25, 25, 25); color: #eee;">
-            <Show when=move || !is_webserial_supported.get() fallback=|| ()>
-                <div style="position: fixed; top: 0; left: 0; width: 100vw; height: 100vh; background: rgba(15, 15, 15, 0.98); z-index: 9999; display: flex; flex-direction: column; align-items: center; justify-content: center; text-align: center; color: white;">
-                    <h1 style="font-family: 'Magneto', 'Impact', sans-serif; font-size: 3rem; margin-bottom: 2rem; color: #ff5555; text-shadow: 0 0 10px rgba(255, 85, 85, 0.3);">Browser Not Supported</h1>
-                    <p style="font-size: 1.2rem; max-width: 800px; line-height: 1.6; color: #ccc; margin-bottom: 3rem;">
-                        FutureTerm requires the <strong>WebSerial API</strong> to communicate with hardware devices.<br/>
-                        This feature is currently missing from your browser (e.g., Safari, Firefox).
-                    </p>
-
-                    <div style="display: flex; gap: 30px; flex-wrap: wrap; justify-content: center;">
-                         <div style="padding: 20px 40px; background: #252525; border-radius: 12px; border: 1px solid #444; text-align: center;">
-                            <div style="font-weight: bold; font-size: 1.1rem; margin-bottom: 10px; color: #4CAF50;">Supported Browsers</div>
-                            <div style="font-size: 1.5rem;">Chrome, Edge, Opera</div>
+            // Safari/Firefox bridge helper install dialog
+            <Show when=move || show_bridge_install.get() fallback=|| ()>
+                <div style="position: fixed; top: 0; left: 0; width: 100vw; height: 100vh; background: rgba(0,0,0,0.7); z-index: 10000; display: flex; align-items: center; justify-content: center;">
+                    <div style="background: #2a2a2a; border: 1px solid #555; border-radius: 8px; padding: 24px 32px; max-width: 480px; color: #eee; font-family: sans-serif;">
+                        <h2 style="margin: 0 0 12px; font-size: 1.2rem; color: #ff9800;">"Serial Port Helper Required"</h2>
+                        <p style="margin: 0 0 8px; font-size: 0.9rem; line-height: 1.5; color: #ccc;">
+                            "Your browser doesn\u{2019}t support the WebSerial API. FutureTerm needs a small helper app running locally to access your serial ports."
+                        </p>
+                        <p style="margin: 0 0 16px; font-size: 0.9rem; line-height: 1.5; color: #ccc;">
+                            "The helper is lightweight (~1 MB), runs only when needed, and shuts down automatically after 5 minutes of inactivity."
+                        </p>
+                        <div style="display: flex; gap: 12px; justify-content: flex-end;">
+                            <button
+                                style="padding: 8px 16px; background: #444; color: #ccc; border: 1px solid #666; border-radius: 4px; cursor: pointer; font-size: 0.9rem;"
+                                on:click=move |_| set_show_bridge_install.set(false)>
+                                "Cancel"
+                            </button>
+                            <a
+                                href="/bridge-helper"
+                                target="_blank"
+                                style="padding: 8px 16px; background: #007acc; color: white; border: none; border-radius: 4px; cursor: pointer; font-size: 0.9rem; text-decoration: none; display: inline-block;">
+                                "Download Helper"
+                            </a>
                         </div>
                     </div>
                 </div>
             </Show>
 
+            // Bridge port picker dialog
+            <Show when=move || !bridge_ports.get().is_empty() fallback=|| ()>
+                <div style="position: fixed; top: 0; left: 0; width: 100vw; height: 100vh; background: rgba(0,0,0,0.7); z-index: 10000; display: flex; align-items: center; justify-content: center;">
+                    <div style="background: #2a2a2a; border: 1px solid #555; border-radius: 8px; padding: 24px 32px; max-width: 480px; min-width: 320px; color: #eee; font-family: sans-serif;">
+                        <h2 style="margin: 0 0 16px; font-size: 1.2rem;">"Select Serial Port"</h2>
+                        {move || {
+                            bridge_ports.get().into_iter().map(|(path, desc)| {
+                                let path_click = path.clone();
+                                view! {
+                                    <button
+                                        style="display: block; width: 100%; padding: 10px 16px; margin: 4px 0; background: #333; color: #eee; border: 1px solid #555; border-radius: 4px; cursor: pointer; text-align: left; font-size: 0.9rem;"
+                                        on:click=move |_| set_bridge_port_pick.set(Some(path_click.clone()))>
+                                        {desc}
+                                    </button>
+                                }
+                            }).collect_view()
+                        }}
+                        <button
+                            style="display: block; width: 100%; padding: 8px 16px; margin-top: 12px; background: #444; color: #ccc; border: 1px solid #666; border-radius: 4px; cursor: pointer; font-size: 0.9rem;"
+                            on:click=move |_| set_bridge_port_pick.set(Some(String::new()))>
+                            "Cancel"
+                        </button>
+                    </div>
+                </div>
+            </Show>
+
             <header style="padding: 10px; background: rgb(25, 25, 25); display: flex; align-items: center; gap: 10px; border-bottom: 1px solid rgb(45, 45, 45);">
-                <h1 style="margin: 0; font-family: 'Magneto', 'Impact', 'Arial Black', sans-serif; font-style: italic; font-size: 1.5rem; font-weight: normal; letter-spacing: 1px;">FutureTerm</h1>
+                <h1 style="margin: 0; font-family: 'Impact', 'Arial Black', sans-serif; font-style: italic; font-size: 1.5rem; font-weight: normal; letter-spacing: 1px;">FutureTerm</h1>
                 <div style="flex: 1;"></div>
 
                 <span style="font-size: 0.9rem; color: #aaa;">{move || status.get()}</span>
@@ -739,4 +1249,184 @@ pub fn App() -> impl IntoView {
             </div>
         </div>
     }
+}
+
+/// Auto-probe baud rate via WebSocket bridge.
+///
+/// Tries common baud rates using set_config (no close/reopen needed),
+/// scores received data, and returns the best match.
+async fn bridge_auto_probe(
+    ws_transport: &transport_websocket::WebSocketTransport,
+    manager: &ActorBridge,
+) -> Result<u32, String> {
+    use core_types::Transport;
+
+    // Same candidates as Chrome prober (connection-actors/src/constants.rs)
+    const BAUD_CANDIDATES: &[u32] = &[
+        115200, 1500000, 1000000, 2000000, 921600, 57600, 460800, 230400, 38400, 19200, 9600,
+    ];
+
+    let mut best_baud = 115200u32;
+    let mut best_score = 0.0_f64;
+    let mut best_protocol: Option<&str> = None;
+    // Preserve data collected at the winning baud rate so we can show it in the terminal
+    // (mirrors WebSerial behavior where probe data is forwarded directly to the worker).
+    let mut best_buffer: Vec<u8> = Vec::new();
+
+    for &baud in BAUD_CANDIDATES {
+        manager
+            .set_status
+            .set(format!("AUTO: Testing {} baud...", baud));
+
+        // Change baud rate via bridge daemon (set_config)
+        if ws_transport.set_baud_rate(baud).await.is_err() {
+            continue;
+        }
+
+        // Drain stale data from previous baud rate.
+        // Generous timing for FTDI chips with 16ms latency timer + WS round-trip.
+        ws_transport.clear_rx_buffer();
+        gloo_timers::future::TimeoutFuture::new(80).await;
+        ws_transport.clear_rx_buffer();
+
+        // Send Ctrl+C (0x03) then CR.
+        // Ctrl+C terminates any stuck command (caused by garbage bytes from wrong-baud probes)
+        // and returns to the shell prompt. CR then executes an empty command to get a fresh
+        // prompt. The combined response (~50 bytes: "^C\r\n<prompt>\r\n<prompt>") is larger
+        // than a bare CR response (~30 bytes), improving score reliability.
+        let _ = ws_transport.write(b"\x03\r").await;
+
+        // Wait to collect data at this baud rate.
+        // Covers: WS round-trip (~10ms) + device response (~10-100ms) +
+        // daemon read-task mutex cycle (~100ms) + WS back (~5ms).
+        gloo_timers::future::TimeoutFuture::new(350).await;
+
+        // Read all available data
+        let mut buffer = Vec::new();
+        loop {
+            match ws_transport.read_chunk().await {
+                Ok((data, _)) if !data.is_empty() => {
+                    buffer.extend_from_slice(&data);
+                    if buffer.len() > 200 {
+                        break;
+                    }
+                }
+                _ => break,
+            }
+        }
+
+        // Retry once for slow devices (FTDI latency, long response time)
+        if buffer.is_empty() {
+            gloo_timers::future::TimeoutFuture::new(150).await;
+            loop {
+                match ws_transport.read_chunk().await {
+                    Ok((data, _)) if !data.is_empty() => {
+                        buffer.extend_from_slice(&data);
+                        if buffer.len() > 200 {
+                            break;
+                        }
+                    }
+                    _ => break,
+                }
+            }
+        }
+
+        if buffer.is_empty() {
+            #[cfg(debug_assertions)]
+            web_sys::console::log_1(&format!("AUTO: {} baud - no data received", baud).into());
+            continue;
+        }
+
+        // Score the data using the analysis crate
+        let score_8n1 = analysis::calculate_score_8n1(&buffer) as f64;
+        let score_mav = analysis::calculate_score_mavlink(&buffer) as f64;
+
+        let (score, protocol) = if score_mav > 0.85 {
+            (score_mav, Some("mavlink"))
+        } else {
+            (score_8n1, None)
+        };
+
+        #[cfg(debug_assertions)]
+        web_sys::console::log_1(
+            &format!(
+                "AUTO: {} baud - {} bytes, score_8n1={:.2}, score_mav={:.2}",
+                baud,
+                buffer.len(),
+                score_8n1,
+                score_mav
+            )
+            .into(),
+        );
+
+        if score > best_score {
+            best_score = score;
+            best_baud = baud;
+            best_protocol = protocol;
+            best_buffer = buffer.clone();
+        }
+
+        // Early exit on high confidence (same thresholds as Chrome prober).
+        // At high baud rates (>=1Mbps), a bash prompt is ~30 bytes — use a lower
+        // min_bytes threshold so we exit early instead of continuing to test all bauds.
+        let threshold = if baud >= 1_000_000 { 0.85 } else { 0.98 };
+        let min_bytes = if baud >= 1_000_000 { 24 } else { 64 };
+        if best_score > threshold && buffer.len() > min_bytes {
+            #[cfg(debug_assertions)]
+            web_sys::console::log_1(
+                &format!(
+                    "AUTO: Early exit - {} baud with score {:.2}",
+                    best_baud, best_score
+                )
+                .into(),
+            );
+            break;
+        }
+    }
+
+    if best_score < 0.30 {
+        return Err("No valid signal detected at any baud rate".into());
+    }
+
+    // Set final baud rate
+    ws_transport
+        .set_baud_rate(best_baud)
+        .await
+        .map_err(|e| format!("Failed to set final baud rate: {}", e))?;
+
+    // Forward the data collected at the winning baud rate to the terminal.
+    // This mirrors WebSerial behavior: probe data is shown instead of discarded,
+    // so the user sees the device prompt immediately after connection.
+    //
+    // Reuse trim_shell_artifacts() which strips leading CR/LF, ANSI escape
+    // sequences, and literal "^C" echoes before the actual prompt text.
+    // WebSerial uses the same function in state_actor::handle_probe_complete.
+    {
+        use connection_actors::data_processing::trim_shell_artifacts;
+        let display_data = trim_shell_artifacts(&best_buffer);
+        if !display_data.is_empty() {
+            let ts_us = (js_sys::Date::now() * 1000.0) as u64;
+            manager.send_worker_message(crate::protocol::UiToWorker::IngestData {
+                data: display_data,
+                timestamp_us: ts_us,
+            });
+        }
+    }
+
+    // Do NOT clear rx_buffer here. Any data that arrived since the probe read
+    // (including additional prompt output) is valid and will be picked up by
+    // the bridge read loop.
+
+    let protocol_str = best_protocol.unwrap_or("text");
+    manager.set_status.set(format!(
+        "AUTO: {} baud (score: {:.2}, {})",
+        best_baud, best_score, protocol_str
+    ));
+
+    // If MAVLink detected, switch decoder
+    if best_protocol == Some("mavlink") {
+        manager.set_decoder("mavlink".into());
+    }
+
+    Ok(best_baud)
 }

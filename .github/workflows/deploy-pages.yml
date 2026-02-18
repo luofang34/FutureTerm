@@ -27,6 +27,24 @@ jobs:
       - name: Install Trunk
         uses: jetli/trunk-action@v0.5.0
 
+      - name: Download latest signed helper DMG
+        run: |
+          # Pull the latest signed+notarized DMG from GitHub Releases into the
+          # bridge-helper directory so it gets deployed alongside the web app.
+          # Falls back gracefully if no release exists yet.
+          mkdir -p apps/web/bridge-helper
+          gh release download \
+            --repo "${{ github.repository }}" \
+            --pattern "FutureTerm-Helper-arm64.dmg" \
+            --dir apps/web/bridge-helper/ \
+            --clobber 2>/dev/null && \
+            mv apps/web/bridge-helper/FutureTerm-Helper-arm64.dmg \
+               apps/web/bridge-helper/FutureTerm-Helper.dmg && \
+            echo "Signed DMG downloaded" || \
+            echo "No signed release found yet — bridge-helper will deploy without DMG"
+        env:
+          GH_TOKEN: ${{ github.token }}
+
       - name: Build WASM app
         run: |
           cd apps/web

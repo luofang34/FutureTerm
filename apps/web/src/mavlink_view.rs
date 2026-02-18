@@ -200,14 +200,14 @@ pub fn MavlinkView(
             display: flex; flex-direction: column; gap: 5px;
             font-family: system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Oxygen, Ubuntu, Cantarell, "Open Sans", "Helvetica Neue", sans-serif;
         }
-        .sys-card-header { display: flex; align-items: center; gap: 8px; font-weight: 600; color: #eee; border-bottom: 1px solid #444; padding-bottom: 8px; font-size: 1.1em; letter-spacing: 0.5px; }
-        .sys-info-row { display: flex; justify-content: flex-start; align-items: flex-start; font-size: 0.85em; flex-wrap: wrap; gap: 8px; padding-top: 4px; border-bottom: 1px solid #333; padding-bottom: 4px; }
+        .sys-card-header { display: flex; align-items: center; gap: 8px; font-weight: 600; color: #eee; border-bottom: 1px solid #444; padding-bottom: 8px; font-size: 0.95em; letter-spacing: 0.5px; }
+        .sys-info-row { display: flex; justify-content: flex-start; align-items: flex-start; font-size: 0.8em; flex-wrap: wrap; gap: 8px; padding-top: 4px; border-bottom: 1px solid #333; padding-bottom: 4px; }
         .sys-info-row:last-child { border-bottom: none; }
         .sys-label { color: #9E9E9E; font-weight: 600; white-space: nowrap; min-width: 70px; }
         // Force wrapping for long values (Mode), right aligned usually but wraps if needed
-        .sys-val { color: #64B5F6; font-family: "SFMono-Regular", Consolas, "Liberation Mono", Menlo, monospace; font-size: 0.9em; text-align: left; white-space: pre-wrap; overflow-wrap: anywhere; max-width: 100%; width: auto; display: flex; flex-direction: column; align-items: flex-start; }
-        .group-header { background: #1e1e1e; color: #888; font-weight: bold; padding: 8px; border-bottom: 1px solid #333; margin-top: 10px; }
-        .msg-table { width: 100%; border-collapse: collapse; font-family: monospace; font-size: 0.9em; }
+        .sys-val { color: #64B5F6; font-family: 'Menlo', 'Monaco', 'Consolas', 'Courier New', monospace; font-size: 0.85em; text-align: left; white-space: pre-wrap; overflow-wrap: anywhere; max-width: 100%; width: auto; display: flex; flex-direction: column; align-items: flex-start; }
+        .group-header { background: #1e1e1e; color: #888; font-weight: bold; padding: 8px; font-size: 0.85em; border-bottom: 1px solid #333; margin-top: 10px; }
+        .msg-table { width: 100%; border-collapse: collapse; font-family: 'Menlo', 'Monaco', 'Consolas', 'Courier New', monospace; font-size: 0.85em; }
         .msg-row { border-bottom: 1px solid #333; }
         .msg-cell { padding: 5px; vertical-align: top; color: #ccc; }
     "#;

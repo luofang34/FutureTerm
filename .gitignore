@@ -48,6 +48,14 @@ socat.log
 # Backups
 *.backup
 
+# Build artifacts (DMG, app bundles, compiled helper binary, generated icon)
+*.dmg
+apps/bridge-macos/FutureTerm.app/
+apps/bridge-macos/AppIcon.icns
+apps/web/bridge-helper/*.dmg
+apps/web/bridge-helper/bridge-daemon
+apps/web/bridge-helper/bridge-daemon-*
+
 # Markdown documentation
 *.md
 !DEVELOPMENT.md

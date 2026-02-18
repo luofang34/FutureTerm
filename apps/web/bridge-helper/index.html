@@ -1,0 +1,198 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>FutureTerm - Serial Port Helper</title>
+  <style>
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+    body {
+      background: #1a1a1a;
+      color: #eee;
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+      min-height: 100vh;
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      padding: 40px 20px;
+    }
+    .container { max-width: 600px; width: 100%; }
+    h1 {
+      font-size: 2rem;
+      margin-bottom: 8px;
+      font-family: 'Impact', 'Arial Black', sans-serif;
+      font-style: italic;
+      letter-spacing: 1px;
+    }
+    .subtitle { color: #aaa; margin-bottom: 32px; font-size: 1rem; }
+    .card {
+      background: #2a2a2a;
+      border: 1px solid #444;
+      border-radius: 8px;
+      padding: 24px;
+      margin-bottom: 20px;
+    }
+    .card h2 { font-size: 1.1rem; color: #ff9800; margin-bottom: 12px; }
+    .card p { font-size: 0.95rem; line-height: 1.6; color: #ccc; margin-bottom: 12px; }
+    .card p:last-child { margin-bottom: 0; }
+    .steps { list-style: none; counter-reset: step; }
+    .steps li {
+      counter-increment: step;
+      padding: 10px 0 10px 40px;
+      position: relative;
+      font-size: 0.95rem;
+      color: #ccc;
+      line-height: 1.5;
+    }
+    .steps li::before {
+      content: counter(step);
+      position: absolute;
+      left: 0;
+      top: 10px;
+      width: 26px;
+      height: 26px;
+      background: #007acc;
+      color: white;
+      border-radius: 50%;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      font-size: 0.85rem;
+      font-weight: bold;
+    }
+    .download-btn {
+      display: inline-block;
+      padding: 12px 28px;
+      background: #007acc;
+      color: white;
+      border: none;
+      border-radius: 6px;
+      font-size: 1rem;
+      font-weight: 600;
+      text-decoration: none;
+      cursor: pointer;
+      transition: background 0.2s;
+    }
+    .download-btn:hover { background: #005fa3; }
+    .download-section { text-align: center; margin: 24px 0; }
+    code {
+      background: #333;
+      padding: 2px 6px;
+      border-radius: 3px;
+      font-size: 0.9em;
+      color: #7ec8e3;
+    }
+    .note {
+      font-size: 0.85rem;
+      color: #888;
+      margin-top: 16px;
+      line-height: 1.5;
+    }
+    .security-badge {
+      display: inline-flex;
+      align-items: center;
+      gap: 6px;
+      background: #1a3a1a;
+      border: 1px solid #2a5a2a;
+      border-radius: 4px;
+      padding: 4px 10px;
+      font-size: 0.85rem;
+      color: #6c6;
+      margin-bottom: 12px;
+    }
+    .back-link {
+      display: inline-block;
+      margin-top: 24px;
+      color: #007acc;
+      text-decoration: none;
+      font-size: 0.95rem;
+    }
+    .back-link:hover { text-decoration: underline; }
+  </style>
+</head>
+<body>
+  <div class="container">
+    <h1 style="font-family: 'Impact', 'Arial Black', sans-serif; font-style: italic; letter-spacing: 1px;">FutureTerm</h1>
+    <p class="subtitle">Serial Port Helper</p>
+
+    <div class="card">
+      <h2>Why is this needed?</h2>
+      <div style="background: #3a2a1a; border-left: 4px solid #ff9800; padding: 12px 16px; margin-bottom: 16px; border-radius: 4px;">
+        <strong>macOS only.</strong> This helper currently supports Mac only. iPad, iPhone, and Windows support is planned for a future release.
+      </div>
+      <p>
+        Some browsers (Safari, Firefox, etc.) don't support the
+        <a href="https://developer.mozilla.org/en-US/docs/Web/API/Web_Serial_API" style="color: #7ec8e3;" target="_blank">WebSerial API</a>,
+        which FutureTerm uses to communicate with serial devices (Arduino, ESP32, flight controllers, etc.).
+      </p>
+      <p>
+        This lightweight helper app bridges the gap by running a local WebSocket server that FutureTerm connects to.
+        It only runs when you're using FutureTerm and shuts down automatically after 5 minutes of inactivity.
+      </p>
+      <div class="security-badge">
+        <svg width="14" height="14" viewBox="0 0 16 16" fill="currentColor"><path d="M8 0l8 3v5c0 4.418-3.582 8-8 8S0 12.418 0 8V3l8-3zm0 1.5L1.5 4v4c0 3.59 2.91 6.5 6.5 6.5s6.5-2.91 6.5-6.5V4L8 1.5z"/><path d="M7 8.793l-1.646-1.647-.708.708L7 10.207l3.354-3.353-.708-.708L7 8.793z"/></svg>
+        Runs on localhost only &middot; No network exposure &middot; Auto-shutdown
+      </div>
+    </div>
+
+    <div class="card">
+      <h2>Installation</h2>
+      <ol class="steps">
+        <li>Download <code>FutureTerm-Helper.dmg</code> using the button below</li>
+        <li>Open the DMG (a disk image — it mounts like a USB drive). Drag <strong>FutureTerm.app</strong> to the <strong>Applications</strong> shortcut inside, or open Finder &rsaquo; Applications and drag it there. Then eject the DMG from your desktop.</li>
+        <li>Go back to FutureTerm in your browser and click <strong>Connect</strong></li>
+        <li>When macOS asks to open FutureTerm, click <strong>Allow</strong> (first time only)</li>
+      </ol>
+    </div>
+
+    <div class="download-section">
+      <a class="download-btn" id="download-link" href="/bridge-helper/FutureTerm-Helper.dmg" download>
+        Download FutureTerm Helper
+      </a>
+      <p class="note">
+        macOS 10.15+ required &middot; Apple Silicon &amp; Intel supported &middot; ~1 MB download
+      </p>
+      <p class="note" id="gh-fallback" style="display: none;">
+        DMG not available locally.
+        <a href="https://github.com/luofang34/FutureTerm/releases/latest" style="color: #007acc;" target="_blank">Download from GitHub Releases</a>
+      </p>
+    </div>
+    <script>
+      // Check if DMG is available locally; if not, show GitHub fallback
+      fetch('/bridge-helper/FutureTerm-Helper.dmg', { method: 'HEAD' })
+        .then(r => { if (!r.ok) throw new Error(); })
+        .catch(() => {
+          console.log('FutureTerm: DMG not available locally, redirecting to GitHub Releases');
+          const link = document.getElementById('download-link');
+          link.href = 'https://github.com/luofang34/FutureTerm/releases/latest';
+          link.removeAttribute('download');
+          link.target = '_blank';
+          document.getElementById('gh-fallback').style.display = 'block';
+        });
+    </script>
+
+    <div class="card">
+      <h2>How it works</h2>
+      <p>
+        When you click <strong>Connect</strong> in FutureTerm:
+      </p>
+      <ol class="steps">
+        <li>FutureTerm detects that WebSerial is not available</li>
+        <li>It tries to connect to the local helper via WebSocket</li>
+        <li>If the helper isn't running, it launches automatically via <code>futureterm://</code> URL scheme</li>
+        <li>The helper provides serial port access through a secure local connection</li>
+      </ol>
+    </div>
+
+    <div class="card">
+      <h2>Troubleshooting</h2>
+      <p><strong>macOS blocks the app?</strong> A notification may appear — click <strong>Open</strong> or <strong>Allow</strong>. If blocked, go to System Settings &rsaquo; Privacy &amp; Security, scroll down to find FutureTerm, and click <strong>Open Anyway</strong>.</p>
+      <p><strong>macOS asks for serial port access?</strong> Click <strong>Allow</strong> when macOS shows a Privacy &amp; Security dialog asking if FutureTerm Helper can access serial devices. This is required to communicate with your device.</p>
+      <p><strong>Connection fails?</strong> Make sure no other app is using port 9876. The helper uses <code>ws://127.0.0.1:9876</code>.</p>
+      <p><strong>Want to uninstall?</strong> Simply delete <code>FutureTerm.app</code> from Applications. No background processes remain.</p>
+    </div>
+
+    <a class="back-link" href="/">&larr; Back to FutureTerm</a>
+  </div>
+</body>
+</html>
