@@ -475,32 +475,36 @@ pub fn App() -> impl IntoView {
                             }
                         }
 
-                        // Retry with progressive delays while user may be
-                        // clicking "Allow" in the macOS security dialog
-                        let retry_delays_ms: &[u32] = &[500, 1000, 1500, 2000, 2000, 2000];
+                        // Show install dialog immediately so users who don't have the
+                        // helper can act right away rather than watching a countdown.
+                        // The dialog auto-dismisses if a retry succeeds.
+                        set_show_bridge_install.set(true);
+                        manager.set_status.set("Starting helper app...".into());
+
+                        // Retry while macOS processes the URL scheme and the user
+                        // may be clicking "Allow" in the security dialog.
+                        // Total window: ~4 s (enough for open + Allow + startup).
+                        let retry_delays_ms: &[u32] = &[400, 800, 1200, 1500];
                         let mut success = false;
-                        for (i, &delay) in retry_delays_ms.iter().enumerate() {
+                        for &delay in retry_delays_ms.iter() {
                             gloo_timers::future::TimeoutFuture::new(delay).await;
                             ws_transport = transport_websocket::WebSocketTransport::new();
                             if ws_transport.connect(ws_url).await.is_ok() {
+                                set_show_bridge_install.set(false); // auto-dismiss
                                 success = true;
                                 break;
                             }
-                            manager.set_status.set(format!(
-                                "Waiting for helper... ({}/{})",
-                                i + 1,
-                                retry_delays_ms.len()
-                            ));
                         }
                         success
                     }
                 };
 
                 if !connected {
+                    // Install dialog is already visible (shown when URL scheme fired).
+                    // Update status so the user knows what to do next.
                     manager
                         .set_status
-                        .set("Helper app required for this browser".into());
-                    set_show_bridge_install.set(true);
+                        .set("Install the helper app and click Connect again".into());
                     return;
                 }
 
@@ -993,7 +997,7 @@ pub fn App() -> impl IntoView {
                             <button
                                 style="padding: 8px 16px; background: #444; color: #ccc; border: 1px solid #666; border-radius: 4px; cursor: pointer; font-size: 0.9rem;"
                                 on:click=move |_| set_show_bridge_install.set(false)>
-                                "Close"
+                                "Cancel"
                             </button>
                             <a
                                 href="/safari-helper"
