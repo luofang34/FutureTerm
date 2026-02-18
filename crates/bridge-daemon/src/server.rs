@@ -140,13 +140,15 @@ async fn handle_websocket(
                     let msg = ServerMessage::Data { data: encoded };
 
                     if let Ok(json) = msg.to_json() {
-                        if ws_sender.send(Message::Text(json.into())).await.is_err() {
+                        if let Err(e) = ws_sender.send(Message::Text(json.into())).await {
+                            eprintln!("WebSocket send (data) failed: {}", e);
                             break;
                         }
                     }
                 }
                 Some(json) = ws_rx.recv() => {
-                    if ws_sender.send(Message::Text(json.into())).await.is_err() {
+                    if let Err(e) = ws_sender.send(Message::Text(json.into())).await {
+                        eprintln!("WebSocket send (control) failed: {}", e);
                         break;
                     }
                 }
@@ -241,6 +243,16 @@ async fn handle_client_message(
                 );
             }
 
+            // Validate baud rate: must be a standard value (300–4,000,000).
+            // Prevents passing arbitrary values to the serial driver.
+            const MAX_BAUD: u32 = 4_000_000;
+            if baud_rate == 0 || baud_rate > MAX_BAUD {
+                return (
+                    ServerMessage::error(Some(id), format!("Invalid baud rate: {}", baud_rate)),
+                    None,
+                );
+            }
+
             let (disconnect_tx, disconnect_rx) = tokio::sync::oneshot::channel();
             match serial_manager
                 .open(&path, baud_rate, data_tx, Some(disconnect_tx))
@@ -275,13 +287,24 @@ async fn handle_client_message(
             data_bits,
             stop_bits,
             parity,
-        } => match serial_manager
-            .set_config(baud_rate, data_bits, stop_bits, parity)
-            .await
-        {
-            Ok(()) => (ServerMessage::ConfigSet { id }, None),
-            Err(e) => (ServerMessage::error(Some(id), e), None),
-        },
+        } => {
+            const MAX_BAUD: u32 = 4_000_000;
+            if let Some(br) = baud_rate {
+                if br == 0 || br > MAX_BAUD {
+                    return (
+                        ServerMessage::error(Some(id), format!("Invalid baud rate: {}", br)),
+                        None,
+                    );
+                }
+            }
+            match serial_manager
+                .set_config(baud_rate, data_bits, stop_bits, parity)
+                .await
+            {
+                Ok(()) => (ServerMessage::ConfigSet { id }, None),
+                Err(e) => (ServerMessage::error(Some(id), e), None),
+            }
+        }
     }
 }
 

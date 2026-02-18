@@ -112,11 +112,14 @@
 </head>
 <body>
   <div class="container">
-    <h1>FutureTerm</h1>
+    <h1 style="font-family: 'Impact', 'Arial Black', sans-serif; font-style: italic; letter-spacing: 1px;">FutureTerm</h1>
     <p class="subtitle">Serial Port Helper</p>
 
     <div class="card">
       <h2>Why is this needed?</h2>
+      <div style="background: #3a2a1a; border-left: 4px solid #ff9800; padding: 12px 16px; margin-bottom: 16px; border-radius: 4px;">
+        <strong>macOS only.</strong> This helper currently supports Mac only. iPad, iPhone, and Windows support is planned for a future release.
+      </div>
       <p>
         Some browsers (Safari, Firefox, etc.) don't support the
         <a href="https://developer.mozilla.org/en-US/docs/Web/API/Web_Serial_API" style="color: #7ec8e3;" target="_blank">WebSerial API</a>,
@@ -136,7 +139,7 @@
       <h2>Installation</h2>
       <ol class="steps">
         <li>Download <code>FutureTerm-Helper.dmg</code> using the button below</li>
-        <li>Open the DMG and drag <strong>FutureTerm.app</strong> to <code>/Applications</code></li>
+        <li>Open the DMG (a disk image — it mounts like a USB drive). Drag <strong>FutureTerm.app</strong> to the <strong>Applications</strong> shortcut inside, or open Finder &rsaquo; Applications and drag it there. Then eject the DMG from your desktop.</li>
         <li>Go back to FutureTerm in your browser and click <strong>Connect</strong></li>
         <li>When macOS asks to open FutureTerm, click <strong>Allow</strong> (first time only)</li>
       </ol>
@@ -159,8 +162,9 @@
       fetch('/bridge-helper/FutureTerm-Helper.dmg', { method: 'HEAD' })
         .then(r => { if (!r.ok) throw new Error(); })
         .catch(() => {
+          console.log('FutureTerm: DMG not available locally, redirecting to GitHub Releases');
           const link = document.getElementById('download-link');
-          link.href = 'https://github.com/nicedream/FutureTerm/releases/latest';
+          link.href = 'https://github.com/luofang34/FutureTerm/releases/latest';
           link.removeAttribute('download');
           link.target = '_blank';
           document.getElementById('gh-fallback').style.display = 'block';
@@ -182,7 +186,7 @@
 
     <div class="card">
       <h2>Troubleshooting</h2>
-      <p><strong>macOS blocks the app?</strong> Go to System Settings &gt; Privacy &amp; Security, scroll down and click "Open Anyway".</p>
+      <p><strong>macOS blocks the app?</strong> A notification may appear — click <strong>Open</strong> or <strong>Allow</strong>. If blocked, go to System Settings &rsaquo; Privacy &amp; Security, scroll down to find FutureTerm, and click <strong>Open Anyway</strong>.</p>
       <p><strong>macOS asks for serial port access?</strong> Click <strong>Allow</strong> when macOS shows a Privacy &amp; Security dialog asking if FutureTerm Helper can access serial devices. This is required to communicate with your device.</p>
       <p><strong>Connection fails?</strong> Make sure no other app is using port 9876. The helper uses <code>ws://127.0.0.1:9876</code>.</p>
       <p><strong>Want to uninstall?</strong> Simply delete <code>FutureTerm.app</code> from Applications. No background processes remain.</p>

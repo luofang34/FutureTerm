@@ -566,7 +566,9 @@ pub fn App() -> impl IntoView {
                         if let Some(path) = bridge_port_pick.get_untracked() {
                             set_bridge_ports.set(Vec::new());
                             if path.is_empty() {
-                                manager.set_status.set("Cancelled".into());
+                                manager
+                                    .set_status
+                                    .set("Cancelled — click Connect to try again".into());
                                 return;
                             }
                             break path;
@@ -610,7 +612,9 @@ pub fn App() -> impl IntoView {
                             if let Some(path) = bridge_port_pick.get_untracked() {
                                 set_bridge_ports.set(Vec::new());
                                 if path.is_empty() {
-                                    manager.set_status.set("Cancelled".into());
+                                    manager
+                                        .set_status
+                                        .set("Cancelled — click Connect to try again".into());
                                     return;
                                 }
                                 break path;
