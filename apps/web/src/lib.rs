@@ -508,6 +508,17 @@ pub fn App() -> impl IntoView {
                     return;
                 }
 
+                // Check daemon version — warn if helper needs an update.
+                // daemon_version() returns None only for daemons built before Hello was added.
+                // All released binaries (v0.1.0+) send Hello.
+                if ws_transport.daemon_version().is_none() {
+                    manager.set_status.set(
+                        "Helper app outdated — please download the latest version from the help page".into()
+                    );
+                    set_show_bridge_install.set(true);
+                    return;
+                }
+
                 // Bridge connected - list available serial ports
                 manager.set_status.set("Listing serial ports...".into());
 

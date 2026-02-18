@@ -120,6 +120,16 @@ async fn handle_websocket(
     let (mut ws_sender, mut ws_receiver) = ws_stream.split();
     let mut serial_manager = SerialManager::new();
 
+    // Send Hello immediately so the web app can detect version mismatches
+    // before any serial commands are exchanged.
+    let hello = ServerMessage::Hello {
+        version: env!("CARGO_PKG_VERSION").to_string(),
+    };
+    if let Ok(json) = hello.to_json() {
+        // Non-fatal: if Hello can't be sent the connection is already broken
+        let _ = ws_sender.send(Message::Text(json.into())).await;
+    }
+
     // Channel for serial data
     let (data_tx, mut data_rx) = mpsc::unbounded_channel::<Vec<u8>>();
 

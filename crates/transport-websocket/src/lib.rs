@@ -10,6 +10,10 @@ use web_sys::{BinaryType, MessageEvent, WebSocket};
 /// Timeout for WebSocket close operations (milliseconds)
 const WS_CLOSE_TIMEOUT_MS: i32 = 1000;
 
+/// How long to wait for the daemon's Hello message after connecting (ms).
+/// Old daemons (pre-Hello) send nothing, so timeout = "daemon is too old".
+const HELLO_TIMEOUT_MS: u32 = 200;
+
 /// Port info returned by bridge daemon's list_ports command
 #[derive(Debug, Clone, Deserialize)]
 pub struct BridgePortInfo {
@@ -42,6 +46,8 @@ pub struct WebSocketTransport {
     error_state: Rc<RefCell<Option<String>>>,
     /// Message ID counter for request-response matching
     next_id: Rc<Cell<u64>>,
+    /// Version string from daemon's Hello message (None = not yet received)
+    daemon_version: Rc<RefCell<Option<String>>>,
     /// Closures must be kept alive for callbacks
     _on_message: Option<Closure<dyn FnMut(MessageEvent)>>,
     _on_error: Option<Closure<dyn FnMut(web_sys::ErrorEvent)>>,
@@ -72,10 +78,18 @@ impl WebSocketTransport {
             control_messages: Rc::new(RefCell::new(Vec::new())),
             error_state: Rc::new(RefCell::new(None)),
             next_id: Rc::new(Cell::new(1)),
+            daemon_version: Rc::new(RefCell::new(None)),
             _on_message: None,
             _on_error: None,
             _on_close: None,
         }
+    }
+
+    /// Version string reported by the bridge daemon in its Hello message.
+    /// Returns `None` if no Hello was received within HELLO_TIMEOUT_MS after connecting,
+    /// which means the daemon is too old to support version negotiation.
+    pub fn daemon_version(&self) -> Option<String> {
+        self.daemon_version.borrow().clone()
     }
 
     /// Get the next message ID for request-response matching
@@ -101,6 +115,7 @@ impl WebSocketTransport {
         let control_messages = self.control_messages.clone();
         let error_state = self.error_state.clone();
         let error_state_msg = error_state.clone();
+        let daemon_version_cell = self.daemon_version.clone();
 
         // onmessage: Handle both JSON text (daemon protocol) and binary data
         let on_message = Closure::wrap(Box::new(move |event: MessageEvent| {
@@ -146,6 +161,16 @@ impl WebSocketTransport {
                     );
                     *error_state_msg.borrow_mut() =
                         Some(format!("Serial port disconnected: {}", reason));
+                } else if msg_type == "hello" {
+                    // Daemon version handshake — store for version compatibility check.
+                    let version = parsed
+                        .get("version")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("unknown")
+                        .to_string();
+                    #[cfg(debug_assertions)]
+                    web_sys::console::log_1(&format!("Bridge daemon version: {}", version).into());
+                    *daemon_version_cell.borrow_mut() = Some(version);
                 } else if msg_type == "written" {
                     // Fire-and-forget write response — discard to prevent unbounded growth.
                     // The write() call is non-blocking so nobody waits for this.
@@ -230,6 +255,18 @@ impl WebSocketTransport {
         self._on_message = Some(on_message);
         self._on_error = Some(on_error);
         self._on_close = Some(on_close);
+
+        // Wait briefly for Hello message (daemon sends it immediately on connect).
+        // On localhost this arrives in <5ms; HELLO_TIMEOUT_MS is a generous upper bound.
+        // If no Hello arrives (daemon too old), daemon_version() returns None.
+        let step_ms = 10_i32;
+        let steps = (HELLO_TIMEOUT_MS / step_ms as u32).max(1);
+        for _ in 0..steps {
+            if self.daemon_version.borrow().is_some() {
+                break;
+            }
+            sleep_ms(step_ms).await;
+        }
 
         Ok(())
     }

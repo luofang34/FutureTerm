@@ -35,6 +35,10 @@ pub enum ClientMessage {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum ServerMessage {
+    /// Sent immediately after WebSocket handshake so the web app can detect
+    /// version mismatches before any serial commands are exchanged.
+    Hello { version: String },
+
     /// Response to ListPorts
     PortsList { id: u64, ports: Vec<PortInfo> },
 
