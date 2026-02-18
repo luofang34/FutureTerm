@@ -265,8 +265,8 @@ LAUNCHER
         -srcfolder "${STAGING_DIR}" -ov -format UDZO "${DMG_PATH}" > /dev/null
     rm -rf "${STAGING_DIR}"
 
-    # Copy to safari-helper for local serving
-    local SAFARI_DIR="apps/web/safari-helper"
+    # Copy to bridge-helper for local serving
+    local SAFARI_DIR="apps/web/bridge-helper"
     if [ -d "${SAFARI_DIR}" ]; then
         cp "${DMG_PATH}" "${SAFARI_DIR}/"
     fi

@@ -1000,7 +1000,7 @@ pub fn App() -> impl IntoView {
                                 "Cancel"
                             </button>
                             <a
-                                href="/safari-helper"
+                                href="/bridge-helper"
                                 target="_blank"
                                 style="padding: 8px 16px; background: #007acc; color: white; border: none; border-radius: 4px; cursor: pointer; font-size: 0.9rem; text-decoration: none; display: inline-block;">
                                 "Download Helper"

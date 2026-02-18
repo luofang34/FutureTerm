@@ -51,9 +51,9 @@ socat.log
 # Build artifacts (DMG, app bundles, compiled helper binary)
 *.dmg
 apps/bridge-macos/FutureTerm.app/
-apps/web/safari-helper/*.dmg
-apps/web/safari-helper/bridge-daemon
-apps/web/safari-helper/bridge-daemon-*
+apps/web/bridge-helper/*.dmg
+apps/web/bridge-helper/bridge-daemon
+apps/web/bridge-helper/bridge-daemon-*
 
 # Markdown documentation
 *.md
