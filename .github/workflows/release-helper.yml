@@ -25,6 +25,8 @@ jobs:
             runner: macos-latest
             arch: x86_64
     runs-on: ${{ matrix.runner }}
+    # Signing secrets are scoped to this environment — fork PRs cannot access them
+    environment: signing
     steps:
       - uses: actions/checkout@v4
 
@@ -55,6 +57,25 @@ jobs:
       - name: Build bridge-daemon
         run: cargo build --release -p bridge-daemon --target ${{ matrix.target }}
 
+      - name: Generate app icon
+        run: |
+          brew install librsvg 2>/dev/null || true
+          ICONSET_DIR=$(mktemp -d)/FutureTerm.iconset
+          mkdir -p "${ICONSET_DIR}"
+          SVG_SRC="apps/bridge-macos/icon.svg"
+          for size in 16 32 64 128 256 512 1024; do
+            rsvg-convert -w "$size" -h "$size" "${SVG_SRC}" \
+              -o "${ICONSET_DIR}/icon_${size}x${size}.png"
+          done
+          cp "${ICONSET_DIR}/icon_32x32.png"     "${ICONSET_DIR}/icon_16x16@2x.png"
+          cp "${ICONSET_DIR}/icon_64x64.png"     "${ICONSET_DIR}/icon_32x32@2x.png"
+          cp "${ICONSET_DIR}/icon_256x256.png"   "${ICONSET_DIR}/icon_128x128@2x.png"
+          cp "${ICONSET_DIR}/icon_512x512.png"   "${ICONSET_DIR}/icon_256x256@2x.png"
+          cp "${ICONSET_DIR}/icon_1024x1024.png" "${ICONSET_DIR}/icon_512x512@2x.png"
+          rm -f "${ICONSET_DIR}/icon_64x64.png" "${ICONSET_DIR}/icon_1024x1024.png"
+          iconutil -c icns "${ICONSET_DIR}" -o "apps/bridge-macos/AppIcon.icns"
+          rm -rf "$(dirname "${ICONSET_DIR}")"
+
       - name: Create app bundle
         run: |
           APP_BUNDLE="FutureTerm.app"
@@ -62,6 +83,10 @@ jobs:
           mkdir -p "${APP_BUNDLE}/Contents/MacOS" "${APP_BUNDLE}/Contents/Resources"
           cp "target/${{ matrix.target }}/release/bridge-daemon" "${APP_BUNDLE}/Contents/MacOS/bridge-daemon-bin"
           cp "apps/bridge-macos/Info.plist" "${APP_BUNDLE}/Contents/"
+          # Copy icon if generated
+          if [ -f "apps/bridge-macos/AppIcon.icns" ]; then
+            cp "apps/bridge-macos/AppIcon.icns" "${APP_BUNDLE}/Contents/Resources/"
+          fi
           # Create launcher script (prevents macOS "not responding" on URL scheme launch)
           cat > "${APP_BUNDLE}/Contents/MacOS/bridge-daemon" << 'LAUNCHER'
           #!/bin/bash
@@ -181,3 +206,19 @@ jobs:
           files: "*.dmg"
           draft: false
           prerelease: false
+
+  # Trigger a pages redeploy so the new signed DMG is picked up immediately
+  redeploy-pages:
+    needs: release
+    runs-on: ubuntu-latest
+    if: startsWith(github.ref, 'refs/tags/')
+    permissions:
+      actions: write
+    steps:
+      - name: Trigger pages redeploy
+        run: |
+          gh workflow run deploy-pages.yml \
+            --repo "${{ github.repository }}" \
+            --ref main
+        env:
+          GH_TOKEN: ${{ github.token }}
