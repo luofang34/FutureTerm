@@ -1350,28 +1350,55 @@ async fn bridge_auto_probe(
     // This mirrors WebSerial behavior: probe data is shown instead of discarded,
     // so the user sees the device prompt immediately after connection.
     //
-    // Strip the Ctrl+C preamble: the probe sends \x03\r so the response starts
-    // with some combination of "^C", "\r", "\n" before the actual prompt.
-    // The exact sequence varies by shell (e.g. "^C\r\n\r\n" on bash+pty).
-    // Loop to strip all leading '^C', '\r', '\n' bytes until we reach content.
+    // Strip the preamble before the actual prompt. The probe sends \x03\r, so
+    // the response begins with bash's bracketed-paste escape sequences and
+    // CR/LF control codes before the visible prompt, e.g.:
+    //   \x1B[?2004l \r \x1B[?2004h \r\n \x1B[?2004l \r\r\n \x1B[?2004h (prompt)
+    //
+    // Strategy: walk the buffer tracking the byte position immediately after
+    // the most recent \r\n boundary. ANSI escape sequences are consumed without
+    // updating the line-start position (they produce no visible newline).
+    // Stop at the first printable byte (>= 0x20) — that is on the prompt line.
+    // Inject everything from the last line-start so the prompt lands on line 1.
     if !best_buffer.is_empty() {
-        let mut start = 0usize;
+        let mut i = 0usize;
+        let mut line_start = 0usize;
         loop {
-            // Strip literal "^C" echo (0x5E 0x43)
-            if best_buffer.get(start..start + 2) == Some(b"^C") {
-                start += 2;
-                continue;
-            }
-            // Strip leading \r and \n
-            if let Some(&b) = best_buffer.get(start) {
-                if b == b'\r' || b == b'\n' {
-                    start += 1;
-                    continue;
+            let Some(&byte) = best_buffer.get(i) else {
+                break;
+            };
+            if byte == 0x1B {
+                // ANSI escape sequence — skip entirely, do NOT update line_start.
+                i += 1;
+                if best_buffer.get(i) == Some(&b'[') {
+                    // CSI sequence: ESC [ <params…> <letter>
+                    i += 1;
+                    while let Some(&b) = best_buffer.get(i) {
+                        i += 1;
+                        if b.is_ascii_alphabetic() {
+                            break;
+                        }
+                    }
+                } else {
+                    // 2-char escape (ESC X)
+                    i += 1;
                 }
+            } else if byte == b'\r' || byte == b'\n' {
+                i += 1;
+                // Consume \r\n as a single line ending
+                if byte == b'\r' && best_buffer.get(i) == Some(&b'\n') {
+                    i += 1;
+                }
+                line_start = i;
+            } else if byte >= 0x20 {
+                // First printable character — prompt starts at line_start
+                break;
+            } else {
+                // Other control characters (e.g. \x03, \t)
+                i += 1;
             }
-            break;
         }
-        let display_data = best_buffer.get(start..).unwrap_or(&[]);
+        let display_data = best_buffer.get(line_start..).unwrap_or(&[]);
         if !display_data.is_empty() {
             let ts_us = (js_sys::Date::now() * 1000.0) as u64;
             manager.send_worker_message(crate::protocol::UiToWorker::IngestData {
