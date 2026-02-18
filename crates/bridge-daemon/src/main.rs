@@ -7,10 +7,18 @@ use tokio::net::TcpListener;
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    // Parse port from argv (default 9876)
-    let port = std::env::args()
+    // Parse port from argv (default 9876).
+    // Reject privileged ports (< 1024) to avoid permission errors and surprises.
+    let port: u16 = std::env::args()
         .nth(1)
-        .and_then(|s| s.parse().ok())
+        .and_then(|s| {
+            let p: u16 = s.parse().ok()?;
+            if p >= 1024 {
+                Some(p)
+            } else {
+                None
+            }
+        })
         .unwrap_or(9876);
 
     eprintln!("FutureTerm Bridge Daemon v{}", env!("CARGO_PKG_VERSION"));

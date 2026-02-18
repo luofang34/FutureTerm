@@ -14,11 +14,20 @@ use tokio_tungstenite::WebSocketStream;
 /// this prevents a malicious page from allocating a large buffer in the daemon.
 const MAX_WS_MESSAGE_SIZE: usize = 1024 * 1024;
 
+/// Production: only accept connections from the deployed web app.
+/// Debug builds also allow localhost dev servers.
+#[cfg(not(debug_assertions))]
 const ALLOWED_ORIGINS: &[&str] = &[
     "https://futureterm.com",
     // "https://futureterm.app",  // User owns this domain, enable when ready
-    "http://localhost:8080",
-    "http://127.0.0.1:8080",
+];
+
+#[cfg(debug_assertions)]
+const ALLOWED_ORIGINS: &[&str] = &[
+    "https://futureterm.com",
+    // "https://futureterm.app",  // User owns this domain, enable when ready
+    "http://localhost:8080", // Dev server (debug builds only)
+    "http://127.0.0.1:8080", // Dev server (debug builds only)
 ];
 
 #[allow(dead_code)] // Used in tests
@@ -239,14 +248,7 @@ async fn handle_client_message(
             baud_rate,
         } => {
             // Validate path to prevent access to non-serial device nodes (e.g. /dev/mem).
-            let is_valid_path = path.starts_with("/dev/cu.")
-                || path.starts_with("/dev/tty.")
-                || path.starts_with("/dev/serial")
-                || path.starts_with("COM")    // Windows COM ports
-                || (path.starts_with("/dev/ttyUSB") || path.starts_with("/dev/ttyACM")
-                    || path.starts_with("/dev/ttyS")); // Linux serial
-
-            if !is_valid_path {
+            if !is_valid_serial_path(&path) {
                 return (
                     ServerMessage::error(Some(id), format!("Invalid serial port path: {}", path)),
                     None,
@@ -318,6 +320,25 @@ async fn handle_client_message(
     }
 }
 
+/// Check whether a path looks like a serial port node.
+/// Rejects device nodes that are not serial ports (e.g. /dev/mem, /dev/disk0)
+/// and path-traversal attempts (e.g. /dev/cu.../../etc/passwd).
+/// This is defense-in-depth: tokio-serial only opens tty/COM devices anyway,
+/// but rejecting early gives a clear error message.
+fn is_valid_serial_path(path: &str) -> bool {
+    // Reject path traversal attempts regardless of prefix
+    if path.contains("..") {
+        return false;
+    }
+    path.starts_with("/dev/cu.")       // macOS (cu = call-out)
+        || path.starts_with("/dev/tty.")    // macOS (tty = dialin)
+        || path.starts_with("/dev/serial")  // Linux by-id/by-path symlinks
+        || path.starts_with("COM")          // Windows COM ports
+        || path.starts_with("/dev/ttyUSB")  // Linux USB serial
+        || path.starts_with("/dev/ttyACM")  // Linux CDC-ACM
+        || path.starts_with("/dev/ttyS") // Linux native serial
+}
+
 /// Simple base64 encoding
 fn base64_encode(data: &[u8]) -> String {
     base64::engine::general_purpose::STANDARD.encode(data)
@@ -358,10 +379,46 @@ mod tests {
     }
 
     #[test]
+    fn test_valid_serial_paths() {
+        assert!(is_valid_serial_path("/dev/cu.usbserial-1234"));
+        assert!(is_valid_serial_path("/dev/cu.SLAB_USBtoUART"));
+        assert!(is_valid_serial_path("/dev/tty.usbmodem12341"));
+        assert!(is_valid_serial_path("/dev/ttyUSB0"));
+        assert!(is_valid_serial_path("/dev/ttyACM0"));
+        assert!(is_valid_serial_path("/dev/ttyS0"));
+        assert!(is_valid_serial_path("/dev/serial/by-id/usb-FTDI-if00"));
+        assert!(is_valid_serial_path("COM3"));
+        assert!(is_valid_serial_path("COM10"));
+    }
+
+    #[test]
+    fn test_invalid_serial_paths() {
+        // Block non-serial device nodes
+        assert!(!is_valid_serial_path("/dev/mem"));
+        assert!(!is_valid_serial_path("/dev/null"));
+        assert!(!is_valid_serial_path("/dev/zero"));
+        assert!(!is_valid_serial_path("/dev/disk0"));
+        assert!(!is_valid_serial_path("/dev/kmem"));
+        assert!(!is_valid_serial_path("/etc/passwd"));
+        // Block path traversal attempts
+        assert!(!is_valid_serial_path("../../etc/passwd"));
+        assert!(!is_valid_serial_path("/dev/cu.../../etc/passwd"));
+    }
+
+    #[test]
     fn test_allowed_origins() {
         assert!(ALLOWED_ORIGINS.contains(&"https://futureterm.com"));
-        assert!(ALLOWED_ORIGINS.contains(&"http://localhost:8080"));
-        assert!(ALLOWED_ORIGINS.contains(&"http://127.0.0.1:8080"));
         assert!(!ALLOWED_ORIGINS.contains(&"https://evil.com"));
+        // Localhost dev origins are only present in debug builds
+        #[cfg(debug_assertions)]
+        {
+            assert!(ALLOWED_ORIGINS.contains(&"http://localhost:8080"));
+            assert!(ALLOWED_ORIGINS.contains(&"http://127.0.0.1:8080"));
+        }
+        #[cfg(not(debug_assertions))]
+        {
+            assert!(!ALLOWED_ORIGINS.contains(&"http://localhost:8080"));
+            assert!(!ALLOWED_ORIGINS.contains(&"http://127.0.0.1:8080"));
+        }
     }
 }

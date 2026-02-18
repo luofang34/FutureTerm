@@ -442,6 +442,9 @@ pub fn App() -> impl IntoView {
                     .set_status
                     .set("WebSerial not available, trying bridge...".into());
 
+                // ws:// (not wss://) is intentional: 127.0.0.1 is a "potentially
+                // trustworthy URL" per W3C Secure Contexts spec, so browsers exempt
+                // it from mixed-content blocking even when the page is on HTTPS.
                 let ws_url = "ws://127.0.0.1:9876";
                 let mut ws_transport = transport_websocket::WebSocketTransport::new();
 
