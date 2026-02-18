@@ -1,12 +1,18 @@
 use crate::protocol::{ClientMessage, ServerMessage};
 use crate::serial::SerialManager;
+use base64::Engine;
 use futures_util::{SinkExt, StreamExt};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{mpsc, RwLock};
+use tokio_tungstenite::tungstenite::protocol::WebSocketConfig;
 use tokio_tungstenite::tungstenite::Message;
 use tokio_tungstenite::WebSocketStream;
+
+/// Maximum WebSocket message size (1 MB). Serial write payloads are tiny;
+/// this prevents a malicious page from allocating a large buffer in the daemon.
+const MAX_WS_MESSAGE_SIZE: usize = 1024 * 1024;
 
 const ALLOWED_ORIGINS: &[&str] = &[
     "https://futureterm.com",
@@ -93,9 +99,15 @@ async fn handle_connection(
             }
         };
 
-    let ws_stream = tokio_tungstenite::accept_hdr_async(stream, callback)
-        .await
-        .map_err(|e| format!("WebSocket handshake failed: {}", e))?;
+    // Apply message size limit to prevent large-payload DoS.
+    let ws_config = WebSocketConfig::default()
+        .max_message_size(Some(MAX_WS_MESSAGE_SIZE))
+        .max_frame_size(Some(MAX_WS_MESSAGE_SIZE));
+
+    let ws_stream =
+        tokio_tungstenite::accept_hdr_async_with_config(stream, callback, Some(ws_config))
+            .await
+            .map_err(|e| format!("WebSocket handshake failed: {}", e))?;
 
     handle_websocket(ws_stream, last_activity).await
 }
@@ -214,6 +226,21 @@ async fn handle_client_message(
             path,
             baud_rate,
         } => {
+            // Validate path to prevent access to non-serial device nodes (e.g. /dev/mem).
+            let is_valid_path = path.starts_with("/dev/cu.")
+                || path.starts_with("/dev/tty.")
+                || path.starts_with("/dev/serial")
+                || path.starts_with("COM")    // Windows COM ports
+                || (path.starts_with("/dev/ttyUSB") || path.starts_with("/dev/ttyACM")
+                    || path.starts_with("/dev/ttyS")); // Linux serial
+
+            if !is_valid_path {
+                return (
+                    ServerMessage::error(Some(id), format!("Invalid serial port path: {}", path)),
+                    None,
+                );
+            }
+
             let (disconnect_tx, disconnect_rx) = tokio::sync::oneshot::channel();
             match serial_manager
                 .open(&path, baud_rate, data_tx, Some(disconnect_tx))
@@ -260,14 +287,7 @@ async fn handle_client_message(
 
 /// Simple base64 encoding
 fn base64_encode(data: &[u8]) -> String {
-    use std::io::Write;
-    let mut buf = Vec::new();
-    {
-        let mut encoder =
-            base64::write::EncoderWriter::new(&mut buf, &base64::engine::general_purpose::STANDARD);
-        encoder.write_all(data).unwrap_or_default();
-    }
-    String::from_utf8(buf).unwrap_or_default()
+    base64::engine::general_purpose::STANDARD.encode(data)
 }
 
 /// Simple base64 decoding

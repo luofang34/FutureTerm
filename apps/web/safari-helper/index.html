@@ -135,7 +135,7 @@
     <div class="card">
       <h2>Installation</h2>
       <ol class="steps">
-        <li>Download <code>FutureTerm.dmg</code> using the button below</li>
+        <li>Download <code>FutureTerm-Helper.dmg</code> using the button below</li>
         <li>Open the DMG and drag <strong>FutureTerm.app</strong> to <code>/Applications</code></li>
         <li>Go back to FutureTerm in your browser and click <strong>Connect</strong></li>
         <li>When macOS asks to open FutureTerm, click <strong>Allow</strong> (first time only)</li>
@@ -147,11 +147,11 @@
         Download FutureTerm Helper
       </a>
       <p class="note">
-        macOS 12+ required &middot; Apple Silicon &amp; Intel supported &middot; ~1 MB download
+        macOS 10.15+ required &middot; Apple Silicon &amp; Intel supported &middot; ~1 MB download
       </p>
       <p class="note" id="gh-fallback" style="display: none;">
         DMG not available locally.
-        <a href="https://github.com/nicedream/FutureTerm/releases/latest" style="color: #007acc;" target="_blank">Download from GitHub Releases</a>
+        <a href="https://github.com/luofang34/FutureTerm/releases/latest" style="color: #007acc;" target="_blank">Download from GitHub Releases</a>
       </p>
     </div>
     <script>
@@ -183,6 +183,7 @@
     <div class="card">
       <h2>Troubleshooting</h2>
       <p><strong>macOS blocks the app?</strong> Go to System Settings &gt; Privacy &amp; Security, scroll down and click "Open Anyway".</p>
+      <p><strong>macOS asks for serial port access?</strong> Click <strong>Allow</strong> when macOS shows a Privacy &amp; Security dialog asking if FutureTerm Helper can access serial devices. This is required to communicate with your device.</p>
       <p><strong>Connection fails?</strong> Make sure no other app is using port 9876. The helper uses <code>ws://127.0.0.1:9876</code>.</p>
       <p><strong>Want to uninstall?</strong> Simply delete <code>FutureTerm.app</code> from Applications. No background processes remain.</p>
     </div>

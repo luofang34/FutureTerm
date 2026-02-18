@@ -121,6 +121,9 @@ pub fn App() -> impl IntoView {
     let bridge_active: Rc<Cell<bool>> = Rc::new(Cell::new(false));
     let bridge_closing: Rc<Cell<bool>> = Rc::new(Cell::new(false));
     let bridge_tx_queue: Rc<RefCell<Vec<Vec<u8>>>> = Rc::new(RefCell::new(Vec::new()));
+    // Pending baud rate change for bridge mode (0 = no pending change).
+    // Written by the reconfigure effect, read+cleared by the bridge loop.
+    let bridge_pending_baud: Rc<Cell<u32>> = Rc::new(Cell::new(0));
     // Bridge port picker signals (Copy signals, no clone needed)
     let (bridge_ports, set_bridge_ports) = create_signal::<Vec<(String, String)>>(Vec::new());
     let (bridge_port_pick, set_bridge_port_pick) = create_signal::<Option<String>>(None);
@@ -297,7 +300,9 @@ pub fn App() -> impl IntoView {
     let bridge_active_for_connect = bridge_active.clone();
     let bridge_closing_for_connect = bridge_closing.clone();
     let bridge_tx_queue_for_connect = bridge_tx_queue.clone();
+    let bridge_pending_baud_for_connect = bridge_pending_baud.clone();
     let bridge_active_reconf = bridge_active.clone();
+    let bridge_pending_baud_reconf = bridge_pending_baud.clone();
     let bridge_active_term = bridge_active.clone();
     let bridge_tx_queue_term = bridge_tx_queue.clone();
 
@@ -393,6 +398,7 @@ pub fn App() -> impl IntoView {
         let bridge_active_connect = bridge_active_for_connect.clone();
         let bridge_closing_connect = bridge_closing_for_connect.clone();
         let bridge_tx_queue_connect = bridge_tx_queue_for_connect.clone();
+        let bridge_pending_baud_connect = bridge_pending_baud_for_connect.clone();
 
         spawn_local(async move {
             let Some(window) = web_sys::window() else {
@@ -634,7 +640,7 @@ pub fn App() -> impl IntoView {
                 }
 
                 // ── Auto-Probe Baud Rate ──
-                let final_baud = if current_baud == 0 {
+                let mut final_baud = if current_baud == 0 {
                     match bridge_auto_probe(&ws_transport, &manager).await {
                         Ok(baud) => baud,
                         Err(e) => {
@@ -680,6 +686,25 @@ pub fn App() -> impl IntoView {
                         // Check if bridge was deactivated (user disconnect)
                         if !bridge_active_connect.get() {
                             break 'bridge;
+                        }
+
+                        // Apply pending baud rate change (set by reconfigure effect)
+                        {
+                            let pending = bridge_pending_baud_connect.get();
+                            if pending > 0 {
+                                bridge_pending_baud_connect.set(0);
+                                if ws_transport.set_baud_rate(pending).await.is_ok() {
+                                    final_baud = pending;
+                                    manager.set_detected_baud.set(final_baud);
+                                    manager.send_worker_message(UiToWorker::Connect {
+                                        baud_rate: final_baud,
+                                    });
+                                    manager.set_status.set(format!(
+                                        "Reconfigured: {} @ {}",
+                                        port_path, final_baud
+                                    ));
+                                }
+                            }
                         }
 
                         // Drain TX queue and send to daemon
@@ -776,6 +801,9 @@ pub fn App() -> impl IntoView {
                     }
 
                     if !reconnected {
+                        manager.set_status.set(
+                            "Device not found after retries. Click Connect to try again.".into(),
+                        );
                         break 'bridge; // Give up after all retries
                     }
                     // Reconnected - continue outer loop (resume read/write)
@@ -880,24 +908,22 @@ pub fn App() -> impl IntoView {
         let f = framing.get();
         let af = active_framing.get();
 
-        // Only reconfigure if already connected via WebSerial (not bridge mode)
-        if connected.get_untracked() && !bridge_active_reconf.get() {
-            let manager_r = manager_reconf.clone();
-
-            spawn_local(async move {
-                // If b=0 and f=Auto, we assume it's the "Auto" state and don't force reconfig
-                // (unless we add a "Re-Scan" button later, but for now this prevents redundant
-                // loops if both set to Auto) Allow Auto (0 / Auto) to trigger
-                // reconfiguration too
-
-                #[cfg(debug_assertions)]
-                web_sys::console::log_1(&"Dynamically Reconfiguring Port...".into());
-
-                // Manager Reconfigure (Handles Close -> Open -> Loop)
-                // Pass `b`, `f`, and `af` (active_framing).
-                // If f=Auto, active_framing preserves detected value across baud changes.
-                manager_r.reconfigure(b, f, af);
-            });
+        if connected.get_untracked() {
+            if bridge_active_reconf.get() {
+                // Bridge mode: signal pending baud change; bridge loop applies it.
+                // Only baud changes are supported; framing is handled by the worker.
+                if b > 0 {
+                    bridge_pending_baud_reconf.set(b);
+                }
+            } else {
+                // WebSerial mode: use existing reconfigure path
+                let manager_r = manager_reconf.clone();
+                spawn_local(async move {
+                    #[cfg(debug_assertions)]
+                    web_sys::console::log_1(&"Dynamically Reconfiguring Port...".into());
+                    manager_r.reconfigure(b, f, af);
+                });
+            }
         }
     });
 
