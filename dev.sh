@@ -223,12 +223,43 @@ build_bridge() {
     echo -e "${YELLOW}Building bridge-daemon (release)...${NC}"
     cargo build --release -p bridge-daemon
 
+    # Generate app icon from SVG source (requires rsvg-convert: brew install librsvg)
+    echo -e "${YELLOW}Generating app icon...${NC}"
+    local ICONSET_DIR
+    ICONSET_DIR=$(mktemp -d)/FutureTerm.iconset
+    mkdir -p "${ICONSET_DIR}"
+    if ! command -v rsvg-convert &>/dev/null; then
+        echo -e "${RED}rsvg-convert not found — skipping icon (brew install librsvg)${NC}"
+    else
+        local SVG_SRC="${BRIDGE_DIR}/icon.svg"
+        # Render all required macOS icon sizes from the single SVG source
+        for size in 16 32 64 128 256 512 1024; do
+            rsvg-convert -w "$size" -h "$size" "${SVG_SRC}" \
+                -o "${ICONSET_DIR}/icon_${size}x${size}.png" 2>/dev/null
+        done
+        # @2x (HiDPI) variants — copy from next size up
+        cp "${ICONSET_DIR}/icon_32x32.png"   "${ICONSET_DIR}/icon_16x16@2x.png"
+        cp "${ICONSET_DIR}/icon_64x64.png"   "${ICONSET_DIR}/icon_32x32@2x.png"
+        cp "${ICONSET_DIR}/icon_256x256.png" "${ICONSET_DIR}/icon_128x128@2x.png"
+        cp "${ICONSET_DIR}/icon_512x512.png" "${ICONSET_DIR}/icon_256x256@2x.png"
+        cp "${ICONSET_DIR}/icon_1024x1024.png" "${ICONSET_DIR}/icon_512x512@2x.png"
+        # Remove non-standard sizes used only for @2x sources
+        rm -f "${ICONSET_DIR}/icon_64x64.png" "${ICONSET_DIR}/icon_1024x1024.png"
+        iconutil -c icns "${ICONSET_DIR}" -o "${BRIDGE_DIR}/AppIcon.icns"
+        rm -rf "$(dirname "${ICONSET_DIR}")"
+        echo -e "${GREEN}Icon generated: ${BRIDGE_DIR}/AppIcon.icns${NC}"
+    fi
+
     # Create app bundle
     echo -e "${YELLOW}Creating app bundle...${NC}"
     rm -rf "${APP_BUNDLE}"
     mkdir -p "${APP_BUNDLE}/Contents/MacOS" "${APP_BUNDLE}/Contents/Resources"
     cp target/release/bridge-daemon "${APP_BUNDLE}/Contents/MacOS/bridge-daemon-bin"
     cp "${BRIDGE_DIR}/Info.plist" "${APP_BUNDLE}/Contents/"
+    # Copy icon if generated
+    if [ -f "${BRIDGE_DIR}/AppIcon.icns" ]; then
+        cp "${BRIDGE_DIR}/AppIcon.icns" "${APP_BUNDLE}/Contents/Resources/"
+    fi
 
     # Create launcher script (prevents macOS "not responding" dialog on URL scheme launch)
     cat > "${APP_BUNDLE}/Contents/MacOS/bridge-daemon" << 'LAUNCHER'

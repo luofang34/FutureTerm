@@ -1,0 +1,13 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1024 1024" width="1024" height="1024">
+  <!-- Dark background matching app theme (#1a1a1a) -->
+  <rect width="1024" height="1024" fill="#1a1a1a"/>
+  <!-- "F" in Impact italic — matches FutureTerm logo font -->
+  <text
+    x="490"
+    y="820"
+    font-family="Impact, 'Arial Black', 'Helvetica Neue', sans-serif"
+    font-style="italic"
+    font-size="860"
+    fill="#ffffff"
+    text-anchor="middle">F</text>
+</svg>

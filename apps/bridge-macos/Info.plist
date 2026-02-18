@@ -25,6 +25,10 @@
 	<key>CFBundleInfoDictionaryVersion</key>
 	<string>6.0</string>
 
+	<!-- App Icon (generated from icon.svg at build time) -->
+	<key>CFBundleIconFile</key>
+	<string>AppIcon</string>
+
 	<!-- Package Type -->
 	<key>CFBundlePackageType</key>
 	<string>APPL</string>
