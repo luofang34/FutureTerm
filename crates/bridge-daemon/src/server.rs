@@ -152,14 +152,9 @@ async fn handle_websocket(
 
         match msg {
             Message::Text(text) => {
-                // Log all incoming messages for diagnostics
-                let preview = &text[..text.len().min(120)];
-                eprintln!("DAEMON RX: {}", preview);
-
                 let (response, disconnect_rx) =
                     handle_client_message(&text, &mut serial_manager, data_tx.clone()).await;
                 let json = response.to_json()?;
-                eprintln!("DAEMON TX: {}", &json[..json.len().min(80)]);
                 ws_tx
                     .send(json)
                     .map_err(|e| format!("Failed to send response: {}", e))?;

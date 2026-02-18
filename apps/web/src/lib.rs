@@ -1221,6 +1221,9 @@ async fn bridge_auto_probe(
     let mut best_baud = 115200u32;
     let mut best_score = 0.0_f64;
     let mut best_protocol: Option<&str> = None;
+    // Preserve data collected at the winning baud rate so we can show it in the terminal
+    // (mirrors WebSerial behavior where probe data is forwarded directly to the worker).
+    let mut best_buffer: Vec<u8> = Vec::new();
 
     for &baud in BAUD_CANDIDATES {
         manager
@@ -1238,8 +1241,12 @@ async fn bridge_auto_probe(
         gloo_timers::future::TimeoutFuture::new(80).await;
         ws_transport.clear_rx_buffer();
 
-        // Send wakeup character (many devices respond to CR)
-        let _ = ws_transport.write(b"\r").await;
+        // Send Ctrl+C (0x03) then CR.
+        // Ctrl+C terminates any stuck command (caused by garbage bytes from wrong-baud probes)
+        // and returns to the shell prompt. CR then executes an empty command to get a fresh
+        // prompt. The combined response (~50 bytes: "^C\r\n<prompt>\r\n<prompt>") is larger
+        // than a bare CR response (~30 bytes), improving score reliability.
+        let _ = ws_transport.write(b"\x03\r").await;
 
         // Wait to collect data at this baud rate.
         // Covers: WS round-trip (~10ms) + device response (~10-100ms) +
@@ -1308,11 +1315,15 @@ async fn bridge_auto_probe(
             best_score = score;
             best_baud = baud;
             best_protocol = protocol;
+            best_buffer = buffer.clone();
         }
 
-        // Early exit on high confidence (same thresholds as Chrome prober)
+        // Early exit on high confidence (same thresholds as Chrome prober).
+        // At high baud rates (>=1Mbps), a bash prompt is ~30 bytes — use a lower
+        // min_bytes threshold so we exit early instead of continuing to test all bauds.
         let threshold = if baud >= 1_000_000 { 0.85 } else { 0.98 };
-        if best_score > threshold && buffer.len() > 64 {
+        let min_bytes = if baud >= 1_000_000 { 24 } else { 64 };
+        if best_score > threshold && buffer.len() > min_bytes {
             #[cfg(debug_assertions)]
             web_sys::console::log_1(
                 &format!(
@@ -1335,8 +1346,44 @@ async fn bridge_auto_probe(
         .await
         .map_err(|e| format!("Failed to set final baud rate: {}", e))?;
 
-    // Drain any stale data from probing before entering read loop
-    ws_transport.clear_rx_buffer();
+    // Forward the data collected at the winning baud rate to the terminal.
+    // This mirrors WebSerial behavior: probe data is shown instead of discarded,
+    // so the user sees the device prompt immediately after connection.
+    //
+    // Strip the Ctrl+C preamble: the probe sends \x03\r so the response starts
+    // with some combination of "^C", "\r", "\n" before the actual prompt.
+    // The exact sequence varies by shell (e.g. "^C\r\n\r\n" on bash+pty).
+    // Loop to strip all leading '^C', '\r', '\n' bytes until we reach content.
+    if !best_buffer.is_empty() {
+        let mut start = 0usize;
+        loop {
+            // Strip literal "^C" echo (0x5E 0x43)
+            if best_buffer.get(start..start + 2) == Some(b"^C") {
+                start += 2;
+                continue;
+            }
+            // Strip leading \r and \n
+            if let Some(&b) = best_buffer.get(start) {
+                if b == b'\r' || b == b'\n' {
+                    start += 1;
+                    continue;
+                }
+            }
+            break;
+        }
+        let display_data = best_buffer.get(start..).unwrap_or(&[]);
+        if !display_data.is_empty() {
+            let ts_us = (js_sys::Date::now() * 1000.0) as u64;
+            manager.send_worker_message(crate::protocol::UiToWorker::IngestData {
+                data: display_data.to_vec(),
+                timestamp_us: ts_us,
+            });
+        }
+    }
+
+    // Do NOT clear rx_buffer here. Any data that arrived since the probe read
+    // (including additional prompt output) is valid and will be picked up by
+    // the bridge read loop.
 
     let protocol_str = best_protocol.unwrap_or("text");
     manager.set_status.set(format!(

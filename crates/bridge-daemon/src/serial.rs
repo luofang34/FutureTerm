@@ -242,6 +242,21 @@ impl SerialManager {
             port_guard
                 .set_baud_rate(baud)
                 .map_err(|e| format!("Failed to set baud rate: {}", e))?;
+
+            // Re-apply flow control and signals after every baud rate change.
+            // On macOS the FTDI driver (AppleUSBFTDI) may reset CRTSCTS back to
+            // enabled as a side-effect of tcsetattr() during the baud switch.
+            // With CRTSCTS on and CTS unasserted (3-wire connection), the FT232
+            // buffers writes silently — TX appears to succeed but nothing is sent.
+            if let Err(e) = port_guard.set_flow_control(tokio_serial::FlowControl::None) {
+                eprintln!("Warning: set_flow_control after baud change failed: {}", e);
+            }
+            if let Err(e) = port_guard.write_data_terminal_ready(true) {
+                eprintln!("Warning: set DTR after baud change failed: {}", e);
+            }
+            if let Err(e) = port_guard.write_request_to_send(true) {
+                eprintln!("Warning: set RTS after baud change failed: {}", e);
+            }
         }
 
         if let Some(bits) = data_bits {

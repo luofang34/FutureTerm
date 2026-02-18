@@ -146,8 +146,11 @@ impl WebSocketTransport {
                     );
                     *error_state_msg.borrow_mut() =
                         Some(format!("Serial port disconnected: {}", reason));
+                } else if msg_type == "written" {
+                    // Fire-and-forget write response — discard to prevent unbounded growth.
+                    // The write() call is non-blocking so nobody waits for this.
                 } else {
-                    // Control message (ports_list, opened, closed, error, etc.)
+                    // Control message (ports_list, opened, closed, config_set, error, etc.)
                     #[cfg(debug_assertions)]
                     web_sys::console::log_1(&format!("Bridge control: type={}", msg_type).into());
                     control_messages.borrow_mut().push(text);
