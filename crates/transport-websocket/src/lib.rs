@@ -303,7 +303,7 @@ impl WebSocketTransport {
                 }
             } // drop borrow before await
 
-            sleep_ms(100).await;
+            sleep_ms(50).await;
         }
 
         Err(TransportError::Io("Timeout waiting for response".into()))

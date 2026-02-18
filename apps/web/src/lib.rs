@@ -420,8 +420,8 @@ pub fn App() -> impl IntoView {
                     manager.set_status.set("Waiting for disconnect...".into());
                     let mut waited = 0u32;
                     while bridge_closing_connect.get() && waited < 3000 {
-                        gloo_timers::future::TimeoutFuture::new(50).await;
-                        waited += 50;
+                        gloo_timers::future::TimeoutFuture::new(10).await;
+                        waited += 10;
                     }
                 }
 
@@ -432,8 +432,8 @@ pub fn App() -> impl IntoView {
                     // Wait for old read loop to exit and cleanup
                     let mut waited = 0u32;
                     while bridge_closing_connect.get() && waited < 3000 {
-                        gloo_timers::future::TimeoutFuture::new(50).await;
-                        waited += 50;
+                        gloo_timers::future::TimeoutFuture::new(10).await;
+                        waited += 10;
                     }
                 }
 

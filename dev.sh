@@ -218,6 +218,8 @@ build_bridge() {
     local APP_BUNDLE="${BRIDGE_DIR}/FutureTerm.app"
     local DMG_PATH="${BRIDGE_DIR}/FutureTerm-Helper.dmg"
     local SIGN_IDENTITY="${CODESIGN_IDENTITY:--}"
+    # Notarization keychain profile (created once with: xcrun notarytool store-credentials)
+    local NOTARY_PROFILE="${APPLE_NOTARY_KEYCHAIN_PROFILE:-futureterm-notary}"
 
     # Build
     echo -e "${YELLOW}Building bridge-daemon (release)...${NC}"
@@ -296,16 +298,39 @@ LAUNCHER
         -srcfolder "${STAGING_DIR}" -ov -format UDZO "${DMG_PATH}" > /dev/null
     rm -rf "${STAGING_DIR}"
 
+    # Notarize and staple (only when signed with real Developer ID)
+    if [ "${SIGN_IDENTITY}" != "-" ]; then
+        echo -e "${YELLOW}Notarizing DMG (this may take 1-5 minutes)...${NC}"
+        if xcrun notarytool submit "${DMG_PATH}" \
+            --keychain-profile "${NOTARY_PROFILE}" \
+            --wait \
+            --timeout 10m 2>&1; then
+            echo -e "${YELLOW}Stapling notarization ticket...${NC}"
+            xcrun stapler staple "${DMG_PATH}"
+            echo -e "${GREEN}Notarization complete and stapled${NC}"
+        else
+            echo -e "${RED}Notarization FAILED — DMG is unsigned for distribution${NC}"
+            echo -e "${YELLOW}To set up notarization credentials:${NC}"
+            echo -e "${CYAN}  xcrun notarytool store-credentials futureterm-notary \\${NC}"
+            echo -e "${CYAN}    --apple-id YOUR_APPLE_ID \\${NC}"
+            echo -e "${CYAN}    --team-id YOUR_TEAM_ID \\${NC}"
+            echo -e "${CYAN}    --password APP_SPECIFIC_PASSWORD${NC}"
+        fi
+    fi
+
     # Copy to bridge-helper for local serving
-    local SAFARI_DIR="apps/web/bridge-helper"
-    if [ -d "${SAFARI_DIR}" ]; then
-        cp "${DMG_PATH}" "${SAFARI_DIR}/"
+    local BRIDGE_HELPER_DIR="apps/web/bridge-helper"
+    if [ -d "${BRIDGE_HELPER_DIR}" ]; then
+        cp "${DMG_PATH}" "${BRIDGE_HELPER_DIR}/"
     fi
 
     echo ""
     echo -e "${GREEN}Bridge build complete: ${DMG_PATH}${NC}"
     echo -e "${CYAN}Install: cp -R ${APP_BUNDLE} /Applications/${NC}"
     echo -e "${CYAN}Test:    open futureterm://launch${NC}"
+    if [ "${SIGN_IDENTITY}" != "-" ]; then
+        echo -e "${CYAN}Sign:    CODESIGN_IDENTITY='Developer ID Application: Name (TEAMID)' ./dev.sh bridge${NC}"
+    fi
 }
 
 # ============================================================
@@ -354,7 +379,9 @@ show_usage() {
     echo "  check      Quality checks only (fmt, clippy, cargo check)"
     echo "  wasm-test  WASM browser tests only"
     echo ""
-    echo "Bridge signing: CODESIGN_IDENTITY='Developer ID Application: ...' ./dev.sh bridge"
+    echo "Bridge signing:      CODESIGN_IDENTITY='Developer ID Application: Name (TEAMID)' ./dev.sh bridge"
+    echo "Bridge notarize:     CODESIGN_IDENTITY='...' APPLE_NOTARY_KEYCHAIN_PROFILE=futureterm-notary ./dev.sh bridge"
+    echo "  (one-time setup)   xcrun notarytool store-credentials futureterm-notary --apple-id ID --team-id TEAM --password PASS"
     echo ""
     echo "If no command is specified, 'serve' is assumed for local development."
 }
