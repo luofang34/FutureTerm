@@ -34,6 +34,13 @@ pub fn trim_shell_artifacts(data: &[u8]) -> Vec<u8> {
             continue;
         }
 
+        // 1b. Skip literal "^C" — pty echo of Ctrl+C (bytes 0x5E 0x43).
+        // Appears when the probe sends \x03 to reset a stuck shell session.
+        if b == b'^' && data.get(start_idx + 1) == Some(&b'C') {
+            start_idx += 2;
+            continue;
+        }
+
         // 2. Skip ANSI Escape Sequences
         if b == 0x1B {
             // ESC character
