@@ -309,6 +309,13 @@ impl StateActor {
     }
 
     async fn handle_disconnect(&mut self) -> Result<(), ActorError> {
+        // Already disconnected - treat as no-op.
+        // This can happen in bridge mode where the StateActor is never informed
+        // of bridge state transitions (bridge uses set_connection_state() directly).
+        if self.state == ConnectionState::Disconnected {
+            return Ok(());
+        }
+
         // Can disconnect from most states
         if !self.state.can_disconnect() {
             return Err(ActorError::UnexpectedMessage {

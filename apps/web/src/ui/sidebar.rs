@@ -57,7 +57,7 @@ pub fn Sidebar(
             <button
                 title="MAVLink Decoder"
                 style=move || format!(
-                    "width: 40px; height: 40px; background: {}; color: white; border: none; cursor: pointer; border-radius: 4px; margin-bottom: 8px; display: flex; align-items: center; justify-content: center; font-family: monospace; font-weight: bold; font-size: 0.8rem;",
+                    "width: 40px; height: 40px; background: {}; color: white; border: none; cursor: pointer; border-radius: 4px; margin-bottom: 8px; display: flex; align-items: center; justify-content: center; font-family: 'Menlo', 'Monaco', 'Consolas', 'Courier New', monospace; font-weight: bold; font-size: 0.8rem;",
                     if view_mode.get() == ViewMode::Mavlink { "rgb(45, 45, 45)" } else { "transparent" }
                 )
                 on:click={

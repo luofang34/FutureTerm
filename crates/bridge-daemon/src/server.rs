@@ -152,12 +152,30 @@ async fn handle_websocket(
 
         match msg {
             Message::Text(text) => {
-                let response =
+                // Log all incoming messages for diagnostics
+                let preview = &text[..text.len().min(120)];
+                eprintln!("DAEMON RX: {}", preview);
+
+                let (response, disconnect_rx) =
                     handle_client_message(&text, &mut serial_manager, data_tx.clone()).await;
                 let json = response.to_json()?;
+                eprintln!("DAEMON TX: {}", &json[..json.len().min(80)]);
                 ws_tx
                     .send(json)
                     .map_err(|e| format!("Failed to send response: {}", e))?;
+
+                // If this was an Open command, watch for serial port disconnect
+                if let Some(rx) = disconnect_rx {
+                    let ws_tx_disc = ws_tx.clone();
+                    tokio::spawn(async move {
+                        if let Ok(reason) = rx.await {
+                            let msg = ServerMessage::PortDisconnected { reason };
+                            if let Ok(json) = msg.to_json() {
+                                let _ = ws_tx_disc.send(json);
+                            }
+                        }
+                    });
+                }
             }
             Message::Close(_) => {
                 eprintln!("Client closed connection");
@@ -168,49 +186,65 @@ async fn handle_websocket(
     }
 
     // Clean up
-    serial_manager.close();
+    serial_manager.close().await;
     Ok(())
 }
 
-/// Handle a single client message
+/// Handle a single client message.
+///
+/// Returns the response and optionally a disconnect receiver (for Open commands)
+/// that fires when the serial port disconnects.
 async fn handle_client_message(
     text: &str,
     serial_manager: &mut SerialManager,
     data_tx: mpsc::UnboundedSender<Vec<u8>>,
-) -> ServerMessage {
+) -> (
+    ServerMessage,
+    Option<tokio::sync::oneshot::Receiver<String>>,
+) {
     let msg = match ClientMessage::from_json(text) {
         Ok(m) => m,
-        Err(e) => return ServerMessage::error(None, e),
+        Err(e) => return (ServerMessage::error(None, e), None),
     };
 
     let _id = msg.id();
 
     match msg {
         ClientMessage::ListPorts { id } => match SerialManager::list_ports() {
-            Ok(ports) => ServerMessage::PortsList { id, ports },
-            Err(e) => ServerMessage::error(Some(id), e),
+            Ok(ports) => (ServerMessage::PortsList { id, ports }, None),
+            Err(e) => (ServerMessage::error(Some(id), e), None),
         },
         ClientMessage::Open {
             id,
             path,
             baud_rate,
-        } => match serial_manager.open(&path, baud_rate, data_tx) {
-            Ok(()) => ServerMessage::Opened { id },
-            Err(e) => ServerMessage::error(Some(id), e),
-        },
+        } => {
+            let (disconnect_tx, disconnect_rx) = tokio::sync::oneshot::channel();
+            match serial_manager
+                .open(&path, baud_rate, data_tx, Some(disconnect_tx))
+                .await
+            {
+                Ok(()) => (ServerMessage::Opened { id }, Some(disconnect_rx)),
+                Err(e) => (ServerMessage::error(Some(id), e), None),
+            }
+        }
         ClientMessage::Close { id } => {
-            serial_manager.close();
-            ServerMessage::Closed { id }
+            serial_manager.close().await;
+            (ServerMessage::Closed { id }, None)
         }
         ClientMessage::Write { id, data } => {
             let decoded = match base64_decode(&data) {
                 Ok(d) => d,
-                Err(e) => return ServerMessage::error(Some(id), e),
+                Err(e) => return (ServerMessage::error(Some(id), e), None),
             };
 
+            eprintln!("Serial TX: {} bytes", decoded.len());
             match serial_manager.write(&decoded).await {
-                Ok(bytes) => ServerMessage::Written { id, bytes },
-                Err(e) => ServerMessage::error(Some(id), e),
+                Ok(bytes) => (ServerMessage::Written { id, bytes }, None),
+                Err(e) => {
+                    eprintln!("Serial TX error: {}", e);
+                    (ServerMessage::error(Some(id), e), None)
+                }
             }
         }
         ClientMessage::SetConfig {
@@ -223,8 +257,8 @@ async fn handle_client_message(
             .set_config(baud_rate, data_bits, stop_bits, parity)
             .await
         {
-            Ok(()) => ServerMessage::ConfigSet { id },
-            Err(e) => ServerMessage::error(Some(id), e),
+            Ok(()) => (ServerMessage::ConfigSet { id }, None),
+            Err(e) => (ServerMessage::error(Some(id), e), None),
         },
     }
 }

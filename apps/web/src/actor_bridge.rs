@@ -488,14 +488,24 @@ impl ActorBridge {
 
     // === Activity Indicators ===
 
-    /// Trigger RX activity indicator
+    /// Trigger RX activity indicator (flashes for 100ms, matches WebSerial behavior)
     pub fn trigger_rx(&self) {
-        self.set_rx_active.set(true);
+        let set_rx = self.set_rx_active;
+        let _ = set_rx.try_set(true);
+        spawn_local(async move {
+            gloo_timers::future::sleep(std::time::Duration::from_millis(100)).await;
+            let _ = set_rx.try_set(false);
+        });
     }
 
-    /// Trigger TX activity indicator
+    /// Trigger TX activity indicator (flashes for 100ms, matches WebSerial behavior)
     pub fn trigger_tx(&self) {
-        self.set_tx_active.set(true);
+        let set_tx = self.set_tx_active;
+        let _ = set_tx.try_set(true);
+        spawn_local(async move {
+            gloo_timers::future::sleep(std::time::Duration::from_millis(100)).await;
+            let _ = set_tx.try_set(false);
+        });
     }
 
     // ═══════════════════════════════════════════════════════════════

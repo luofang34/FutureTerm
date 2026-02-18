@@ -53,6 +53,9 @@ pub enum ServerMessage {
     /// Serial data received (base64 encoded)
     Data { data: String },
 
+    /// Serial port disconnected (device unplugged)
+    PortDisconnected { reason: String },
+
     /// Error response
     Error { id: Option<u64>, message: String },
 }

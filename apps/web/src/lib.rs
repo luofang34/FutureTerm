@@ -119,6 +119,7 @@ pub fn App() -> impl IntoView {
 
     // Bridge mode shared state (for Safari/Firefox WebSocket bridge)
     let bridge_active: Rc<Cell<bool>> = Rc::new(Cell::new(false));
+    let bridge_closing: Rc<Cell<bool>> = Rc::new(Cell::new(false));
     let bridge_tx_queue: Rc<RefCell<Vec<Vec<u8>>>> = Rc::new(RefCell::new(Vec::new()));
     // Bridge port picker signals (Copy signals, no clone needed)
     let (bridge_ports, set_bridge_ports) = create_signal::<Vec<(String, String)>>(Vec::new());
@@ -292,7 +293,9 @@ pub fn App() -> impl IntoView {
 
     // Bridge mode clones - all clones must happen before any move closure
     let bridge_active_disc = bridge_active.clone();
+    let bridge_closing_disc = bridge_closing.clone();
     let bridge_active_for_connect = bridge_active.clone();
+    let bridge_closing_for_connect = bridge_closing.clone();
     let bridge_tx_queue_for_connect = bridge_tx_queue.clone();
     let bridge_active_reconf = bridge_active.clone();
     let bridge_active_term = bridge_active.clone();
@@ -318,6 +321,8 @@ pub fn App() -> impl IntoView {
             // Check if we're in bridge mode
             if bridge_active_disc.get() {
                 // Bridge disconnect - signal the read loop to stop
+                // Set closing flag so connect flow waits for cleanup to finish
+                bridge_closing_disc.set(true);
                 bridge_active_disc.set(false);
                 return;
             }
@@ -386,6 +391,7 @@ pub fn App() -> impl IntoView {
 
         // Bridge mode clones for the async block
         let bridge_active_connect = bridge_active_for_connect.clone();
+        let bridge_closing_connect = bridge_closing_for_connect.clone();
         let bridge_tx_queue_connect = bridge_tx_queue_for_connect.clone();
 
         spawn_local(async move {
@@ -400,11 +406,29 @@ pub fn App() -> impl IntoView {
 
             // Phase 3: WebSocket fallback for Safari/Firefox
             if serial.is_undefined() {
+                // Wait for any in-progress bridge cleanup to finish.
+                // This prevents the race where Disconnect→Connect fires
+                // before the old session's close_port() completes on the daemon,
+                // causing "Device or resource busy" errors.
+                if bridge_closing_connect.get() {
+                    manager.set_status.set("Waiting for disconnect...".into());
+                    let mut waited = 0u32;
+                    while bridge_closing_connect.get() && waited < 3000 {
+                        gloo_timers::future::TimeoutFuture::new(50).await;
+                        waited += 50;
+                    }
+                }
+
                 // If already in bridge mode, disconnect first (hot-swap / manual select)
                 if bridge_active_connect.get() {
+                    bridge_closing_connect.set(true);
                     bridge_active_connect.set(false);
                     // Wait for old read loop to exit and cleanup
-                    gloo_timers::future::TimeoutFuture::new(200).await;
+                    let mut waited = 0u32;
+                    while bridge_closing_connect.get() && waited < 3000 {
+                        gloo_timers::future::TimeoutFuture::new(50).await;
+                        waited += 50;
+                    }
                 }
 
                 // WebSerial not available - try WebSocket bridge
@@ -420,7 +444,7 @@ pub fn App() -> impl IntoView {
                     Ok(_) => true,
                     Err(_) => {
                         // Daemon not running - try URL scheme launch
-                        manager.set_status.set("Launching bridge helper...".into());
+                        manager.set_status.set("Launching helper...".into());
 
                         // Launch via hidden iframe (avoids navigating away)
                         let launch_url = "futureterm://launch?port=9876";
@@ -445,18 +469,31 @@ pub fn App() -> impl IntoView {
                             }
                         }
 
-                        // Wait for daemon to start
-                        gloo_timers::future::TimeoutFuture::new(500).await;
-
-                        // Retry connection
-                        ws_transport.connect(ws_url).await.is_ok()
+                        // Retry with progressive delays while user may be
+                        // clicking "Allow" in the macOS security dialog
+                        let retry_delays_ms: &[u32] = &[500, 1000, 1500, 2000, 2000, 2000];
+                        let mut success = false;
+                        for (i, &delay) in retry_delays_ms.iter().enumerate() {
+                            gloo_timers::future::TimeoutFuture::new(delay).await;
+                            ws_transport = transport_websocket::WebSocketTransport::new();
+                            if ws_transport.connect(ws_url).await.is_ok() {
+                                success = true;
+                                break;
+                            }
+                            manager.set_status.set(format!(
+                                "Waiting for helper... ({}/{})",
+                                i + 1,
+                                retry_delays_ms.len()
+                            ));
+                        }
+                        success
                     }
                 };
 
                 if !connected {
                     manager
                         .set_status
-                        .set("Helper app required for Safari/Firefox".into());
+                        .set("Helper app required for this browser".into());
                     set_show_bridge_install.set(true);
                     return;
                 }
@@ -636,52 +673,123 @@ pub fn App() -> impl IntoView {
                     .into(),
                 );
 
-                // Bridge read/write loop
-                loop {
-                    // Check if bridge was deactivated (user disconnect)
-                    if !bridge_active_connect.get() {
-                        break;
-                    }
+                // Bridge read/write loop with auto-reconnect
+                'bridge: loop {
+                    // Inner read/write loop
+                    loop {
+                        // Check if bridge was deactivated (user disconnect)
+                        if !bridge_active_connect.get() {
+                            break 'bridge;
+                        }
 
-                    // Drain TX queue and send to daemon
-                    {
-                        let tx_data: Vec<Vec<u8>> =
-                            bridge_tx_queue_connect.borrow_mut().drain(..).collect();
-                        for data in tx_data {
-                            if ws_transport.write(&data).await.is_err() {
-                                break;
+                        // Drain TX queue and send to daemon
+                        {
+                            let tx_data: Vec<Vec<u8>> =
+                                bridge_tx_queue_connect.borrow_mut().drain(..).collect();
+                            if !tx_data.is_empty() {
+                                #[cfg(debug_assertions)]
+                                web_sys::console::log_1(
+                                    &format!(
+                                        "Bridge TX: sending {} chunks to daemon",
+                                        tx_data.len()
+                                    )
+                                    .into(),
+                                );
+                                let mut sent_any = false;
+                                for data in tx_data {
+                                    if ws_transport.write(&data).await.is_err() {
+                                        #[cfg(debug_assertions)]
+                                        web_sys::console::error_1(
+                                            &"Bridge TX: write to daemon failed".into(),
+                                        );
+                                        break;
+                                    }
+                                    sent_any = true;
+                                }
+                                if sent_any {
+                                    manager.trigger_tx();
+                                }
                             }
                         }
+
+                        // Read serial data from bridge
+                        match ws_transport.read_chunk().await {
+                            Ok((data, ts)) if !data.is_empty() => {
+                                manager.trigger_rx();
+                                manager.send_worker_message(UiToWorker::IngestData {
+                                    data,
+                                    timestamp_us: ts,
+                                });
+                            }
+                            Err(_e) => {
+                                #[cfg(debug_assertions)]
+                                web_sys::console::log_1(
+                                    &format!("Bridge: port lost: {}", _e).into(),
+                                );
+                                break; // Exit inner loop, enter retry
+                            }
+                            _ => {}
+                        }
+
+                        // Small yield to prevent busy-spinning
+                        gloo_timers::future::TimeoutFuture::new(5).await;
                     }
 
-                    // Read serial data from bridge
-                    match ws_transport.read_chunk().await {
-                        Ok((data, ts)) if !data.is_empty() => {
-                            manager.send_worker_message(UiToWorker::IngestData {
-                                data,
-                                timestamp_us: ts,
-                            });
+                    // Device lost - try to reconnect (same as WebSerial behavior)
+                    if !bridge_active_connect.get() {
+                        break 'bridge;
+                    }
+
+                    // Transition to DeviceLost state (triggers orange pulsing indicator)
+                    manager.set_connection_state(ConnectionState::DeviceLost);
+                    manager
+                        .set_status
+                        .set("Device lost. Reconnecting...".into());
+                    let _ = ws_transport.close_port().await;
+
+                    // Retry re-opening the same port with backoff
+                    manager.set_connection_state(ConnectionState::AutoReconnecting);
+                    let retry_delays_ms: &[u32] = &[500, 1000, 1500, 2000, 2000, 2000];
+                    let mut reconnected = false;
+                    for (i, &delay) in retry_delays_ms.iter().enumerate() {
+                        if !bridge_active_connect.get() {
+                            break; // User clicked disconnect
                         }
-                        Err(_e) => {
-                            #[cfg(debug_assertions)]
-                            web_sys::console::log_1(
-                                &format!("Bridge read loop ended: {}", _e).into(),
-                            );
+                        gloo_timers::future::TimeoutFuture::new(delay).await;
+
+                        // Clear error state so open_port can work
+                        ws_transport.clear_error();
+
+                        if ws_transport.open_port(&port_path, final_baud).await.is_ok() {
+                            reconnected = true;
+                            manager.set_connection_state(ConnectionState::Connected);
+                            manager
+                                .set_status
+                                .set(format!("Reconnected: {} @ {}", port_path, final_baud));
                             break;
                         }
-                        _ => {}
+                        manager.set_status.set(format!(
+                            "Device lost. Retrying... ({}/{})",
+                            i + 1,
+                            retry_delays_ms.len()
+                        ));
                     }
 
-                    // Small yield to prevent busy-spinning
-                    gloo_timers::future::TimeoutFuture::new(5).await;
+                    if !reconnected {
+                        break 'bridge; // Give up after all retries
+                    }
+                    // Reconnected - continue outer loop (resume read/write)
                 }
 
-                // Cleanup
+                // Cleanup - close_port on daemon first, then WebSocket connection
+                bridge_closing_connect.set(true);
                 let _ = ws_transport.close_port().await;
                 let _ = ws_transport.close().await;
                 bridge_active_connect.set(false);
                 manager.set_connection_state(ConnectionState::Disconnected);
                 manager.set_status.set("Disconnected".into());
+                // Signal that cleanup is complete - connect flow can proceed
+                bridge_closing_connect.set(false);
                 return;
             }
 
@@ -821,6 +929,10 @@ pub fn App() -> impl IntoView {
 
                 if bridge_active_tx.get() {
                     // Bridge mode - queue for WS send
+                    #[cfg(debug_assertions)]
+                    web_sys::console::log_1(
+                        &format!("Bridge TX: queuing {} bytes", bytes.len()).into(),
+                    );
                     bridge_tx_queue_tx.borrow_mut().push(bytes);
                 } else {
                     // WebSerial mode
@@ -846,7 +958,7 @@ pub fn App() -> impl IntoView {
                     <div style="background: #2a2a2a; border: 1px solid #555; border-radius: 8px; padding: 24px 32px; max-width: 480px; color: #eee; font-family: sans-serif;">
                         <h2 style="margin: 0 0 12px; font-size: 1.2rem; color: #ff9800;">"Serial Port Helper Required"</h2>
                         <p style="margin: 0 0 8px; font-size: 0.9rem; line-height: 1.5; color: #ccc;">
-                            "Safari and Firefox don\u{2019}t support the WebSerial API. FutureTerm needs a small helper app running locally to access your serial ports."
+                            "Your browser doesn\u{2019}t support the WebSerial API. FutureTerm needs a small helper app running locally to access your serial ports."
                         </p>
                         <p style="margin: 0 0 16px; font-size: 0.9rem; line-height: 1.5; color: #ccc;">
                             "The helper is lightweight (~1 MB), runs only when needed, and shuts down automatically after 5 minutes of inactivity."
@@ -895,7 +1007,7 @@ pub fn App() -> impl IntoView {
             </Show>
 
             <header style="padding: 10px; background: rgb(25, 25, 25); display: flex; align-items: center; gap: 10px; border-bottom: 1px solid rgb(45, 45, 45);">
-                <h1 style="margin: 0; font-family: 'Magneto', 'Impact', 'Arial Black', sans-serif; font-style: italic; font-size: 1.5rem; font-weight: normal; letter-spacing: 1px;">FutureTerm</h1>
+                <h1 style="margin: 0; font-family: 'Impact', 'Arial Black', sans-serif; font-style: italic; font-size: 1.5rem; font-weight: normal; letter-spacing: 1px;">FutureTerm</h1>
                 <div style="flex: 1;"></div>
 
                 <span style="font-size: 0.9rem; color: #aaa;">{move || status.get()}</span>
@@ -1120,16 +1232,19 @@ async fn bridge_auto_probe(
             continue;
         }
 
-        // Drain stale data from previous baud rate
+        // Drain stale data from previous baud rate.
+        // Generous timing for FTDI chips with 16ms latency timer + WS round-trip.
         ws_transport.clear_rx_buffer();
-        gloo_timers::future::TimeoutFuture::new(50).await;
+        gloo_timers::future::TimeoutFuture::new(80).await;
         ws_transport.clear_rx_buffer();
 
         // Send wakeup character (many devices respond to CR)
         let _ = ws_transport.write(b"\r").await;
 
-        // Wait to collect data at this baud rate
-        gloo_timers::future::TimeoutFuture::new(200).await;
+        // Wait to collect data at this baud rate.
+        // Covers: WS round-trip (~10ms) + device response (~10-100ms) +
+        // daemon read-task mutex cycle (~100ms) + WS back (~5ms).
+        gloo_timers::future::TimeoutFuture::new(350).await;
 
         // Read all available data
         let mut buffer = Vec::new();
@@ -1142,6 +1257,22 @@ async fn bridge_auto_probe(
                     }
                 }
                 _ => break,
+            }
+        }
+
+        // Retry once for slow devices (FTDI latency, long response time)
+        if buffer.is_empty() {
+            gloo_timers::future::TimeoutFuture::new(150).await;
+            loop {
+                match ws_transport.read_chunk().await {
+                    Ok((data, _)) if !data.is_empty() => {
+                        buffer.extend_from_slice(&data);
+                        if buffer.len() > 200 {
+                            break;
+                        }
+                    }
+                    _ => break,
+                }
             }
         }
 

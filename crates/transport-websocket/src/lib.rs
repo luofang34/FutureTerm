@@ -100,6 +100,7 @@ impl WebSocketTransport {
         let rx_buffer = self.rx_buffer.clone();
         let control_messages = self.control_messages.clone();
         let error_state = self.error_state.clone();
+        let error_state_msg = error_state.clone();
 
         // onmessage: Handle both JSON text (daemon protocol) and binary data
         let on_message = Closure::wrap(Box::new(move |event: MessageEvent| {
@@ -133,6 +134,18 @@ impl WebSocketTransport {
                             }
                         }
                     }
+                } else if msg_type == "port_disconnected" {
+                    // Serial port disconnected (device unplugged)
+                    let reason = parsed
+                        .get("reason")
+                        .and_then(|r| r.as_str())
+                        .unwrap_or("unknown");
+                    #[cfg(debug_assertions)]
+                    web_sys::console::log_1(
+                        &format!("Bridge: port disconnected: {}", reason).into(),
+                    );
+                    *error_state_msg.borrow_mut() =
+                        Some(format!("Serial port disconnected: {}", reason));
                 } else {
                     // Control message (ports_list, opened, closed, error, etc.)
                     #[cfg(debug_assertions)]
@@ -221,6 +234,11 @@ impl WebSocketTransport {
     /// Clear the receive buffer (used during baud rate probing to discard stale data)
     pub fn clear_rx_buffer(&self) {
         self.rx_buffer.borrow_mut().clear();
+    }
+
+    /// Clear the error state (used when retrying after port disconnect)
+    pub fn clear_error(&self) {
+        *self.error_state.borrow_mut() = None;
     }
 
     // ═══════════════════════════════════════════════════════════════

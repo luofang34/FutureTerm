@@ -3,7 +3,7 @@
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
-  <title>FutureTerm - Safari Helper</title>
+  <title>FutureTerm - Serial Port Helper</title>
   <style>
     * { box-sizing: border-box; margin: 0; padding: 0; }
     body {
@@ -113,12 +113,12 @@
 <body>
   <div class="container">
     <h1>FutureTerm</h1>
-    <p class="subtitle">Safari &amp; Firefox Serial Port Helper</p>
+    <p class="subtitle">Serial Port Helper</p>
 
     <div class="card">
       <h2>Why is this needed?</h2>
       <p>
-        Safari and Firefox don't support the
+        Some browsers (Safari, Firefox, etc.) don't support the
         <a href="https://developer.mozilla.org/en-US/docs/Web/API/Web_Serial_API" style="color: #7ec8e3;" target="_blank">WebSerial API</a>,
         which FutureTerm uses to communicate with serial devices (Arduino, ESP32, flight controllers, etc.).
       </p>
@@ -170,7 +170,7 @@
     <div class="card">
       <h2>How it works</h2>
       <p>
-        When you click <strong>Connect</strong> in FutureTerm on Safari/Firefox:
+        When you click <strong>Connect</strong> in FutureTerm:
       </p>
       <ol class="steps">
         <li>FutureTerm detects that WebSerial is not available</li>
@@ -183,7 +183,7 @@
     <div class="card">
       <h2>Troubleshooting</h2>
       <p><strong>macOS blocks the app?</strong> Go to System Settings &gt; Privacy &amp; Security, scroll down and click "Open Anyway".</p>
-      <p><strong>Connection fails?</strong> Make sure no other app is using port 9876. The helper uses <code>wss://127.0.0.1:9876</code>.</p>
+      <p><strong>Connection fails?</strong> Make sure no other app is using port 9876. The helper uses <code>ws://127.0.0.1:9876</code>.</p>
       <p><strong>Want to uninstall?</strong> Simply delete <code>FutureTerm.app</code> from Applications. No background processes remain.</p>
     </div>
 
