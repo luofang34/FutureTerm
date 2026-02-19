@@ -22,6 +22,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         })
         .unwrap_or(9876);
 
+    // Install crypto provider (both ring and aws-lc-rs are pulled in by deps;
+    // rustls needs exactly one chosen explicitly).
+    let _ = rustls::crypto::ring::default_provider().install_default();
+
     eprintln!("FutureTerm Bridge Daemon v{}", env!("CARGO_PKG_VERSION"));
 
     // Try to set up TLS (fetch cert from server or load from disk cache).
