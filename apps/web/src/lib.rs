@@ -442,64 +442,89 @@ pub fn App() -> impl IntoView {
                     .set_status
                     .set("WebSerial not available, trying bridge...".into());
 
-                // ws:// (not wss://) is intentional: 127.0.0.1 is a "potentially
-                // trustworthy URL" per W3C Secure Contexts spec, so browsers exempt
-                // it from mixed-content blocking even when the page is on HTTPS.
-                let ws_url = "ws://127.0.0.1:9876";
+                // Production: wss:// via local.futureterm.com (TLS required for Safari).
+                // Dev: ws:// to 127.0.0.1 directly (no cert needed, Chrome exempts localhost).
+                // Fallback: if wss:// fails, try ws://127.0.0.1 (works in Chrome/Edge).
+                let ws_url_primary = if cfg!(debug_assertions) {
+                    "ws://127.0.0.1:9876"
+                } else {
+                    "wss://local.futureterm.com:9876"
+                };
+                let ws_url_fallback = "ws://127.0.0.1:9876";
+
                 let mut ws_transport = transport_websocket::WebSocketTransport::new();
 
                 // Try direct connection first (daemon already running)
-                let connected = match ws_transport.connect(ws_url).await {
+                let connected = match ws_transport.connect(ws_url_primary).await {
                     Ok(_) => true,
-                    Err(_) => {
-                        // Daemon not running - try URL scheme launch
-                        manager.set_status.set("Launching helper...".into());
+                    Err(_) if ws_url_primary != ws_url_fallback => {
+                        // wss:// failed — try plain ws:// fallback (works in Chrome/Edge
+                        // which exempt 127.0.0.1 from mixed-content blocking)
+                        ws_transport = transport_websocket::WebSocketTransport::new();
+                        ws_transport.connect(ws_url_fallback).await.is_ok()
+                    }
+                    Err(_) => false,
+                };
 
-                        // Launch via hidden iframe (avoids navigating away)
-                        let launch_url = "futureterm://launch?port=9876";
-                        if let Some(doc) = window.document() {
-                            if let Ok(iframe) = doc.create_element("iframe") {
-                                let _ = iframe.set_attribute("style", "display:none");
-                                let _ = iframe.set_attribute("src", launch_url);
-                                if let Some(body) = doc.body() {
-                                    let _ = body.append_child(&iframe);
-                                    let body_clone = body.clone();
-                                    let iframe_clone = iframe.clone();
-                                    let cleanup = wasm_bindgen::closure::Closure::once(move || {
-                                        let _ = body_clone.remove_child(&iframe_clone);
-                                    });
-                                    let _ = window
-                                        .set_timeout_with_callback_and_timeout_and_arguments_0(
-                                            cleanup.as_ref().unchecked_ref(),
-                                            1000,
-                                        );
-                                    cleanup.forget();
-                                }
+                let connected = if connected {
+                    true
+                } else {
+                    // Daemon not running - try URL scheme launch
+                    manager.set_status.set("Launching helper...".into());
+
+                    // Launch via hidden iframe (avoids navigating away)
+                    let launch_url = "futureterm://launch?port=9876";
+                    if let Some(doc) = window.document() {
+                        if let Ok(iframe) = doc.create_element("iframe") {
+                            let _ = iframe.set_attribute("style", "display:none");
+                            let _ = iframe.set_attribute("src", launch_url);
+                            if let Some(body) = doc.body() {
+                                let _ = body.append_child(&iframe);
+                                let body_clone = body.clone();
+                                let iframe_clone = iframe.clone();
+                                let cleanup = wasm_bindgen::closure::Closure::once(move || {
+                                    let _ = body_clone.remove_child(&iframe_clone);
+                                });
+                                let _ = window
+                                    .set_timeout_with_callback_and_timeout_and_arguments_0(
+                                        cleanup.as_ref().unchecked_ref(),
+                                        1000,
+                                    );
+                                cleanup.forget();
                             }
                         }
+                    }
 
-                        // Show install dialog immediately so users who don't have the
-                        // helper can act right away rather than watching a countdown.
-                        // The dialog auto-dismisses if a retry succeeds.
-                        set_show_bridge_install.set(true);
-                        manager.set_status.set("Starting helper app...".into());
+                    // Show install dialog immediately so users who don't have the
+                    // helper can act right away rather than watching a countdown.
+                    // The dialog auto-dismisses if a retry succeeds.
+                    set_show_bridge_install.set(true);
+                    manager.set_status.set("Starting helper app...".into());
 
-                        // Retry while macOS processes the URL scheme and the user
-                        // may be clicking "Allow" in the security dialog.
-                        // Total window: ~4 s (enough for open + Allow + startup).
-                        let retry_delays_ms: &[u32] = &[400, 800, 1200, 1500];
-                        let mut success = false;
-                        for &delay in retry_delays_ms.iter() {
-                            gloo_timers::future::TimeoutFuture::new(delay).await;
+                    // Retry while macOS processes the URL scheme and the user
+                    // may be clicking "Allow" in the security dialog.
+                    // Total window: ~4 s (enough for open + Allow + startup).
+                    let retry_delays_ms: &[u32] = &[400, 800, 1200, 1500];
+                    let mut success = false;
+                    for &delay in retry_delays_ms.iter() {
+                        gloo_timers::future::TimeoutFuture::new(delay).await;
+                        // Try primary URL first, then fallback
+                        ws_transport = transport_websocket::WebSocketTransport::new();
+                        if ws_transport.connect(ws_url_primary).await.is_ok() {
+                            set_show_bridge_install.set(false);
+                            success = true;
+                            break;
+                        }
+                        if ws_url_primary != ws_url_fallback {
                             ws_transport = transport_websocket::WebSocketTransport::new();
-                            if ws_transport.connect(ws_url).await.is_ok() {
-                                set_show_bridge_install.set(false); // auto-dismiss
+                            if ws_transport.connect(ws_url_fallback).await.is_ok() {
+                                set_show_bridge_install.set(false);
                                 success = true;
                                 break;
                             }
                         }
-                        success
                     }
+                    success
                 };
 
                 if !connected {

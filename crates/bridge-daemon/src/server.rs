@@ -4,8 +4,10 @@ use base64::Engine;
 use futures_util::{SinkExt, StreamExt};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
+use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{mpsc, RwLock};
+use tokio_rustls::TlsAcceptor;
 use tokio_tungstenite::tungstenite::protocol::WebSocketConfig;
 use tokio_tungstenite::tungstenite::Message;
 use tokio_tungstenite::WebSocketStream;
@@ -34,13 +36,18 @@ const ALLOWED_ORIGINS: &[&str] = &[
 const IDLE_TIMEOUT: Duration = Duration::from_secs(300); // 5 minutes
 const IDLE_CHECK_INTERVAL: Duration = Duration::from_secs(60); // Check every 60 seconds
 
-/// WebSocket server with Origin validation and auto-shutdown
-pub async fn serve(listener: TcpListener, idle_timeout: Duration) -> Result<(), String> {
+/// WebSocket server with Origin validation, optional TLS, and auto-shutdown.
+pub async fn serve(
+    listener: TcpListener,
+    idle_timeout: Duration,
+    tls_acceptor: Option<TlsAcceptor>,
+) -> Result<(), String> {
     eprintln!(
         "WebSocket server listening on {}",
         listener.local_addr().map_err(|e| e.to_string())?
     );
 
+    let tls_acceptor = tls_acceptor.map(Arc::new);
     let last_activity = Arc::new(RwLock::new(Instant::now()));
     let last_activity_clone = last_activity.clone();
 
@@ -65,67 +72,108 @@ pub async fn serve(listener: TcpListener, idle_timeout: Duration) -> Result<(), 
         eprintln!("New connection from {}", addr);
 
         let last_activity = last_activity.clone();
+        let tls = tls_acceptor.clone();
         tokio::spawn(async move {
-            if let Err(e) = handle_connection(stream, last_activity).await {
+            let result = if let Some(acceptor) = tls {
+                // TLS path: TCP → TLS handshake → WebSocket handshake
+                match acceptor.accept(stream).await {
+                    Ok(tls_stream) => handle_connection_tls(tls_stream, last_activity).await,
+                    Err(e) => Err(format!("TLS handshake failed: {}", e)),
+                }
+            } else {
+                // Plain path: TCP → WebSocket handshake (dev mode / fallback)
+                handle_connection_plain(stream, last_activity).await
+            };
+
+            if let Err(e) = result {
                 eprintln!("Connection error: {}", e);
             }
         });
     }
 }
 
-/// Handle a single WebSocket connection
-async fn handle_connection(
+/// WebSocket config shared by plain and TLS paths.
+fn make_ws_config() -> WebSocketConfig {
+    WebSocketConfig::default()
+        .max_message_size(Some(MAX_WS_MESSAGE_SIZE))
+        .max_frame_size(Some(MAX_WS_MESSAGE_SIZE))
+}
+
+/// Origin validation callback shared by plain and TLS paths.
+fn make_origin_callback() -> impl FnOnce(
+    &tokio_tungstenite::tungstenite::handshake::server::Request,
+    tokio_tungstenite::tungstenite::handshake::server::Response,
+) -> Result<
+    tokio_tungstenite::tungstenite::handshake::server::Response,
+    tokio_tungstenite::tungstenite::handshake::server::ErrorResponse,
+> {
+    |req, response| {
+        let origin = req.headers().get("Origin").and_then(|h| h.to_str().ok());
+
+        match origin {
+            Some(o) if ALLOWED_ORIGINS.contains(&o) => {
+                eprintln!("Accepted connection from origin: {}", o);
+                Ok(response)
+            }
+            Some(o) => {
+                eprintln!("Rejected connection from unauthorized origin: {}", o);
+                Err(
+                    tokio_tungstenite::tungstenite::handshake::server::ErrorResponse::new(Some(
+                        "Unauthorized origin".into(),
+                    )),
+                )
+            }
+            None => {
+                eprintln!("Rejected connection with missing Origin header");
+                Err(
+                    tokio_tungstenite::tungstenite::handshake::server::ErrorResponse::new(Some(
+                        "Missing Origin header".into(),
+                    )),
+                )
+            }
+        }
+    }
+}
+
+/// Handle a plain (non-TLS) WebSocket connection.
+async fn handle_connection_plain(
     stream: TcpStream,
     last_activity: Arc<RwLock<Instant>>,
 ) -> Result<(), String> {
-    // Validate Origin header during WebSocket handshake
-    let callback =
-        |req: &tokio_tungstenite::tungstenite::handshake::server::Request,
-         response: tokio_tungstenite::tungstenite::handshake::server::Response| {
-            let origin = req.headers().get("Origin").and_then(|h| h.to_str().ok());
-
-            match origin {
-                Some(o) if ALLOWED_ORIGINS.contains(&o) => {
-                    eprintln!("Accepted connection from origin: {}", o);
-                    Ok(response)
-                }
-                Some(o) => {
-                    eprintln!("Rejected connection from unauthorized origin: {}", o);
-                    Err(
-                        tokio_tungstenite::tungstenite::handshake::server::ErrorResponse::new(
-                            Some("Unauthorized origin".into()),
-                        ),
-                    )
-                }
-                None => {
-                    eprintln!("Rejected connection with missing Origin header");
-                    Err(
-                        tokio_tungstenite::tungstenite::handshake::server::ErrorResponse::new(
-                            Some("Missing Origin header".into()),
-                        ),
-                    )
-                }
-            }
-        };
-
-    // Apply message size limit to prevent large-payload DoS.
-    let ws_config = WebSocketConfig::default()
-        .max_message_size(Some(MAX_WS_MESSAGE_SIZE))
-        .max_frame_size(Some(MAX_WS_MESSAGE_SIZE));
-
-    let ws_stream =
-        tokio_tungstenite::accept_hdr_async_with_config(stream, callback, Some(ws_config))
-            .await
-            .map_err(|e| format!("WebSocket handshake failed: {}", e))?;
-
+    let ws_stream = tokio_tungstenite::accept_hdr_async_with_config(
+        stream,
+        make_origin_callback(),
+        Some(make_ws_config()),
+    )
+    .await
+    .map_err(|e| format!("WebSocket handshake failed: {}", e))?;
     handle_websocket(ws_stream, last_activity).await
 }
 
-/// Handle WebSocket messages
-async fn handle_websocket(
-    ws_stream: WebSocketStream<TcpStream>,
+/// Handle a TLS-wrapped WebSocket connection.
+async fn handle_connection_tls(
+    stream: tokio_rustls::server::TlsStream<TcpStream>,
     last_activity: Arc<RwLock<Instant>>,
 ) -> Result<(), String> {
+    let ws_stream = tokio_tungstenite::accept_hdr_async_with_config(
+        stream,
+        make_origin_callback(),
+        Some(make_ws_config()),
+    )
+    .await
+    .map_err(|e| format!("WebSocket handshake failed: {}", e))?;
+    handle_websocket(ws_stream, last_activity).await
+}
+
+/// Handle WebSocket messages (generic over stream type: works with both
+/// plain TcpStream and TlsStream<TcpStream>).
+async fn handle_websocket<S>(
+    ws_stream: WebSocketStream<S>,
+    last_activity: Arc<RwLock<Instant>>,
+) -> Result<(), String>
+where
+    S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+{
     let (mut ws_sender, mut ws_receiver) = ws_stream.split();
     let mut serial_manager = SerialManager::new();
 

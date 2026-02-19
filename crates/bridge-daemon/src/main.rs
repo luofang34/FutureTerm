@@ -1,6 +1,7 @@
 mod protocol;
 mod serial;
 mod server;
+mod tls;
 
 use std::time::Duration;
 use tokio::net::TcpListener;
@@ -23,6 +24,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     eprintln!("FutureTerm Bridge Daemon v{}", env!("CARGO_PKG_VERSION"));
 
+    // Try to set up TLS (fetch cert from server or load from disk cache).
+    // If TLS is unavailable, the daemon falls back to plain ws://.
+    let tls_acceptor = tls::load_tls_acceptor().await;
+
+    if tls_acceptor.is_some() {
+        eprintln!("TLS enabled: wss://local.futureterm.com:{}", port);
+    } else {
+        eprintln!("TLS unavailable, falling back to ws://127.0.0.1:{}", port);
+    }
+
     // Single instance check: if port is already bound, another instance is running
     let listener = match TcpListener::bind(format!("127.0.0.1:{}", port)).await {
         Ok(l) => l,
@@ -33,7 +44,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     };
 
     // Start WebSocket server with auto-shutdown (5 minutes idle)
-    server::serve(listener, Duration::from_secs(300)).await?;
+    server::serve(listener, Duration::from_secs(300), tls_acceptor).await?;
 
     Ok(())
 }
