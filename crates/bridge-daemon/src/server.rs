@@ -33,7 +33,7 @@ const ALLOWED_ORIGINS: &[&str] = &[
 ];
 
 #[allow(dead_code)] // Used in tests
-const IDLE_TIMEOUT: Duration = Duration::from_secs(300); // 5 minutes
+const IDLE_TIMEOUT: Duration = Duration::from_secs(120); // 2 minutes
 const IDLE_CHECK_INTERVAL: Duration = Duration::from_secs(60); // Check every 60 seconds
 
 /// WebSocket server with Origin validation, optional TLS, and auto-shutdown.
@@ -364,6 +364,15 @@ async fn handle_client_message(
                 Ok(()) => (ServerMessage::ConfigSet { id }, None),
                 Err(e) => (ServerMessage::error(Some(id), e), None),
             }
+        }
+        ClientMessage::Shutdown { id } => {
+            eprintln!("Shutdown requested by client (version upgrade)");
+            // Exit after a brief delay so the response can be sent
+            tokio::spawn(async {
+                tokio::time::sleep(Duration::from_millis(100)).await;
+                std::process::exit(0);
+            });
+            (ServerMessage::Closed { id }, None)
         }
     }
 }

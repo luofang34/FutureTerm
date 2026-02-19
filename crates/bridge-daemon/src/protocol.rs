@@ -30,6 +30,9 @@ pub enum ClientMessage {
         stop_bits: Option<u8>,
         parity: Option<String>,
     },
+
+    /// Request daemon to shut down gracefully (for version upgrades)
+    Shutdown { id: u64 },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -102,7 +105,8 @@ impl ClientMessage {
             | ClientMessage::Open { id, .. }
             | ClientMessage::Close { id }
             | ClientMessage::Write { id, .. }
-            | ClientMessage::SetConfig { id, .. } => *id,
+            | ClientMessage::SetConfig { id, .. }
+            | ClientMessage::Shutdown { id } => *id,
         }
     }
 }
@@ -251,6 +255,22 @@ mod tests {
 
         let msg2 = ClientMessage::Close { id: 100 };
         assert_eq!(msg2.id(), 100);
+    }
+
+    #[test]
+    fn test_parse_shutdown() {
+        let json = r#"{"type":"shutdown","id":99}"#;
+        let msg = ClientMessage::from_json(json).unwrap();
+        match msg {
+            ClientMessage::Shutdown { id } => assert_eq!(id, 99),
+            _ => panic!("Wrong message type"),
+        }
+    }
+
+    #[test]
+    fn test_shutdown_id() {
+        let msg = ClientMessage::Shutdown { id: 42 };
+        assert_eq!(msg.id(), 42);
     }
 
     #[test]

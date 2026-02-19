@@ -47,8 +47,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     };
 
-    // Start WebSocket server with auto-shutdown (5 minutes idle)
-    server::serve(listener, Duration::from_secs(300), tls_acceptor).await?;
+    // Start WebSocket server with auto-shutdown (2 minutes idle)
+    server::serve(listener, Duration::from_secs(120), tls_acceptor).await?;
 
     Ok(())
 }

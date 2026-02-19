@@ -387,6 +387,14 @@ impl WebSocketTransport {
         Ok(())
     }
 
+    /// Request the bridge daemon to shut down gracefully (for version upgrades).
+    /// Fire-and-forget: the daemon exits after a brief delay.
+    pub fn send_shutdown(&self) -> Result<(), TransportError> {
+        let id = self.next_msg_id();
+        let request = format!(r#"{{"type":"shutdown","id":{}}}"#, id);
+        self.send_json(&request)
+    }
+
     /// Set serial config via bridge daemon
     pub async fn set_baud_rate(&self, baud_rate: u32) -> Result<(), TransportError> {
         let id = self.next_msg_id();
