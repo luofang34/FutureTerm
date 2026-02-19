@@ -50,6 +50,16 @@ jobs:
           cd apps/web
           RUSTFLAGS="--cfg=web_sys_unstable_apis" trunk build --release
 
+      - name: Copy cert bundle to dist
+        run: |
+          if [ -f apps/web/cert/bridge.json ]; then
+            mkdir -p apps/web/dist/cert
+            cp apps/web/cert/bridge.json apps/web/dist/cert/
+            echo "Cert bundle copied to dist/cert/"
+          else
+            echo "No cert bundle found (first deploy before cert renewal)"
+          fi
+
       - name: Upload artifact
         uses: actions/upload-pages-artifact@v3
         with:
