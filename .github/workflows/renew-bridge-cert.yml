@@ -19,8 +19,7 @@ jobs:
 
       - name: Install certbot + DNS plugin
         run: |
-          sudo apt-get update -qq
-          sudo apt-get install -y -qq certbot python3-certbot-dns-route53 python3-certbot-dns-cloudflare
+          pip install certbot certbot-dns-route53 certbot-dns-cloudflare
 
       - name: Renew certificate (Route 53 — futureterm.com)
         if: env.AWS_ACCESS_KEY_ID != ''
