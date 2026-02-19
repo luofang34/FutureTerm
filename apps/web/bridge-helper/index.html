@@ -88,18 +88,6 @@
       margin-top: 16px;
       line-height: 1.5;
     }
-    .security-badge {
-      display: inline-flex;
-      align-items: center;
-      gap: 6px;
-      background: #1a3a1a;
-      border: 1px solid #2a5a2a;
-      border-radius: 4px;
-      padding: 4px 10px;
-      font-size: 0.85rem;
-      color: #6c6;
-      margin-bottom: 12px;
-    }
     .back-link {
       display: inline-block;
       margin-top: 24px;
@@ -126,13 +114,9 @@
         which FutureTerm uses to communicate with serial devices (Arduino, ESP32, flight controllers, etc.).
       </p>
       <p>
-        This lightweight helper app bridges the gap by running a local WebSocket server that FutureTerm connects to.
-        It only runs when you're using FutureTerm and shuts down automatically after 5 minutes of inactivity.
+        This helper runs a local WebSocket server on your machine that FutureTerm connects to.
+        It listens on localhost only and shuts down automatically after 5 minutes of inactivity.
       </p>
-      <div class="security-badge">
-        <svg width="14" height="14" viewBox="0 0 16 16" fill="currentColor"><path d="M8 0l8 3v5c0 4.418-3.582 8-8 8S0 12.418 0 8V3l8-3zm0 1.5L1.5 4v4c0 3.59 2.91 6.5 6.5 6.5s6.5-2.91 6.5-6.5V4L8 1.5z"/><path d="M7 8.793l-1.646-1.647-.708.708L7 10.207l3.354-3.353-.708-.708L7 8.793z"/></svg>
-        Runs on localhost only &middot; No network exposure &middot; Auto-shutdown
-      </div>
     </div>
 
     <div class="card">
@@ -180,7 +164,7 @@
         <li>FutureTerm detects that WebSerial is not available</li>
         <li>It tries to connect to the local helper via WebSocket</li>
         <li>If the helper isn't running, it launches automatically via <code>futureterm://</code> URL scheme</li>
-        <li>The helper provides serial port access through a secure local connection</li>
+        <li>The helper provides serial port access through a local TLS connection</li>
       </ol>
     </div>
 
@@ -188,7 +172,7 @@
       <h2>Troubleshooting</h2>
       <p><strong>macOS blocks the app?</strong> A notification may appear — click <strong>Open</strong> or <strong>Allow</strong>. If blocked, go to System Settings &rsaquo; Privacy &amp; Security, scroll down to find FutureTerm, and click <strong>Open Anyway</strong>.</p>
       <p><strong>macOS asks for serial port access?</strong> Click <strong>Allow</strong> when macOS shows a Privacy &amp; Security dialog asking if FutureTerm Helper can access serial devices. This is required to communicate with your device.</p>
-      <p><strong>Connection fails?</strong> Make sure no other app is using port 9876. The helper uses <code>ws://127.0.0.1:9876</code>.</p>
+      <p><strong>Connection fails?</strong> Make sure no other app is using port 9876. The helper listens on <code>localhost:9876</code>.</p>
       <p><strong>Want to uninstall?</strong> Simply delete <code>FutureTerm.app</code> from Applications. No background processes remain.</p>
     </div>
 
