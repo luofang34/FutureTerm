@@ -528,12 +528,46 @@ pub fn App() -> impl IntoView {
                 };
 
                 if !connected {
-                    // Install dialog is already visible (shown when URL scheme fired).
-                    // Update status so the user knows what to do next.
+                    // Install dialog is already visible. Keep polling in the
+                    // background so the page auto-detects when the user finishes
+                    // installing the helper — no manual "Connect again" needed.
                     manager
                         .set_status
-                        .set("Install the helper app and click Connect again".into());
-                    return;
+                        .set("Waiting for helper app\u{2026}".into());
+
+                    let mut detected = false;
+                    // Poll every 3 s for up to ~2 minutes (40 attempts)
+                    for _ in 0..40 {
+                        gloo_timers::future::TimeoutFuture::new(3000).await;
+                        // User clicked Cancel — stop polling
+                        if !show_bridge_install.get() {
+                            return;
+                        }
+                        // Try primary URL
+                        ws_transport = transport_websocket::WebSocketTransport::new();
+                        if ws_transport.connect(ws_url_primary).await.is_ok() {
+                            detected = true;
+                            break;
+                        }
+                        // Try fallback URL
+                        if ws_url_primary != ws_url_fallback {
+                            ws_transport = transport_websocket::WebSocketTransport::new();
+                            if ws_transport.connect(ws_url_fallback).await.is_ok() {
+                                detected = true;
+                                break;
+                            }
+                        }
+                    }
+
+                    if !detected {
+                        manager
+                            .set_status
+                            .set("Could not connect. Click Connect to try again.".into());
+                        return;
+                    }
+
+                    // Helper detected — dismiss dialog and continue to version check
+                    set_show_bridge_install.set(false);
                 }
 
                 // Check daemon version — restart if outdated.

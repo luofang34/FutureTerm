@@ -91,8 +91,27 @@ jobs:
           cat > "${APP_BUNDLE}/Contents/MacOS/bridge-daemon" << 'LAUNCHER'
           #!/bin/bash
           DIR="$(cd "$(dirname "$0")" && pwd)"
+          APP_BUNDLE="$(cd "$DIR/../.." && pwd)"
+          INSTALLED="/Applications/FutureTerm.app/Contents/MacOS"
+          LSREGISTER="/System/Library/Frameworks/CoreServices.framework/Frameworks/LaunchServices.framework/Support/lsregister"
+
+          # Self-cleanup: if launched from Trash, unregister from LaunchServices
+          # and exit. Trashed apps should not handle URL schemes.
+          case "$APP_BUNDLE" in
+              */.Trash/*)
+                  "$LSREGISTER" -u "$APP_BUNDLE" 2>/dev/null
+                  exit 0
+                  ;;
+          esac
+
+          # If we're NOT the installed copy but the installed copy exists, delegate to it.
+          BIN="${DIR}/bridge-daemon-bin"
+          if [ "$DIR" != "$INSTALLED" ] && [ -x "${INSTALLED}/bridge-daemon-bin" ]; then
+              BIN="${INSTALLED}/bridge-daemon-bin"
+          fi
+
           mkdir -p ~/Library/Logs/FutureTerm
-          nohup "${DIR}/bridge-daemon-bin" "$@" >> ~/Library/Logs/FutureTerm/bridge.log 2>&1 &
+          nohup "$BIN" "$@" >> ~/Library/Logs/FutureTerm/bridge.log 2>&1 &
           LAUNCHER
           chmod +x "${APP_BUNDLE}/Contents/MacOS/bridge-daemon" "${APP_BUNDLE}/Contents/MacOS/bridge-daemon-bin"
 
