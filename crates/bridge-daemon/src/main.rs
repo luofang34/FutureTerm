@@ -33,7 +33,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let tls_acceptor = tls::load_tls_acceptor().await;
 
     if tls_acceptor.is_some() {
-        eprintln!("TLS enabled: wss://local.futureterm.com:{}", port);
+        eprintln!("TLS enabled: wss://127.0.0.1:{}", port);
     } else {
         eprintln!("TLS unavailable, falling back to ws://127.0.0.1:{}", port);
     }

@@ -16,8 +16,6 @@ use tokio_tungstenite::WebSocketStream;
 /// this prevents a malicious page from allocating a large buffer in the daemon.
 const MAX_WS_MESSAGE_SIZE: usize = 1024 * 1024;
 
-/// Production: only accept connections from the deployed web app.
-/// Debug builds also allow localhost dev servers.
 #[cfg(not(debug_assertions))]
 const ALLOWED_ORIGINS: &[&str] = &[
     "https://futureterm.com",
@@ -28,8 +26,8 @@ const ALLOWED_ORIGINS: &[&str] = &[
 const ALLOWED_ORIGINS: &[&str] = &[
     "https://futureterm.com",
     // "https://futureterm.app",  // User owns this domain, enable when ready
-    "http://localhost:8080", // Dev server (debug builds only)
-    "http://127.0.0.1:8080", // Dev server (debug builds only)
+    "http://localhost:8080",
+    "http://127.0.0.1:8080",
 ];
 
 #[allow(dead_code)] // Used in tests
@@ -466,12 +464,13 @@ mod tests {
     fn test_allowed_origins() {
         assert!(ALLOWED_ORIGINS.contains(&"https://futureterm.com"));
         assert!(!ALLOWED_ORIGINS.contains(&"https://evil.com"));
-        // Localhost dev origins are only present in debug builds
+
         #[cfg(debug_assertions)]
         {
             assert!(ALLOWED_ORIGINS.contains(&"http://localhost:8080"));
             assert!(ALLOWED_ORIGINS.contains(&"http://127.0.0.1:8080"));
         }
+
         #[cfg(not(debug_assertions))]
         {
             assert!(!ALLOWED_ORIGINS.contains(&"http://localhost:8080"));
