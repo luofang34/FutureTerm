@@ -442,14 +442,10 @@ pub fn App() -> impl IntoView {
                     .set_status
                     .set("WebSerial not available, trying bridge...".into());
 
-                // Production: wss:// via local.futureterm.com (TLS required for Safari).
-                // Dev: ws:// to 127.0.0.1 directly (no cert needed, Chrome exempts localhost).
-                // Fallback: if wss:// fails, try ws://127.0.0.1 (works in Chrome/Edge).
-                let ws_url_primary = if cfg!(debug_assertions) {
-                    "ws://127.0.0.1:9876"
-                } else {
-                    "wss://local.futureterm.com:9876"
-                };
+                // wss:// via locally-trusted self-signed cert for 127.0.0.1.
+                // Safari requires TLS even for localhost; Chrome/Edge exempt it.
+                // Fallback: plain ws:// (works in Chrome/Edge only).
+                let ws_url_primary = "wss://127.0.0.1:9876";
                 let ws_url_fallback = "ws://127.0.0.1:9876";
 
                 let mut ws_transport = transport_websocket::WebSocketTransport::new();
@@ -572,7 +568,7 @@ pub fn App() -> impl IntoView {
 
                 // Check daemon version — restart if outdated.
                 // Expected version must match the daemon built with this release.
-                const EXPECTED_DAEMON_VERSION: &str = "0.2.0";
+                const EXPECTED_DAEMON_VERSION: &str = "0.2.1";
 
                 let daemon_ver = ws_transport.daemon_version();
                 match daemon_ver.as_deref() {

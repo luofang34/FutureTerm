@@ -1,26 +1,7 @@
 use rustls::pki_types::CertificateDer;
-use serde::Deserialize;
 use std::path::PathBuf;
 use std::sync::Arc;
 use tokio_rustls::TlsAcceptor;
-
-/// HTTPS endpoint serving the latest cert+key bundle (hosted on GitHub Pages).
-/// The renewal workflow commits this file to apps/web/cert/bridge.json,
-/// which gets deployed to GitHub Pages at this URL.
-const CERT_URL: &str = "https://futureterm.com/cert/bridge.json";
-
-/// Fallback URL in case the primary domain changes to futureterm.app.
-#[allow(dead_code)]
-const CERT_URL_ALT: &str = "https://futureterm.app/cert/bridge.json";
-
-/// JSON shape returned by the cert endpoint.
-#[derive(Deserialize)]
-struct CertBundle {
-    cert_pem: String,
-    key_pem: String,
-    #[allow(dead_code)]
-    not_after: Option<String>,
-}
 
 /// Cert storage directory: ~/Library/Application Support/FutureTerm/ (macOS)
 /// or ~/.local/share/FutureTerm/ (Linux).
@@ -29,52 +10,99 @@ fn cert_dir() -> Option<PathBuf> {
 }
 
 fn cert_path() -> Option<PathBuf> {
-    cert_dir().map(|d| d.join("bridge-cert.pem"))
+    cert_dir().map(|d| d.join("local-cert.pem"))
 }
 
 fn key_path() -> Option<PathBuf> {
-    cert_dir().map(|d| d.join("bridge-key.pem"))
+    cert_dir().map(|d| d.join("local-key.pem"))
 }
 
-/// Load or fetch the TLS certificate, returning a TlsAcceptor.
-/// Returns None if TLS cannot be set up (network down, no cached cert).
+/// Load or generate a self-signed TLS certificate for 127.0.0.1.
+///
+/// First run: generates a self-signed cert, saves to disk, and adds to the
+/// macOS Keychain as trusted for SSL (prompts user for authentication once).
+///
+/// Subsequent runs: loads the cached cert from disk.
 pub async fn load_tls_acceptor() -> Option<TlsAcceptor> {
-    // 1. Try loading cached cert from disk
-    let cached = load_cached_cert().await;
-
-    // 2. If cached cert exists and is not near expiry, use it
-    if let Some((ref cert_pem, ref key_pem)) = cached {
-        if !is_near_expiry(cert_pem) {
-            if let Ok(acceptor) = build_acceptor(cert_pem, key_pem) {
-                eprintln!("TLS: Using cached certificate");
-                return Some(acceptor);
-            }
+    // Try loading existing cert from disk
+    if let Some((cert_pem, key_pem)) = load_cached_cert().await {
+        if let Ok(acceptor) = build_acceptor(&cert_pem, &key_pem) {
+            eprintln!("TLS: Using existing local certificate");
+            return Some(acceptor);
         }
+        eprintln!("TLS: Cached certificate is invalid, regenerating...");
     }
 
-    // 3. Try fetching fresh cert from server
-    match fetch_cert_from_server() {
-        Ok((cert_pem, key_pem)) => {
-            eprintln!("TLS: Fetched fresh certificate from server");
-            let _ = save_cert_to_disk(&cert_pem, &key_pem).await;
-            match build_acceptor(&cert_pem, &key_pem) {
-                Ok(acceptor) => return Some(acceptor),
-                Err(e) => eprintln!("TLS: Failed to build acceptor from fetched cert: {}", e),
-            }
-        }
+    // Generate new self-signed certificate
+    let (cert_pem, key_pem) = match generate_self_signed_cert() {
+        Ok(pair) => pair,
         Err(e) => {
-            eprintln!("TLS: Failed to fetch cert from server: {}", e);
+            eprintln!("TLS: Failed to generate certificate: {}", e);
+            return None;
+        }
+    };
+    eprintln!("TLS: Generated new self-signed certificate for 127.0.0.1");
+
+    // Save to disk
+    if let Err(e) = save_cert_to_disk(&cert_pem, &key_pem).await {
+        eprintln!("TLS: Failed to save certificate: {}", e);
+    }
+
+    // Add to macOS Keychain so browsers trust wss://127.0.0.1
+    #[cfg(target_os = "macos")]
+    if let Some(cert_p) = cert_path() {
+        match add_to_macos_keychain(&cert_p) {
+            Ok(()) => eprintln!("TLS: Certificate trusted in macOS Keychain"),
+            Err(e) => eprintln!(
+                "TLS: Keychain trust failed: {} (Safari may reject wss://127.0.0.1)",
+                e
+            ),
         }
     }
 
-    // 4. Fall back to stale cached cert as last resort
-    if let Some((cert_pem, key_pem)) = cached {
-        eprintln!("TLS: Using stale cached certificate as fallback");
-        return build_acceptor(&cert_pem, &key_pem).ok();
-    }
+    build_acceptor(&cert_pem, &key_pem).ok()
+}
 
-    eprintln!("TLS: No certificate available");
-    None
+/// Generate a self-signed certificate valid for 127.0.0.1 and localhost.
+/// Uses ECDSA P-256 for compact, fast certs. Valid for ~11 years (rcgen default).
+fn generate_self_signed_cert() -> Result<(String, String), String> {
+    use rcgen::{CertificateParams, KeyPair, SanType};
+    use std::net::{IpAddr, Ipv4Addr};
+
+    let mut params = CertificateParams::new(vec!["localhost".into()])
+        .map_err(|e| format!("Cert params: {}", e))?;
+
+    // Add IP SAN for 127.0.0.1 (browsers check SAN, not CN)
+    params
+        .subject_alt_names
+        .push(SanType::IpAddress(IpAddr::V4(Ipv4Addr::LOCALHOST)));
+
+    let key_pair = KeyPair::generate().map_err(|e| format!("Key generation: {}", e))?;
+
+    let cert = params
+        .self_signed(&key_pair)
+        .map_err(|e| format!("Self-signing: {}", e))?;
+
+    Ok((cert.pem(), key_pair.serialize_pem()))
+}
+
+/// Add a certificate to the macOS Keychain as trusted for SSL.
+/// On first run, macOS shows an authentication dialog (user enters password once).
+///
+/// Uses `spawn()` so the daemon starts serving immediately while the user
+/// interacts with the password dialog. Chrome works instantly (exempts localhost);
+/// Safari starts working once the user enters their password.
+#[cfg(target_os = "macos")]
+fn add_to_macos_keychain(cert_path: &std::path::Path) -> Result<(), String> {
+    let _child = std::process::Command::new("security")
+        .args(["add-trusted-cert", "-p", "ssl"])
+        .arg(cert_path)
+        .spawn()
+        .map_err(|e| format!("Failed to run security: {}", e))?;
+
+    // Child process runs in background — macOS SecurityAgent will show
+    // the authentication dialog. We don't wait for it to complete.
+    Ok(())
 }
 
 fn build_acceptor(cert_pem: &str, key_pem: &str) -> Result<TlsAcceptor, String> {
@@ -113,156 +141,39 @@ async fn load_cached_cert() -> Option<(String, String)> {
     Some((cert_pem, key_pem))
 }
 
-/// Save cert+key to disk for caching.
 async fn save_cert_to_disk(cert_pem: &str, key_pem: &str) -> Result<(), String> {
-    let dir = cert_dir().ok_or("Cannot determine data directory")?;
+    let dir = cert_dir().ok_or("Cannot determine cert directory")?;
     tokio::fs::create_dir_all(&dir)
         .await
         .map_err(|e| format!("Failed to create cert dir: {}", e))?;
 
-    let cert_p = dir.join("bridge-cert.pem");
-    let key_p = dir.join("bridge-key.pem");
+    let cert_p = dir.join("local-cert.pem");
+    let key_p = dir.join("local-key.pem");
 
+    // Write certificate normally (world readable is fine for public certs)
     tokio::fs::write(&cert_p, cert_pem)
         .await
         .map_err(|e| format!("Failed to write cert: {}", e))?;
 
-    tokio::fs::write(&key_p, key_pem)
-        .await
-        .map_err(|e| format!("Failed to write key: {}", e))?;
+    // Create a strict `0o600` options handle to restrict private key access
+    let mut key_opts = tokio::fs::OpenOptions::new();
+    key_opts.write(true).create(true).truncate(true);
 
-    // Restrict key file permissions (owner read-only)
     #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        let perms = std::fs::Permissions::from_mode(0o600);
-        let _ = std::fs::set_permissions(&key_p, perms);
-    }
+    key_opts.mode(0o600);
+
+    let mut key_file = key_opts
+        .open(&key_p)
+        .await
+        .map_err(|e| format!("Failed to open key file: {}", e))?;
+
+    use tokio::io::AsyncWriteExt;
+    key_file
+        .write_all(key_pem.as_bytes())
+        .await
+        .map_err(|e| format!("Failed to write key file: {}", e))?;
 
     Ok(())
-}
-
-/// Fetch cert+key bundle from the server (blocking HTTP, runs once at startup).
-fn fetch_cert_from_server() -> Result<(String, String), String> {
-    let bundle: CertBundle = ureq::get(CERT_URL)
-        .call()
-        .map_err(|e| format!("HTTP request failed: {}", e))?
-        .body_mut()
-        .read_json()
-        .map_err(|e| format!("JSON parse failed: {}", e))?;
-
-    if bundle.cert_pem.is_empty() || bundle.key_pem.is_empty() {
-        return Err("Empty cert or key in bundle".into());
-    }
-
-    Ok((bundle.cert_pem, bundle.key_pem))
-}
-
-/// Check if a PEM certificate expires within 7 days.
-/// Returns true if the cert is near expiry or cannot be parsed.
-fn is_near_expiry(cert_pem: &str) -> bool {
-    // Parse the first certificate from PEM
-    let cert_der = match rustls_pemfile::certs(&mut cert_pem.as_bytes()).next() {
-        Some(Ok(c)) => c,
-        _ => return true, // Can't parse → treat as expired
-    };
-
-    // Use x509-parser-lite approach: check the notAfter field.
-    // rustls doesn't expose cert fields directly, so we do a rough check:
-    // Parse the ASN.1 DER to find the validity period.
-    parse_not_after_and_check(&cert_der, 7)
-}
-
-/// Parse X.509 DER to extract notAfter and check if it's within `days` of now.
-/// Returns true if near expiry or unparseable.
-fn parse_not_after_and_check(der: &[u8], days: i64) -> bool {
-    // X.509 certificate structure (simplified):
-    // SEQUENCE {
-    //   SEQUENCE {  -- tbsCertificate
-    //     [0] version
-    //     INTEGER serialNumber
-    //     SEQUENCE algorithmIdentifier
-    //     SEQUENCE issuer
-    //     SEQUENCE validity {
-    //       UTCTime/GeneralizedTime notBefore
-    //       UTCTime/GeneralizedTime notAfter
-    //     }
-    //     ...
-    //   }
-    //   ...
-    // }
-    //
-    // We walk the ASN.1 structure to find the validity sequence,
-    // then extract notAfter. This avoids adding a full x509 parser dependency.
-
-    let _ = days; // Used below
-
-    // Find notAfter by searching for time patterns in DER.
-    // UTCTime tag = 0x17, GeneralizedTime tag = 0x18
-    let mut i = 0;
-    let mut time_count = 0;
-    while i < der.len().saturating_sub(2) {
-        let tag = der.get(i).copied().unwrap_or(0);
-        if tag == 0x17 || tag == 0x18 {
-            time_count += 1;
-            if time_count == 2 {
-                // This is notAfter
-                let len = der.get(i + 1).copied().unwrap_or(0) as usize;
-                if let Some(time_bytes) = der.get(i + 2..i + 2 + len) {
-                    if let Ok(time_str) = std::str::from_utf8(time_bytes) {
-                        return is_time_within_days(time_str, tag == 0x18, days);
-                    }
-                }
-                return true; // Can't parse
-            }
-        }
-        i += 1;
-    }
-
-    true // Can't find notAfter → treat as expired
-}
-
-/// Check if an ASN.1 time string is within `days` days from now.
-fn is_time_within_days(time_str: &str, is_generalized: bool, days: i64) -> bool {
-    // UTCTime format: YYMMDDHHMMSSZ
-    // GeneralizedTime format: YYYYMMDDHHMMSSZ
-    let (year, rest) = if is_generalized {
-        // YYYYMMDDHHMMSSZ
-        if time_str.len() < 14 {
-            return true;
-        }
-        let y: i64 = time_str.get(..4).and_then(|s| s.parse().ok()).unwrap_or(0);
-        (y, &time_str[4..])
-    } else {
-        // YYMMDDHHMMSSZ
-        if time_str.len() < 12 {
-            return true;
-        }
-        let y: i64 = time_str.get(..2).and_then(|s| s.parse().ok()).unwrap_or(0);
-        let full_year = if y >= 50 { 1900 + y } else { 2000 + y };
-        (full_year, &time_str[2..])
-    };
-
-    let month: i64 = rest.get(..2).and_then(|s| s.parse().ok()).unwrap_or(0);
-    let day: i64 = rest.get(2..4).and_then(|s| s.parse().ok()).unwrap_or(0);
-
-    // Approximate: convert to days since epoch for comparison.
-    // Not perfectly accurate but sufficient for "within 7 days" check.
-    let cert_days = year * 365 + month * 30 + day;
-
-    // Get current date in same rough format
-    let now = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default();
-    let now_secs = now.as_secs() as i64;
-    // Seconds since epoch → rough days
-    let now_days_epoch = now_secs / 86400;
-    // Convert cert date to rough days since epoch
-    // Days from year 0 to 1970 ≈ 719163
-    let cert_days_epoch = cert_days - 719163;
-
-    let remaining = cert_days_epoch - now_days_epoch;
-    remaining <= days
 }
 
 #[cfg(test)]
@@ -270,21 +181,19 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_is_time_within_days_utctime_future() {
-        // UTCTime format: YYMMDDHHMMSSZ (2-digit year)
-        // "301231235959Z" = Dec 31, 2030 — far in the future, NOT near expiry
-        assert!(!is_time_within_days("301231235959Z", false, 7));
+    fn test_generate_self_signed_cert() {
+        let (cert_pem, key_pem) = generate_self_signed_cert().expect("cert generation failed");
+        assert!(cert_pem.contains("BEGIN CERTIFICATE"));
+        assert!(key_pem.contains("BEGIN PRIVATE KEY"));
     }
 
     #[test]
-    fn test_is_time_within_days_utctime_past() {
-        // UTCTime format: "200101000000Z" = Jan 1, 2020 — already expired
-        assert!(is_time_within_days("200101000000Z", false, 7));
-    }
-
-    #[test]
-    fn test_is_time_within_days_generalized_future() {
-        assert!(!is_time_within_days("20301231235959Z", true, 7));
+    fn test_build_acceptor_with_generated_cert() {
+        // Install crypto provider (same as main.rs does at startup)
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let (cert_pem, key_pem) = generate_self_signed_cert().expect("cert generation failed");
+        let acceptor = build_acceptor(&cert_pem, &key_pem);
+        assert!(acceptor.is_ok());
     }
 
     #[test]
@@ -300,13 +209,7 @@ mod tests {
     }
 
     #[test]
-    fn test_is_near_expiry_invalid() {
-        assert!(is_near_expiry("not a pem"));
-    }
-
-    #[test]
     fn test_cert_dir_exists() {
-        // Should return Some on all platforms
         assert!(cert_dir().is_some());
     }
 }
