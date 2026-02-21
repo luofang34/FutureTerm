@@ -42,17 +42,17 @@ jobs:
           KEY_PEM=$(cat "$CERT_DIR/local.futureterm.app.key")
           EXPIRES=$(date -u -d "+90 days" +%Y-%m-%dT%H:%M:%SZ)
 
-          # Build JSON bundle
-          JSON=$(jq -n \
+          # Build JSON bundle and write to temp file
+          jq -n \
             --arg cert "$CERT_PEM" \
             --arg key "$KEY_PEM" \
             --arg exp "$EXPIRES" \
-            '{cert_pem: $cert, key_pem: $key, expires: $exp}')
+            '{cert_pem: $cert, key_pem: $key, expires: $exp}' > /tmp/cert_bundle.json
 
-          # Write to KV
-          echo "$JSON" | npx wrangler kv key put \
+          # Write to KV via --path
+          npx wrangler kv key put \
             --namespace-id="59c7ed06a4af4acf9bafc312612a9b42" \
-            "cert_bundle" --pipe
+            "cert_bundle" --path=/tmp/cert_bundle.json
 
       - name: Verify cert is served
         run: |
