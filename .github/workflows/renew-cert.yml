@@ -1,0 +1,67 @@
+name: Renew TLS Certificate
+
+on:
+  schedule:
+    # Every 60 days — LE certs last 90 days, giving 30-day buffer
+    - cron: '0 3 1 */2 *'
+  workflow_dispatch:
+
+# GitHub Secrets required (same as deploy-cert-worker.yml):
+#   CF_ACCOUNT_ID      - Cloudflare account ID
+#   CF_WORKERS_TOKEN   - Workers KV Storage Edit
+#   CF_DNS_TOKEN       - Zone DNS Edit for futureterm.app
+
+jobs:
+  renew:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Install acme.sh
+        run: |
+          curl -sSL https://get.acme.sh | sh -s email=cert@futureterm.app
+          echo "$HOME/.acme.sh" >> "$GITHUB_PATH"
+
+      - name: Issue or renew certificate
+        env:
+          CF_Token: ${{ secrets.CF_DNS_TOKEN }}
+        run: |
+          ~/.acme.sh/acme.sh --issue \
+            --dns dns_cf \
+            -d local.futureterm.app \
+            --keylength ec-256 \
+            --server letsencrypt \
+            --force
+
+      - name: Store cert bundle in Cloudflare KV
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CF_WORKERS_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CF_ACCOUNT_ID }}
+        run: |
+          CERT_DIR="$HOME/.acme.sh/local.futureterm.app_ecc"
+
+          CERT_PEM=$(cat "$CERT_DIR/fullchain.cer")
+          KEY_PEM=$(cat "$CERT_DIR/local.futureterm.app.key")
+          EXPIRES=$(date -u -d "+90 days" +%Y-%m-%dT%H:%M:%SZ)
+
+          # Build JSON bundle
+          JSON=$(jq -n \
+            --arg cert "$CERT_PEM" \
+            --arg key "$KEY_PEM" \
+            --arg exp "$EXPIRES" \
+            '{cert_pem: $cert, key_pem: $key, expires: $exp}')
+
+          # Write to KV
+          echo "$JSON" | npx wrangler kv key put \
+            --namespace-id="59c7ed06a4af4acf9bafc312612a9b42" \
+            "cert_bundle" --pipe
+
+      - name: Verify cert is served
+        run: |
+          RESP=$(curl -s -H "X-FT-Token: ft-bridge-cert-v1" https://cert.futureterm.app/cert)
+          if echo "$RESP" | jq -e '.cert_pem' > /dev/null 2>&1; then
+            echo "Certificate stored and served successfully"
+            echo "$RESP" | jq '{expires: .expires, cert_preview: (.cert_pem | split("\n") | .[0:2] | join("\n"))}'
+          else
+            echo "ERROR: Certificate not available after KV write"
+            echo "$RESP"
+            exit 1
+          fi
