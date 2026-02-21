@@ -49,9 +49,10 @@ jobs:
             --arg exp "$EXPIRES" \
             '{cert_pem: $cert, key_pem: $key, expires: $exp}' > /tmp/cert_bundle.json
 
-          # Write to KV via --path
+          # Write to remote KV
           npx wrangler kv key put \
             --namespace-id="59c7ed06a4af4acf9bafc312612a9b42" \
+            --remote \
             "cert_bundle" --path=/tmp/cert_bundle.json
 
       - name: Verify cert is served
