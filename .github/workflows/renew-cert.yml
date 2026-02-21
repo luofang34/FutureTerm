@@ -27,7 +27,7 @@ jobs:
           ~/.acme.sh/acme.sh --issue \
             --dns dns_cf \
             -d local.futureterm.app \
-            --keylength ec-256 \
+            --keylength 2048 \
             --server letsencrypt \
             --force
 
@@ -36,7 +36,7 @@ jobs:
           CLOUDFLARE_API_TOKEN: ${{ secrets.CF_WORKERS_TOKEN }}
           CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CF_ACCOUNT_ID }}
         run: |
-          CERT_DIR="$HOME/.acme.sh/local.futureterm.app_ecc"
+          CERT_DIR="$HOME/.acme.sh/local.futureterm.app"
 
           CERT_PEM=$(cat "$CERT_DIR/fullchain.cer")
           KEY_PEM=$(cat "$CERT_DIR/local.futureterm.app.key")
