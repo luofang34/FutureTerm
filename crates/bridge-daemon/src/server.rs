@@ -18,14 +18,14 @@ const MAX_WS_MESSAGE_SIZE: usize = 1024 * 1024;
 
 #[cfg(not(debug_assertions))]
 const ALLOWED_ORIGINS: &[&str] = &[
-    "https://futureterm.com",
-    // "https://futureterm.app",  // User owns this domain, enable when ready
+    "https://futureterm.app",
+    "https://futureterm.com", // backward compat during migration to .app
 ];
 
 #[cfg(debug_assertions)]
 const ALLOWED_ORIGINS: &[&str] = &[
+    "https://futureterm.app",
     "https://futureterm.com",
-    // "https://futureterm.app",  // User owns this domain, enable when ready
     "http://localhost:8080",
     "http://127.0.0.1:8080",
 ];
@@ -462,6 +462,7 @@ mod tests {
 
     #[test]
     fn test_allowed_origins() {
+        assert!(ALLOWED_ORIGINS.contains(&"https://futureterm.app"));
         assert!(ALLOWED_ORIGINS.contains(&"https://futureterm.com"));
         assert!(!ALLOWED_ORIGINS.contains(&"https://evil.com"));
 

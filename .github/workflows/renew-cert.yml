@@ -6,15 +6,18 @@ on:
     - cron: '0 3 1 */2 *'
   workflow_dispatch:
 
-# GitHub Secrets required (same as deploy-cert-worker.yml):
-#   CF_ACCOUNT_ID      - Cloudflare account ID
-#   CF_WORKERS_TOKEN   - Workers KV Storage Edit
-#   CF_DNS_TOKEN       - Zone DNS Edit for futureterm.app
+# GitHub Secrets required:
+#   CF_DNS_TOKEN - Zone DNS Edit for futureterm.app (used by acme.sh dns_cf plugin)
+
+permissions:
+  contents: write   # needed to create/update GitHub Release
 
 jobs:
   renew:
     runs-on: ubuntu-latest
     steps:
+      - uses: actions/checkout@v4
+
       - name: Install acme.sh
         run: |
           curl -sSL https://get.acme.sh | sh -s email=cert@futureterm.app
@@ -31,10 +34,7 @@ jobs:
             --server letsencrypt \
             --force
 
-      - name: Store cert bundle in Cloudflare KV
-        env:
-          CLOUDFLARE_API_TOKEN: ${{ secrets.CF_WORKERS_TOKEN }}
-          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CF_ACCOUNT_ID }}
+      - name: Build cert bundle JSON
         run: |
           CERT_DIR="$HOME/.acme.sh/local.futureterm.app"
 
@@ -42,27 +42,34 @@ jobs:
           KEY_PEM=$(cat "$CERT_DIR/local.futureterm.app.key")
           EXPIRES=$(date -u -d "+90 days" +%Y-%m-%dT%H:%M:%SZ)
 
-          # Build JSON bundle and write to temp file
           jq -n \
             --arg cert "$CERT_PEM" \
             --arg key "$KEY_PEM" \
             --arg exp "$EXPIRES" \
-            '{cert_pem: $cert, key_pem: $key, expires: $exp}' > /tmp/cert_bundle.json
+            '{cert_pem: $cert, key_pem: $key, expires: $exp}' > cert-bundle.json
 
-          # Write to remote KV
-          npx wrangler kv key put \
-            --namespace-id="59c7ed06a4af4acf9bafc312612a9b42" \
-            --remote \
-            "cert_bundle" --path=/tmp/cert_bundle.json
-
-      - name: Verify cert is served
+      - name: Upload to GitHub Release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          RESP=$(curl -s -H "X-FT-Token: ft-bridge-cert-v1" https://cert.futureterm.app/cert)
+          # Create the release if it doesn't exist yet
+          if ! gh release view cert-latest > /dev/null 2>&1; then
+            gh release create cert-latest \
+              --title "TLS Certificate" \
+              --notes "Auto-renewed LE certificate for local.futureterm.app. Updated every 60 days." \
+              cert-bundle.json
+          else
+            gh release upload cert-latest cert-bundle.json --clobber
+          fi
+
+      - name: Verify cert is downloadable
+        run: |
+          RESP=$(curl -sL https://github.com/luofang34/FutureTerm/releases/download/cert-latest/cert-bundle.json)
           if echo "$RESP" | jq -e '.cert_pem' > /dev/null 2>&1; then
-            echo "Certificate stored and served successfully"
+            echo "Certificate uploaded and downloadable"
             echo "$RESP" | jq '{expires: .expires, cert_preview: (.cert_pem | split("\n") | .[0:2] | join("\n"))}'
           else
-            echo "ERROR: Certificate not available after KV write"
-            echo "$RESP"
+            echo "ERROR: Certificate not available after upload"
+            echo "$RESP" | head -5
             exit 1
           fi

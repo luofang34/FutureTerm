@@ -28,14 +28,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     eprintln!("FutureTerm Bridge Daemon v{}", env!("CARGO_PKG_VERSION"));
 
-    // Try to set up TLS (fetch cert from server or load from disk cache).
-    // If TLS is unavailable, the daemon falls back to plain ws://.
+    // Fetch ACME certificate for local.futureterm.app from the cert worker.
+    // If unavailable, daemon runs without TLS — Chrome/Edge still use WebSerial
+    // directly, but Safari/Firefox bridge will be disabled.
     let tls_acceptor = tls::load_tls_acceptor().await;
 
     if tls_acceptor.is_some() {
-        eprintln!("TLS enabled: wss://127.0.0.1:{}", port);
+        eprintln!("TLS enabled: wss://local.futureterm.app:{}", port);
     } else {
-        eprintln!("TLS unavailable, falling back to ws://127.0.0.1:{}", port);
+        eprintln!(
+            "TLS unavailable: ws://127.0.0.1:{} (Safari/Firefox bridge disabled)",
+            port
+        );
     }
 
     // Single instance check: if port is already bound, another instance is running
