@@ -2,6 +2,7 @@ use crate::protocol::{ClientMessage, ServerMessage};
 use crate::serial::SerialManager;
 use base64::Engine;
 use futures_util::{SinkExt, StreamExt};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::io::{AsyncRead, AsyncWrite};
@@ -18,14 +19,14 @@ const MAX_WS_MESSAGE_SIZE: usize = 1024 * 1024;
 
 #[cfg(not(debug_assertions))]
 const ALLOWED_ORIGINS: &[&str] = &[
-    "https://futureterm.com",
-    // "https://futureterm.app",  // User owns this domain, enable when ready
+    "https://futureterm.app",
+    "https://futureterm.com", // backward compat during migration to .app
 ];
 
 #[cfg(debug_assertions)]
 const ALLOWED_ORIGINS: &[&str] = &[
+    "https://futureterm.app",
     "https://futureterm.com",
-    // "https://futureterm.app",  // User owns this domain, enable when ready
     "http://localhost:8080",
     "http://127.0.0.1:8080",
 ];
@@ -48,11 +49,18 @@ pub async fn serve(
     let tls_acceptor = tls_acceptor.map(Arc::new);
     let last_activity = Arc::new(RwLock::new(Instant::now()));
     let last_activity_clone = last_activity.clone();
+    let active_connections = Arc::new(AtomicUsize::new(0));
+    let active_connections_idle = active_connections.clone();
 
-    // Spawn idle timeout checker
+    // Spawn idle timeout checker — only triggers when zero connections
     tokio::spawn(async move {
         loop {
             tokio::time::sleep(IDLE_CHECK_INTERVAL).await;
+            if active_connections_idle.load(Ordering::Relaxed) > 0 {
+                // Active connections present — reset idle timer
+                *last_activity_clone.write().await = Instant::now();
+                continue;
+            }
             let elapsed = last_activity_clone.read().await.elapsed();
             if elapsed > idle_timeout {
                 eprintln!("Idle timeout ({:?}), shutting down", idle_timeout);
@@ -71,6 +79,8 @@ pub async fn serve(
 
         let last_activity = last_activity.clone();
         let tls = tls_acceptor.clone();
+        let conns = active_connections.clone();
+        conns.fetch_add(1, Ordering::Relaxed);
         tokio::spawn(async move {
             let result = if let Some(acceptor) = tls {
                 // TLS path: TCP → TLS handshake → WebSocket handshake
@@ -86,6 +96,7 @@ pub async fn serve(
             if let Err(e) = result {
                 eprintln!("Connection error: {}", e);
             }
+            conns.fetch_sub(1, Ordering::Relaxed);
         });
     }
 }
@@ -462,6 +473,7 @@ mod tests {
 
     #[test]
     fn test_allowed_origins() {
+        assert!(ALLOWED_ORIGINS.contains(&"https://futureterm.app"));
         assert!(ALLOWED_ORIGINS.contains(&"https://futureterm.com"));
         assert!(!ALLOWED_ORIGINS.contains(&"https://evil.com"));
 

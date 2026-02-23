@@ -442,25 +442,18 @@ pub fn App() -> impl IntoView {
                     .set_status
                     .set("WebSerial not available, trying bridge...".into());
 
-                // wss:// via locally-trusted self-signed cert for 127.0.0.1.
-                // Safari requires TLS even for localhost; Chrome/Edge exempt it.
-                // Fallback: plain ws:// (works in Chrome/Edge only).
-                let ws_url_primary = "wss://127.0.0.1:9876";
-                let ws_url_fallback = "ws://127.0.0.1:9876";
+                // Connect to bridge daemon via wss://local.futureterm.app:9876.
+                //
+                // Uses a Let's Encrypt cert fetched by the daemon from GitHub
+                // Releases. The domain resolves to 127.0.0.1 — traffic stays local.
+                // LE certs are trusted by ALL browsers natively (no Keychain or
+                // NSS store interaction needed).
+                let ws_url = "wss://local.futureterm.app:9876";
 
                 let mut ws_transport = transport_websocket::WebSocketTransport::new();
 
                 // Try direct connection first (daemon already running)
-                let connected = match ws_transport.connect(ws_url_primary).await {
-                    Ok(_) => true,
-                    Err(_) if ws_url_primary != ws_url_fallback => {
-                        // wss:// failed — try plain ws:// fallback (works in Chrome/Edge
-                        // which exempt 127.0.0.1 from mixed-content blocking)
-                        ws_transport = transport_websocket::WebSocketTransport::new();
-                        ws_transport.connect(ws_url_fallback).await.is_ok()
-                    }
-                    Err(_) => false,
-                };
+                let connected = ws_transport.connect(ws_url).await.is_ok();
 
                 let connected = if connected {
                     true
@@ -504,20 +497,11 @@ pub fn App() -> impl IntoView {
                     let mut success = false;
                     for &delay in retry_delays_ms.iter() {
                         gloo_timers::future::TimeoutFuture::new(delay).await;
-                        // Try primary URL first, then fallback
                         ws_transport = transport_websocket::WebSocketTransport::new();
-                        if ws_transport.connect(ws_url_primary).await.is_ok() {
+                        if ws_transport.connect(ws_url).await.is_ok() {
                             set_show_bridge_install.set(false);
                             success = true;
                             break;
-                        }
-                        if ws_url_primary != ws_url_fallback {
-                            ws_transport = transport_websocket::WebSocketTransport::new();
-                            if ws_transport.connect(ws_url_fallback).await.is_ok() {
-                                set_show_bridge_install.set(false);
-                                success = true;
-                                break;
-                            }
                         }
                     }
                     success
@@ -539,19 +523,10 @@ pub fn App() -> impl IntoView {
                         if !show_bridge_install.get() {
                             return;
                         }
-                        // Try primary URL
                         ws_transport = transport_websocket::WebSocketTransport::new();
-                        if ws_transport.connect(ws_url_primary).await.is_ok() {
+                        if ws_transport.connect(ws_url).await.is_ok() {
                             detected = true;
                             break;
-                        }
-                        // Try fallback URL
-                        if ws_url_primary != ws_url_fallback {
-                            ws_transport = transport_websocket::WebSocketTransport::new();
-                            if ws_transport.connect(ws_url_fallback).await.is_ok() {
-                                detected = true;
-                                break;
-                            }
                         }
                     }
 
@@ -568,7 +543,7 @@ pub fn App() -> impl IntoView {
 
                 // Check daemon version — restart if outdated.
                 // Expected version must match the daemon built with this release.
-                const EXPECTED_DAEMON_VERSION: &str = "0.2.1";
+                const EXPECTED_DAEMON_VERSION: &str = "0.3.0";
 
                 let daemon_ver = ws_transport.daemon_version();
                 match daemon_ver.as_deref() {
@@ -631,16 +606,9 @@ pub fn App() -> impl IntoView {
                         for &delay in retry_delays_ms.iter() {
                             gloo_timers::future::TimeoutFuture::new(delay).await;
                             ws_transport = transport_websocket::WebSocketTransport::new();
-                            if ws_transport.connect(ws_url_primary).await.is_ok() {
+                            if ws_transport.connect(ws_url).await.is_ok() {
                                 restarted = true;
                                 break;
-                            }
-                            if ws_url_primary != ws_url_fallback {
-                                ws_transport = transport_websocket::WebSocketTransport::new();
-                                if ws_transport.connect(ws_url_fallback).await.is_ok() {
-                                    restarted = true;
-                                    break;
-                                }
                             }
                         }
 
