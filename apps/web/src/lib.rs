@@ -153,6 +153,38 @@ pub fn App() -> impl IntoView {
     let (bridge_ports, set_bridge_ports) = create_signal::<Vec<(String, String)>>(Vec::new());
     let (bridge_port_pick, set_bridge_port_pick) = create_signal::<Option<String>>(None);
 
+    // ── Startup pre-checks ──
+    // Detect transport availability at page load so the Connect button can
+    // act instantly instead of spending 3+ seconds probing.
+    //
+    // WebSerial check is synchronous (<1ms).  Bridge daemon probe is async
+    // but a TCP connection-refused on localhost resolves in <10ms, so both
+    // results are typically ready well before the user clicks anything.
+    let has_webserial = web_sys::window()
+        .map(|w| !w.navigator().serial().is_undefined())
+        .unwrap_or(false);
+
+    // bridge_ready: None = still checking, Some(true) = daemon reachable
+    let (bridge_ready, set_bridge_ready) = create_signal::<Option<bool>>(None);
+
+    if !has_webserial {
+        let set_install = set_show_bridge_install;
+        spawn_local(async move {
+            let mut ws = transport_websocket::WebSocketTransport::new();
+            let ok = ws.connect("wss://local.futureterm.app:9876").await.is_ok();
+            if ok {
+                let _ = ws.close().await;
+            }
+            set_bridge_ready.set(Some(ok));
+
+            // No WebSerial AND no daemon → show install dialog immediately.
+            // User sees it while the page finishes loading — no wasted clicks.
+            if !ok {
+                set_install.set(true);
+            }
+        });
+    }
+
     // Worker Logic
     let manager_worker_init = manager.clone();
     let bridge_active_worker = bridge_active.clone();
@@ -473,13 +505,9 @@ pub fn App() -> impl IntoView {
                     }
                 }
 
-                // WebSerial not available - try WebSocket bridge
-                manager
-                    .set_status
-                    .set("WebSerial not available, trying bridge...".into());
-
-                // Connect to bridge daemon via wss://local.futureterm.app:9876.
+                // WebSerial not available — use WebSocket bridge.
                 //
+                // Connect to bridge daemon via wss://local.futureterm.app:9876.
                 // Uses a Let's Encrypt cert fetched by the daemon from GitHub
                 // Releases. The domain resolves to 127.0.0.1 — traffic stays local.
                 // LE certs are trusted by ALL browsers natively (no Keychain or
@@ -488,14 +516,37 @@ pub fn App() -> impl IntoView {
 
                 let mut ws_transport = transport_websocket::WebSocketTransport::new();
 
-                // Try direct connection first (daemon already running)
-                let connected = ws_transport.connect(ws_url).await.is_ok();
+                // Use the startup pre-check result to skip the 3s connect
+                // timeout when we already know whether the daemon is up.
+                let precheck = bridge_ready.get_untracked();
+
+                let connected = match precheck {
+                    // Daemon was reachable at page load — connect directly.
+                    Some(true) => {
+                        manager
+                            .set_status
+                            .set("Connecting to bridge\u{2026}".into());
+                        ws_transport.connect(ws_url).await.is_ok()
+                    }
+                    // Daemon was unreachable at page load — skip the 3s
+                    // timeout and go straight to URL scheme launch.
+                    Some(false) => false,
+                    // Pre-check still in flight (rare) — probe now.
+                    None => {
+                        manager
+                            .set_status
+                            .set("Connecting to bridge\u{2026}".into());
+                        ws_transport.connect(ws_url).await.is_ok()
+                    }
+                };
 
                 let connected = if connected {
+                    // Dismiss the install dialog if it was shown at startup.
+                    set_show_bridge_install.set(false);
                     true
                 } else {
-                    // Daemon not running - try URL scheme launch
-                    manager.set_status.set("Launching helper...".into());
+                    // Daemon not running — try URL scheme launch.
+                    manager.set_status.set("Launching helper\u{2026}".into());
 
                     // Launch via hidden iframe (avoids navigating away)
                     let launch_url = "futureterm://launch?port=9876";
@@ -520,14 +571,8 @@ pub fn App() -> impl IntoView {
                         }
                     }
 
-                    manager.set_status.set("Launching helper\u{2026}".into());
-
                     // Aggressive retry schedule (no install dialog yet).
                     // Cumulative: 500 / 1000 / 2000 / 3500ms.
-                    //   500ms  — cached cert, no macOS Allow dialog
-                    //  1000ms  — cached cert, slow process launch
-                    //  2000ms  — cold cert fetch from GitHub (~500ms-1.5s)
-                    //  3500ms  — Allow dialog click + cold cert
                     let retry_delays_ms: &[u32] = &[500, 500, 1000, 1500];
                     let mut success = false;
                     for &delay in retry_delays_ms.iter() {
@@ -579,8 +624,10 @@ pub fn App() -> impl IntoView {
                         return;
                     }
 
-                    // Helper detected — dismiss dialog and continue to version check
+                    // Helper detected — dismiss dialog, update pre-check cache,
+                    // and continue to version check.
                     set_show_bridge_install.set(false);
+                    set_bridge_ready.set(Some(true));
                 }
 
                 // Check daemon version — restart if outdated.
