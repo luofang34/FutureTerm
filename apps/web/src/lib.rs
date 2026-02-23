@@ -520,25 +520,29 @@ pub fn App() -> impl IntoView {
                         }
                     }
 
-                    // Show install dialog immediately so users who don't have the
-                    // helper can act right away rather than watching a countdown.
-                    // The dialog auto-dismisses if a retry succeeds.
-                    set_show_bridge_install.set(true);
-                    manager.set_status.set("Starting helper app...".into());
+                    manager.set_status.set("Launching helper\u{2026}".into());
 
-                    // Retry while macOS processes the URL scheme and the user
-                    // may be clicking "Allow" in the security dialog.
-                    // Total window: ~4 s (enough for open + Allow + startup).
-                    let retry_delays_ms: &[u32] = &[400, 800, 1200, 1500];
+                    // Aggressive retry schedule (no install dialog yet).
+                    // Cumulative: 500 / 1000 / 2000 / 3500ms.
+                    //   500ms  — cached cert, no macOS Allow dialog
+                    //  1000ms  — cached cert, slow process launch
+                    //  2000ms  — cold cert fetch from GitHub (~500ms-1.5s)
+                    //  3500ms  — Allow dialog click + cold cert
+                    let retry_delays_ms: &[u32] = &[500, 500, 1000, 1500];
                     let mut success = false;
                     for &delay in retry_delays_ms.iter() {
                         gloo_timers::future::TimeoutFuture::new(delay).await;
                         ws_transport = transport_websocket::WebSocketTransport::new();
                         if ws_transport.connect(ws_url).await.is_ok() {
-                            set_show_bridge_install.set(false);
                             success = true;
                             break;
                         }
+                    }
+
+                    // Only show install dialog after all fast retries failed —
+                    // returning users with the helper installed never see it.
+                    if !success {
+                        set_show_bridge_install.set(true);
                     }
                     success
                 };
@@ -552,9 +556,11 @@ pub fn App() -> impl IntoView {
                         .set("Waiting for helper app\u{2026}".into());
 
                     let mut detected = false;
-                    // Poll every 3 s for up to ~2 minutes (40 attempts)
-                    for _ in 0..40 {
-                        gloo_timers::future::TimeoutFuture::new(3000).await;
+                    // Poll every 1 s for up to ~2 minutes (120 attempts).
+                    // Fast polling gives snappy UX — the dialog disappears
+                    // within a second of the helper becoming reachable.
+                    for _ in 0..120 {
+                        gloo_timers::future::TimeoutFuture::new(1000).await;
                         // User clicked Cancel — stop polling
                         if !show_bridge_install.get() {
                             return;
@@ -799,10 +805,27 @@ pub fn App() -> impl IntoView {
                 }
 
                 // ── Auto-Probe Baud Rate ──
+                // Set bridge_active + Probing state so the Disconnect button
+                // works during probe (same UX as WebSerial probing).
                 let mut final_baud = if current_baud == 0 {
-                    match bridge_auto_probe(&ws_transport, &manager).await {
+                    bridge_active_connect.set(true);
+                    manager.set_connection_state(ConnectionState::Probing);
+
+                    match bridge_auto_probe(&ws_transport, &manager, &bridge_closing_connect).await
+                    {
                         Ok(baud) => baud,
                         Err(e) => {
+                            // User cancelled or real failure
+                            if bridge_closing_connect.get() {
+                                // Clean up: close port, reset state
+                                let _ = ws_transport.close_port().await;
+                                let _ = ws_transport.close().await;
+                                bridge_active_connect.set(false);
+                                bridge_closing_connect.set(false);
+                                manager.set_connection_state(ConnectionState::Disconnected);
+                                manager.set_status.set("Disconnected".into());
+                                return;
+                            }
                             #[cfg(debug_assertions)]
                             web_sys::console::log_1(
                                 &format!("Bridge auto-probe failed: {}", e).into(),
@@ -1395,6 +1418,7 @@ pub fn App() -> impl IntoView {
 async fn bridge_auto_probe(
     ws_transport: &transport_websocket::WebSocketTransport,
     manager: &ActorBridge,
+    cancel: &Rc<Cell<bool>>,
 ) -> Result<u32, String> {
     use core_types::Transport;
 
@@ -1411,6 +1435,10 @@ async fn bridge_auto_probe(
     let mut best_buffer: Vec<u8> = Vec::new();
 
     for &baud in BAUD_CANDIDATES {
+        // Check cancellation at the top of each iteration
+        if cancel.get() {
+            return Err("Probe cancelled by user".into());
+        }
         manager
             .set_status
             .set(format!("AUTO: Testing {} baud...", baud));
