@@ -735,6 +735,11 @@ impl TerminalMetadata {
             .retain(|span| span.raw_log_byte_start < span.raw_log_byte_end);
     }
 
+    /// Returns true if the terminal has any content (not at origin position)
+    pub fn has_content(&self) -> bool {
+        self.current_terminal_line > 0 || self.current_terminal_column > 0
+    }
+
     /// Clears all metadata (e.g., when Terminal is reset)
     #[allow(dead_code)] // Reserved for future Terminal reset handling
     pub fn clear(&mut self) {

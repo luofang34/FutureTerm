@@ -117,6 +117,31 @@ pub fn App() -> impl IntoView {
     // Legacy signals removed/replaced by manager:
     // status, connected, transport, active_port, is_reconfiguring
 
+    // Session separator: prepend \r\n on first write after reconnect so the
+    // new prompt doesn't concatenate on the previous session's last line.
+    // NOT set on the very first connection (terminal at origin → no separator needed).
+    let needs_session_newline: Rc<Cell<bool>> = Rc::new(Cell::new(false));
+
+    // Set the session-newline flag when transitioning to Connected and the
+    // terminal already has content from a previous session.
+    {
+        let flag = needs_session_newline.clone();
+        create_effect(move |prev: Option<ConnectionState>| {
+            let current = state_signal.get();
+            if current == ConnectionState::Connected {
+                if let Some(prev_state) = prev {
+                    if prev_state != ConnectionState::Connected {
+                        let meta = terminal_metadata.get_untracked();
+                        if meta.has_content() {
+                            flag.set(true);
+                        }
+                    }
+                }
+            }
+            current
+        });
+    }
+
     // Bridge mode shared state (for Safari/Firefox WebSocket bridge)
     let bridge_active: Rc<Cell<bool>> = Rc::new(Cell::new(false));
     let bridge_closing: Rc<Cell<bool>> = Rc::new(Cell::new(false));
@@ -132,10 +157,12 @@ pub fn App() -> impl IntoView {
     let manager_worker_init = manager.clone();
     let bridge_active_worker = bridge_active.clone();
     let bridge_tx_queue_worker = bridge_tx_queue.clone();
+    let needs_newline_worker = needs_session_newline.clone();
     create_effect(move |_| {
         let manager = manager_worker_init.clone();
         let bridge_active_tx = bridge_active_worker.clone();
         let bridge_tx_queue_tx = bridge_tx_queue_worker.clone();
+        let needs_newline = needs_newline_worker.clone();
         if let Ok(w) = Worker::new("worker_bootstrap.js") {
             // Restore TextDecoder for RX to Main Thread (if we ever want to decode locally? No,
             // worker does that) But wait, worker sends BACK a 'DataBatch' with frames.
@@ -217,6 +244,15 @@ pub fn App() -> impl IntoView {
                             // metadata for cross-view selection sync to
                             // work
                             if let Some(term) = term_handle.get_untracked() {
+                                // On reconnect, separate from previous session output
+                                if needs_newline.get() {
+                                    needs_newline.set(false);
+                                    term.write("\r\n");
+                                    // Keep metadata in sync with the injected newline
+                                    set_terminal_metadata.update(|meta| {
+                                        meta.record_write(b"\r\n", "\r\n", 0);
+                                    });
+                                }
                                 for f in &frames {
                                     if !f.bytes.is_empty() {
                                         if let Ok(text) = decoder
