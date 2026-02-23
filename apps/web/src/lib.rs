@@ -632,7 +632,7 @@ pub fn App() -> impl IntoView {
 
                 // Check daemon version — restart if outdated.
                 // Expected version must match the daemon built with this release.
-                const EXPECTED_DAEMON_VERSION: &str = "0.3.0";
+                const EXPECTED_DAEMON_VERSION: &str = "0.3.1";
 
                 let daemon_ver = ws_transport.daemon_version();
                 match daemon_ver.as_deref() {
