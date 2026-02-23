@@ -37,6 +37,7 @@ Claude.md
 gemini.md
 .cursorrules
 .aider*
+.mcp.json
 
 # Shell scripts - ignore generated logs/temp scripts but keep dev/build scripts
 socat.log
