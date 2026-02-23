@@ -122,6 +122,10 @@ pub async fn load_tls_acceptor() -> Option<TlsAcceptor> {
 /// transparently.
 fn fetch_acme_cert() -> Result<(String, String), String> {
     let body = ureq::get(CERT_URL)
+        .config()
+        .timeout_connect(Some(std::time::Duration::from_secs(10)))
+        .timeout_recv_body(Some(std::time::Duration::from_secs(10)))
+        .build()
         .call()
         .map_err(|e| format!("HTTP request failed: {}", e))?
         .into_body()

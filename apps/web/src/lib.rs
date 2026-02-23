@@ -117,6 +117,31 @@ pub fn App() -> impl IntoView {
     // Legacy signals removed/replaced by manager:
     // status, connected, transport, active_port, is_reconfiguring
 
+    // Session separator: prepend \r\n on first write after reconnect so the
+    // new prompt doesn't concatenate on the previous session's last line.
+    // NOT set on the very first connection (terminal at origin → no separator needed).
+    let needs_session_newline: Rc<Cell<bool>> = Rc::new(Cell::new(false));
+
+    // Set the session-newline flag when transitioning to Connected and the
+    // terminal already has content from a previous session.
+    {
+        let flag = needs_session_newline.clone();
+        create_effect(move |prev: Option<ConnectionState>| {
+            let current = state_signal.get();
+            if current == ConnectionState::Connected {
+                if let Some(prev_state) = prev {
+                    if prev_state != ConnectionState::Connected {
+                        let meta = terminal_metadata.get_untracked();
+                        if meta.has_content() {
+                            flag.set(true);
+                        }
+                    }
+                }
+            }
+            current
+        });
+    }
+
     // Bridge mode shared state (for Safari/Firefox WebSocket bridge)
     let bridge_active: Rc<Cell<bool>> = Rc::new(Cell::new(false));
     let bridge_closing: Rc<Cell<bool>> = Rc::new(Cell::new(false));
@@ -128,14 +153,48 @@ pub fn App() -> impl IntoView {
     let (bridge_ports, set_bridge_ports) = create_signal::<Vec<(String, String)>>(Vec::new());
     let (bridge_port_pick, set_bridge_port_pick) = create_signal::<Option<String>>(None);
 
+    // ── Startup pre-checks ──
+    // Detect transport availability at page load so the Connect button can
+    // act instantly instead of spending 3+ seconds probing.
+    //
+    // WebSerial check is synchronous (<1ms).  Bridge daemon probe is async
+    // but a TCP connection-refused on localhost resolves in <10ms, so both
+    // results are typically ready well before the user clicks anything.
+    let has_webserial = web_sys::window()
+        .map(|w| !w.navigator().serial().is_undefined())
+        .unwrap_or(false);
+
+    // bridge_ready: None = still checking, Some(true) = daemon reachable
+    let (bridge_ready, set_bridge_ready) = create_signal::<Option<bool>>(None);
+
+    if !has_webserial {
+        let set_install = set_show_bridge_install;
+        spawn_local(async move {
+            let mut ws = transport_websocket::WebSocketTransport::new();
+            let ok = ws.connect("wss://local.futureterm.app:9876").await.is_ok();
+            if ok {
+                let _ = ws.close().await;
+            }
+            set_bridge_ready.set(Some(ok));
+
+            // No WebSerial AND no daemon → show install dialog immediately.
+            // User sees it while the page finishes loading — no wasted clicks.
+            if !ok {
+                set_install.set(true);
+            }
+        });
+    }
+
     // Worker Logic
     let manager_worker_init = manager.clone();
     let bridge_active_worker = bridge_active.clone();
     let bridge_tx_queue_worker = bridge_tx_queue.clone();
+    let needs_newline_worker = needs_session_newline.clone();
     create_effect(move |_| {
         let manager = manager_worker_init.clone();
         let bridge_active_tx = bridge_active_worker.clone();
         let bridge_tx_queue_tx = bridge_tx_queue_worker.clone();
+        let needs_newline = needs_newline_worker.clone();
         if let Ok(w) = Worker::new("worker_bootstrap.js") {
             // Restore TextDecoder for RX to Main Thread (if we ever want to decode locally? No,
             // worker does that) But wait, worker sends BACK a 'DataBatch' with frames.
@@ -217,6 +276,15 @@ pub fn App() -> impl IntoView {
                             // metadata for cross-view selection sync to
                             // work
                             if let Some(term) = term_handle.get_untracked() {
+                                // On reconnect, separate from previous session output
+                                if needs_newline.get() {
+                                    needs_newline.set(false);
+                                    term.write("\r\n");
+                                    // Keep metadata in sync with the injected newline
+                                    set_terminal_metadata.update(|meta| {
+                                        meta.record_write(b"\r\n", "\r\n", 0);
+                                    });
+                                }
                                 for f in &frames {
                                     if !f.bytes.is_empty() {
                                         if let Ok(text) = decoder
@@ -437,13 +505,9 @@ pub fn App() -> impl IntoView {
                     }
                 }
 
-                // WebSerial not available - try WebSocket bridge
-                manager
-                    .set_status
-                    .set("WebSerial not available, trying bridge...".into());
-
-                // Connect to bridge daemon via wss://local.futureterm.app:9876.
+                // WebSerial not available — use WebSocket bridge.
                 //
+                // Connect to bridge daemon via wss://local.futureterm.app:9876.
                 // Uses a Let's Encrypt cert fetched by the daemon from GitHub
                 // Releases. The domain resolves to 127.0.0.1 — traffic stays local.
                 // LE certs are trusted by ALL browsers natively (no Keychain or
@@ -452,14 +516,37 @@ pub fn App() -> impl IntoView {
 
                 let mut ws_transport = transport_websocket::WebSocketTransport::new();
 
-                // Try direct connection first (daemon already running)
-                let connected = ws_transport.connect(ws_url).await.is_ok();
+                // Use the startup pre-check result to skip the 3s connect
+                // timeout when we already know whether the daemon is up.
+                let precheck = bridge_ready.get_untracked();
+
+                let connected = match precheck {
+                    // Daemon was reachable at page load — connect directly.
+                    Some(true) => {
+                        manager
+                            .set_status
+                            .set("Connecting to bridge\u{2026}".into());
+                        ws_transport.connect(ws_url).await.is_ok()
+                    }
+                    // Daemon was unreachable at page load — skip the 3s
+                    // timeout and go straight to URL scheme launch.
+                    Some(false) => false,
+                    // Pre-check still in flight (rare) — probe now.
+                    None => {
+                        manager
+                            .set_status
+                            .set("Connecting to bridge\u{2026}".into());
+                        ws_transport.connect(ws_url).await.is_ok()
+                    }
+                };
 
                 let connected = if connected {
+                    // Dismiss the install dialog if it was shown at startup.
+                    set_show_bridge_install.set(false);
                     true
                 } else {
-                    // Daemon not running - try URL scheme launch
-                    manager.set_status.set("Launching helper...".into());
+                    // Daemon not running — try URL scheme launch.
+                    manager.set_status.set("Launching helper\u{2026}".into());
 
                     // Launch via hidden iframe (avoids navigating away)
                     let launch_url = "futureterm://launch?port=9876";
@@ -484,25 +571,23 @@ pub fn App() -> impl IntoView {
                         }
                     }
 
-                    // Show install dialog immediately so users who don't have the
-                    // helper can act right away rather than watching a countdown.
-                    // The dialog auto-dismisses if a retry succeeds.
-                    set_show_bridge_install.set(true);
-                    manager.set_status.set("Starting helper app...".into());
-
-                    // Retry while macOS processes the URL scheme and the user
-                    // may be clicking "Allow" in the security dialog.
-                    // Total window: ~4 s (enough for open + Allow + startup).
-                    let retry_delays_ms: &[u32] = &[400, 800, 1200, 1500];
+                    // Aggressive retry schedule (no install dialog yet).
+                    // Cumulative: 500 / 1000 / 2000 / 3500ms.
+                    let retry_delays_ms: &[u32] = &[500, 500, 1000, 1500];
                     let mut success = false;
                     for &delay in retry_delays_ms.iter() {
                         gloo_timers::future::TimeoutFuture::new(delay).await;
                         ws_transport = transport_websocket::WebSocketTransport::new();
                         if ws_transport.connect(ws_url).await.is_ok() {
-                            set_show_bridge_install.set(false);
                             success = true;
                             break;
                         }
+                    }
+
+                    // Only show install dialog after all fast retries failed —
+                    // returning users with the helper installed never see it.
+                    if !success {
+                        set_show_bridge_install.set(true);
                     }
                     success
                 };
@@ -516,9 +601,11 @@ pub fn App() -> impl IntoView {
                         .set("Waiting for helper app\u{2026}".into());
 
                     let mut detected = false;
-                    // Poll every 3 s for up to ~2 minutes (40 attempts)
-                    for _ in 0..40 {
-                        gloo_timers::future::TimeoutFuture::new(3000).await;
+                    // Poll every 1 s for up to ~2 minutes (120 attempts).
+                    // Fast polling gives snappy UX — the dialog disappears
+                    // within a second of the helper becoming reachable.
+                    for _ in 0..120 {
+                        gloo_timers::future::TimeoutFuture::new(1000).await;
                         // User clicked Cancel — stop polling
                         if !show_bridge_install.get() {
                             return;
@@ -537,8 +624,10 @@ pub fn App() -> impl IntoView {
                         return;
                     }
 
-                    // Helper detected — dismiss dialog and continue to version check
+                    // Helper detected — dismiss dialog, update pre-check cache,
+                    // and continue to version check.
                     set_show_bridge_install.set(false);
+                    set_bridge_ready.set(Some(true));
                 }
 
                 // Check daemon version — restart if outdated.
@@ -763,10 +852,27 @@ pub fn App() -> impl IntoView {
                 }
 
                 // ── Auto-Probe Baud Rate ──
+                // Set bridge_active + Probing state so the Disconnect button
+                // works during probe (same UX as WebSerial probing).
                 let mut final_baud = if current_baud == 0 {
-                    match bridge_auto_probe(&ws_transport, &manager).await {
+                    bridge_active_connect.set(true);
+                    manager.set_connection_state(ConnectionState::Probing);
+
+                    match bridge_auto_probe(&ws_transport, &manager, &bridge_closing_connect).await
+                    {
                         Ok(baud) => baud,
                         Err(e) => {
+                            // User cancelled or real failure
+                            if bridge_closing_connect.get() {
+                                // Clean up: close port, reset state
+                                let _ = ws_transport.close_port().await;
+                                let _ = ws_transport.close().await;
+                                bridge_active_connect.set(false);
+                                bridge_closing_connect.set(false);
+                                manager.set_connection_state(ConnectionState::Disconnected);
+                                manager.set_status.set("Disconnected".into());
+                                return;
+                            }
                             #[cfg(debug_assertions)]
                             web_sys::console::log_1(
                                 &format!("Bridge auto-probe failed: {}", e).into(),
@@ -1359,6 +1465,7 @@ pub fn App() -> impl IntoView {
 async fn bridge_auto_probe(
     ws_transport: &transport_websocket::WebSocketTransport,
     manager: &ActorBridge,
+    cancel: &Rc<Cell<bool>>,
 ) -> Result<u32, String> {
     use core_types::Transport;
 
@@ -1375,6 +1482,10 @@ async fn bridge_auto_probe(
     let mut best_buffer: Vec<u8> = Vec::new();
 
     for &baud in BAUD_CANDIDATES {
+        // Check cancellation at the top of each iteration
+        if cancel.get() {
+            return Err("Probe cancelled by user".into());
+        }
         manager
             .set_status
             .set(format!("AUTO: Testing {} baud...", baud));

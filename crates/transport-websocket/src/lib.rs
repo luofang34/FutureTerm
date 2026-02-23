@@ -7,6 +7,12 @@ use wasm_bindgen::prelude::*;
 use wasm_bindgen_futures::JsFuture;
 use web_sys::{BinaryType, MessageEvent, WebSocket};
 
+/// Timeout for WebSocket connect operations (milliseconds).
+/// Successful localhost wss:// connections complete in ~50-250ms (including
+/// DNS + TLS). 3 seconds is a generous safety net for the rare case where
+/// the promise hangs (browser fires neither onopen, onerror, nor onclose).
+const WS_CONNECT_TIMEOUT_MS: i32 = 3000;
+
 /// Timeout for WebSocket close operations (milliseconds)
 const WS_CLOSE_TIMEOUT_MS: i32 = 1000;
 
@@ -219,11 +225,14 @@ impl WebSocketTransport {
 
         ws.set_onclose(Some(on_close.as_ref().unchecked_ref()));
 
-        // Wait for connection to open
+        // Wait for connection to open, with a timeout.
+        // Some browsers fire onclose (not onerror) on TLS failures, so we
+        // listen for all three events to avoid hanging the promise forever.
         let open_promise = js_sys::Promise::new(&mut |resolve, reject| {
             let ws_clone = ws.clone();
             let resolve_clone = resolve.clone();
             let reject_clone = reject.clone();
+            let reject_close = reject.clone();
 
             let onopen = Closure::once(move || {
                 let _ = resolve_clone.call0(&JsValue::NULL);
@@ -233,14 +242,30 @@ impl WebSocketTransport {
                 let _ = reject_clone.call1(&JsValue::NULL, &"Connection failed".into());
             });
 
+            let onclose_once = Closure::once(move |_: web_sys::CloseEvent| {
+                let _ = reject_close.call1(&JsValue::NULL, &"Connection closed before open".into());
+            });
+
             ws_clone.set_onopen(Some(onopen.as_ref().unchecked_ref()));
             ws_clone.set_onerror(Some(onerror_once.as_ref().unchecked_ref()));
+            ws_clone.set_onclose(Some(onclose_once.as_ref().unchecked_ref()));
 
             onopen.forget();
             onerror_once.forget();
+            onclose_once.forget();
         });
 
-        JsFuture::from(open_promise)
+        let timeout_promise = js_sys::Promise::new(&mut |_resolve, reject| {
+            if let Some(window) = web_sys::window() {
+                let _ = window.set_timeout_with_callback_and_timeout_and_arguments_0(
+                    &reject,
+                    WS_CONNECT_TIMEOUT_MS,
+                );
+            }
+        });
+
+        let race = js_sys::Promise::race(&js_sys::Array::of2(&open_promise, &timeout_promise));
+        JsFuture::from(race)
             .await
             .map_err(|e| TransportError::ConnectionFailed(format!("Connection failed: {:?}", e)))?;
 
