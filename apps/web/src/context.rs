@@ -5,9 +5,7 @@ use crate::xterm::TerminalHandle;
 use actor_protocol::ConnectionState;
 use core_types::{DecodedEvent, RawEvent, SelectionRange};
 use leptos::*;
-use std::cell::{Cell, RefCell};
 use std::collections::VecDeque;
-use std::rc::Rc;
 use web_sys::Worker;
 
 /// Shared application state for the entire FutureTerm UI.
@@ -15,6 +13,8 @@ use web_sys::Worker;
 /// Holds ALL reactive signals and shared flags that were previously
 /// scattered as local variables in `App()`. Passed via Leptos context
 /// so child components can access it without prop-drilling.
+///
+/// Bridge-specific fields live in `BridgeContext` (bridge_context.rs).
 #[derive(Clone)]
 #[allow(dead_code)] // Fields exposed for future phases of the modular plugin refactor
 pub struct AppContext {
@@ -60,24 +60,6 @@ pub struct AppContext {
     pub view_mode: ReadSignal<ViewId>,
     pub set_view_mode: WriteSignal<ViewId>,
 
-    // ── Bridge mode shared state (Safari/Firefox WebSocket bridge) ──
-    pub bridge_active: Rc<Cell<bool>>,
-    pub bridge_closing: Rc<Cell<bool>>,
-    pub bridge_tx_queue: Rc<RefCell<Vec<Vec<u8>>>>,
-    pub bridge_pending_baud: Rc<Cell<u32>>,
-
-    // ── Bridge UI signals ──
-    pub bridge_ports: ReadSignal<Vec<(String, String)>>,
-    pub set_bridge_ports: WriteSignal<Vec<(String, String)>>,
-    pub bridge_port_pick: ReadSignal<Option<String>>,
-    pub set_bridge_port_pick: WriteSignal<Option<String>>,
-    pub bridge_ready: ReadSignal<Option<bool>>,
-    pub set_bridge_ready: WriteSignal<Option<bool>>,
-
-    // ── Bridge install dialog ──
-    pub show_bridge_install: ReadSignal<bool>,
-    pub set_show_bridge_install: WriteSignal<bool>,
-
     // ── Worker ──
     pub worker: ReadSignal<Option<Worker>>,
     pub set_worker: WriteSignal<Option<Worker>>,
@@ -85,9 +67,6 @@ pub struct AppContext {
     // ── Terminal readiness ──
     pub _terminal_ready: ReadSignal<bool>,
     pub set_terminal_ready: WriteSignal<bool>,
-
-    // ── Session separator flag ──
-    pub needs_session_newline: Rc<Cell<bool>>,
 }
 
 /// Create all shared application state.
@@ -98,13 +77,14 @@ pub struct AppContext {
 /// The `worker` / `set_worker` signals are accepted as parameters because
 /// they must be created *before* `ActorBridge::new()` (which reads them)
 /// and then shared with the rest of the app via the context.
+///
+/// Bridge-specific state is created separately via `create_bridge_context()`.
 pub fn create_app_context(
     manager: ActorBridge,
     worker: ReadSignal<Option<Worker>>,
     set_worker: WriteSignal<Option<Worker>>,
 ) -> AppContext {
     let (_terminal_ready, set_terminal_ready) = create_signal(false);
-    let (show_bridge_install, set_show_bridge_install) = create_signal(false);
     let (view_mode, set_view_mode) = create_signal(ViewId::Terminal);
 
     // Derive connected signal from state machine
@@ -134,38 +114,6 @@ pub fn create_app_context(
     let (global_selection, set_global_selection) = create_signal::<Option<SelectionRange>>(None);
     let (terminal_metadata, set_terminal_metadata) = create_signal(TerminalMetadata::new());
 
-    // Session separator flag
-    let needs_session_newline: Rc<Cell<bool>> = Rc::new(Cell::new(false));
-
-    // Set the session-newline flag when transitioning to Connected and the
-    // terminal already has content from a previous session.
-    {
-        let flag = needs_session_newline.clone();
-        create_effect(move |prev: Option<ConnectionState>| {
-            let current = state_signal.get();
-            if current == ConnectionState::Connected {
-                if let Some(prev_state) = prev {
-                    if prev_state != ConnectionState::Connected {
-                        let meta = terminal_metadata.get_untracked();
-                        if meta.has_content() {
-                            flag.set(true);
-                        }
-                    }
-                }
-            }
-            current
-        });
-    }
-
-    // Bridge mode shared state
-    let bridge_active: Rc<Cell<bool>> = Rc::new(Cell::new(false));
-    let bridge_closing: Rc<Cell<bool>> = Rc::new(Cell::new(false));
-    let bridge_tx_queue: Rc<RefCell<Vec<Vec<u8>>>> = Rc::new(RefCell::new(Vec::new()));
-    let bridge_pending_baud: Rc<Cell<u32>> = Rc::new(Cell::new(0));
-    let (bridge_ports, set_bridge_ports) = create_signal::<Vec<(String, String)>>(Vec::new());
-    let (bridge_port_pick, set_bridge_port_pick) = create_signal::<Option<String>>(None);
-    let (bridge_ready, set_bridge_ready) = create_signal::<Option<bool>>(None);
-
     AppContext {
         manager,
         events_list,
@@ -191,22 +139,9 @@ pub fn create_app_context(
         connected,
         view_mode,
         set_view_mode,
-        bridge_active,
-        bridge_closing,
-        bridge_tx_queue,
-        bridge_pending_baud,
-        bridge_ports,
-        set_bridge_ports,
-        bridge_port_pick,
-        set_bridge_port_pick,
-        bridge_ready,
-        set_bridge_ready,
-        show_bridge_install,
-        set_show_bridge_install,
         worker,
         set_worker,
         _terminal_ready,
         set_terminal_ready,
-        needs_session_newline,
     }
 }

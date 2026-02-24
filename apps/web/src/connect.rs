@@ -3,6 +3,7 @@ mod webserial;
 
 pub use bridge::run_startup_precheck;
 
+use crate::bridge_context::BridgeContext;
 use crate::context::AppContext;
 use leptos::*;
 use wasm_bindgen_futures::spawn_local;
@@ -12,7 +13,7 @@ use wasm_bindgen_futures::spawn_local;
 /// Determines whether the current session should use the WebSerial API
 /// (Chrome/Edge) or the WebSocket bridge (Safari/Firefox) and dispatches
 /// to the appropriate sub-module.
-pub fn on_connect(ctx: &AppContext, force_picker: bool) {
+pub fn on_connect(ctx: &AppContext, bctx: &BridgeContext, force_picker: bool) {
     let shift_held = force_picker;
     let manager = &ctx.manager;
     let current_state = manager.state.get();
@@ -31,11 +32,11 @@ pub fn on_connect(ctx: &AppContext, force_picker: bool) {
     // Allow disconnect if state allows it
     if current_state.can_disconnect() && !force_picker {
         // Check if we're in bridge mode
-        if ctx.bridge_active.get() {
+        if bctx.active.get() {
             // Bridge disconnect - signal the read loop to stop
             // Set closing flag so connect flow waits for cleanup to finish
-            ctx.bridge_closing.set(true);
-            ctx.bridge_active.set(false);
+            bctx.closing.set(true);
+            bctx.active.set(false);
             return;
         }
 
@@ -100,16 +101,16 @@ pub fn on_connect(ctx: &AppContext, force_picker: bool) {
     let manager = manager.clone();
 
     // Bridge mode clones for the async block
-    let bridge_active_connect = ctx.bridge_active.clone();
-    let bridge_closing_connect = ctx.bridge_closing.clone();
-    let bridge_tx_queue_connect = ctx.bridge_tx_queue.clone();
-    let bridge_pending_baud_connect = ctx.bridge_pending_baud.clone();
-    let bridge_ready = ctx.bridge_ready;
-    let set_bridge_ready = ctx.set_bridge_ready;
-    let set_show_bridge_install = ctx.set_show_bridge_install;
-    let set_bridge_ports = ctx.set_bridge_ports;
-    let set_bridge_port_pick = ctx.set_bridge_port_pick;
-    let bridge_port_pick = ctx.bridge_port_pick;
+    let bridge_active_connect = bctx.active.clone();
+    let bridge_closing_connect = bctx.closing.clone();
+    let bridge_tx_queue_connect = bctx.tx_queue.clone();
+    let bridge_pending_baud_connect = bctx.pending_baud.clone();
+    let bridge_ready = bctx.ready;
+    let set_bridge_ready = bctx.set_ready;
+    let set_show_bridge_install = bctx.set_show_install;
+    let set_bridge_ports = bctx.set_ports;
+    let set_bridge_port_pick = bctx.set_port_pick;
+    let bridge_port_pick = bctx.port_pick;
     let framing = ctx.framing;
 
     spawn_local(async move {

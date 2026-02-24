@@ -1,3 +1,4 @@
+use crate::bridge_context::BridgeContext;
 use crate::context::AppContext;
 use crate::protocol::WorkerToUi;
 use core_types::RawEvent;
@@ -59,8 +60,8 @@ fn trim_decoded_events<T>(events: &mut VecDeque<T>, max_events: usize) {
 /// This creates the worker, wires up the message handler that routes
 /// `WorkerToUi` messages to the appropriate signals (raw log, terminal,
 /// decoded events, TX forwarding), and stores the worker in the context.
-pub fn setup_worker_dispatch(ctx: &AppContext) {
-    // Clone all fields we need from AppContext before moving into closures.
+pub fn setup_worker_dispatch(ctx: &AppContext, bctx: &BridgeContext) {
+    // Clone all fields we need from AppContext/BridgeContext before moving into closures.
     let manager = ctx.manager.clone();
     let set_worker = ctx.set_worker;
     let set_raw_log = ctx.set_raw_log;
@@ -69,7 +70,7 @@ pub fn setup_worker_dispatch(ctx: &AppContext) {
     let set_terminal_metadata = ctx.set_terminal_metadata;
     let term_handle = ctx.term_handle;
     let set_events_list = ctx.set_events_list;
-    let needs_session_newline = ctx.needs_session_newline.clone();
+    let needs_session_newline = bctx.needs_session_newline.clone();
 
     create_effect(move |_| {
         let manager = manager.clone();

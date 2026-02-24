@@ -1,5 +1,5 @@
 use crate::actor_bridge::ActorBridge;
-use crate::context::AppContext;
+use crate::bridge_context::BridgeContext;
 use crate::protocol::UiToWorker;
 use actor_protocol::ConnectionState;
 use core_types::Transport;
@@ -24,15 +24,15 @@ const MAX_TX_QUEUE: usize = 1024;
 /// if the daemon is not running, and retries with increasing delays.  If the
 /// daemon is found, sets `bridge_ready = Some(true)`.  If not found after
 /// retries, shows the bridge install dialog and starts 5-minute polling.
-pub fn run_startup_precheck(ctx: &AppContext) {
+pub fn run_startup_precheck(bctx: &BridgeContext) {
     let has_webserial = web_sys::window()
         .map(|w| !w.navigator().serial().is_undefined())
         .unwrap_or(false);
 
     if !has_webserial {
-        let set_install = ctx.set_show_bridge_install;
-        let set_bridge_ready = ctx.set_bridge_ready;
-        let show_bridge_install = ctx.show_bridge_install;
+        let set_install = bctx.set_show_install;
+        let set_bridge_ready = bctx.set_ready;
+        let show_bridge_install = bctx.show_install;
 
         spawn_local(async move {
             let ws_url = "wss://local.futureterm.app:9876";
