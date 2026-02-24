@@ -5,9 +5,7 @@ use leptos::*;
 /// status indicator, RX/TX activity lights, and connect/disconnect button.
 #[component]
 pub fn Header(on_connect: impl Fn(bool) + 'static + Clone) -> impl IntoView {
-    // AppContext is always provided by App() before this component renders.
-    #[allow(clippy::expect_used)]
-    let ctx = use_context::<AppContext>().expect("AppContext must be provided");
+    let ctx = expect_context::<AppContext>();
 
     let manager = ctx.manager.clone();
     let baud_rate = ctx.baud_rate;

@@ -11,8 +11,7 @@ use wasm_bindgen::JsCast;
 /// inlined in `App()`.
 #[component]
 pub fn TerminalPlugin() -> impl IntoView {
-    #[allow(clippy::expect_used)]
-    let ctx = use_context::<AppContext>().expect("AppContext");
+    let ctx = expect_context::<AppContext>();
 
     let set_terminal_ready = ctx.set_terminal_ready;
     let set_term_handle = ctx.set_term_handle;

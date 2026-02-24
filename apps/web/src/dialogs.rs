@@ -5,9 +5,7 @@ use leptos::*;
 /// app for Safari/Firefox (browsers without WebSerial support).
 #[component]
 pub fn BridgeInstallDialog() -> impl IntoView {
-    // BridgeContext is always provided by App() before this component renders.
-    #[allow(clippy::expect_used)]
-    let bctx = use_context::<BridgeContext>().expect("BridgeContext must be provided");
+    let bctx = expect_context::<BridgeContext>();
 
     let show_install = bctx.show_install;
     let set_show_install = bctx.set_show_install;
@@ -50,9 +48,7 @@ pub fn BridgePortPicker(on_connect: impl Fn(bool) + 'static + Clone) -> impl Int
     // use when the port-picker may trigger a connect after selection.
     let _ = &on_connect;
 
-    // BridgeContext is always provided by App() before this component renders.
-    #[allow(clippy::expect_used)]
-    let bctx = use_context::<BridgeContext>().expect("BridgeContext must be provided");
+    let bctx = expect_context::<BridgeContext>();
 
     let ports = bctx.ports;
     let set_port_pick = bctx.set_port_pick;
