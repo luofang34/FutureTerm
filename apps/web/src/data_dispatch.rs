@@ -2,6 +2,7 @@ use crate::context::AppContext;
 use crate::protocol::WorkerToUi;
 use core_types::RawEvent;
 use leptos::*;
+use std::collections::VecDeque;
 use wasm_bindgen::prelude::*;
 use wasm_bindgen::JsCast;
 use wasm_bindgen_futures::spawn_local;
@@ -20,7 +21,7 @@ const MAX_DECODED_EVENTS: usize = 2500;
 /// Trim raw_log events from the front to stay under size/count limits.
 /// Returns (events_trimmed, bytes_removed).
 fn trim_raw_log(
-    log: &mut Vec<RawEvent>,
+    log: &mut VecDeque<RawEvent>,
     total_bytes: usize,
     max_bytes: usize,
     max_events: usize,
@@ -46,7 +47,7 @@ fn trim_raw_log(
 
 /// Trim decoded events list to stay under capacity.
 /// Removes oldest events from the front.
-fn trim_decoded_events<T>(events: &mut Vec<T>, max_events: usize) {
+fn trim_decoded_events<T>(events: &mut VecDeque<T>, max_events: usize) {
     if events.len() > max_events {
         let split = events.len() - max_events;
         events.drain(0..split);
@@ -106,7 +107,7 @@ pub fn setup_worker_dispatch(ctx: &AppContext) {
                                     for frame in &frames {
                                         let event = RawEvent::from_frame(frame);
                                         bytes_added += event.byte_size();
-                                        log.push(event);
+                                        log.push_back(event);
                                     }
 
                                     // Update cumulative byte counter
@@ -221,6 +222,7 @@ pub fn setup_worker_dispatch(ctx: &AppContext) {
 mod tests {
     use super::*;
     use core_types::{Channel, RawEvent};
+    use std::collections::VecDeque;
 
     // Helper to create a test RawEvent with a given byte size
     fn make_event(size: usize) -> RawEvent {
@@ -236,7 +238,7 @@ mod tests {
 
     #[test]
     fn test_trim_raw_log_under_limits() {
-        let mut log = vec![make_event(100), make_event(200)];
+        let mut log = VecDeque::from(vec![make_event(100), make_event(200)]);
         let total_bytes = 300;
         let (trimmed, bytes_removed) = trim_raw_log(&mut log, total_bytes, 1000, 10);
         assert_eq!(trimmed, 0);
@@ -247,7 +249,7 @@ mod tests {
     #[test]
     fn test_trim_raw_log_over_byte_limit() {
         // 5 events of 300 bytes each = 1500 total, max_bytes = 1000
-        let mut log: Vec<RawEvent> = (0..5).map(|_| make_event(300)).collect();
+        let mut log: VecDeque<RawEvent> = (0..5).map(|_| make_event(300)).collect();
         let total_bytes = 1500;
         let (trimmed, bytes_removed) = trim_raw_log(&mut log, total_bytes, 1000, 10000);
         // Need to remove at least 500 bytes from front
@@ -260,7 +262,7 @@ mod tests {
     #[test]
     fn test_trim_raw_log_over_event_limit() {
         // 10 events, max_events = 5
-        let mut log: Vec<RawEvent> = (0..10).map(|_| make_event(10)).collect();
+        let mut log: VecDeque<RawEvent> = (0..10).map(|_| make_event(10)).collect();
         let total_bytes = 100;
         let (trimmed, bytes_removed) = trim_raw_log(&mut log, total_bytes, 10_000_000, 5);
         assert_eq!(trimmed, 5);
@@ -275,7 +277,7 @@ mod tests {
         // Byte limit requires removing 15000 bytes = 15 events
         // Event limit requires removing 12 events
         // Byte limit is stricter, so 15 events removed
-        let mut log: Vec<RawEvent> = (0..20).map(|_| make_event(1000)).collect();
+        let mut log: VecDeque<RawEvent> = (0..20).map(|_| make_event(1000)).collect();
         let total_bytes = 20000;
         let (trimmed, bytes_removed) = trim_raw_log(&mut log, total_bytes, 5000, 8);
         assert_eq!(trimmed, 15);
@@ -286,7 +288,7 @@ mod tests {
     #[test]
     fn test_trim_raw_log_exact_boundary() {
         // Exactly at the byte limit - should not trim
-        let mut log = vec![make_event(500), make_event(500)];
+        let mut log = VecDeque::from(vec![make_event(500), make_event(500)]);
         let total_bytes = 1000;
         let (trimmed, bytes_removed) = trim_raw_log(&mut log, total_bytes, 1000, 10);
         assert_eq!(trimmed, 0);
@@ -297,7 +299,7 @@ mod tests {
     #[test]
     fn test_trim_raw_log_exact_event_boundary() {
         // Exactly at the event limit - should not trim
-        let mut log: Vec<RawEvent> = (0..5).map(|_| make_event(10)).collect();
+        let mut log: VecDeque<RawEvent> = (0..5).map(|_| make_event(10)).collect();
         let total_bytes = 50;
         let (trimmed, bytes_removed) = trim_raw_log(&mut log, total_bytes, 10000, 5);
         assert_eq!(trimmed, 0);
@@ -308,7 +310,7 @@ mod tests {
     #[test]
     fn test_trim_raw_log_one_over_byte_limit() {
         // 1 byte over the byte limit
-        let mut log = vec![make_event(501), make_event(500)];
+        let mut log = VecDeque::from(vec![make_event(501), make_event(500)]);
         let total_bytes = 1001;
         let (trimmed, bytes_removed) = trim_raw_log(&mut log, total_bytes, 1000, 10000);
         // Remove first event (501 bytes), remaining = 500 <= 1000
@@ -320,7 +322,7 @@ mod tests {
     #[test]
     fn test_trim_raw_log_single_huge_event() {
         // One event larger than the entire max_bytes budget
-        let mut log = vec![make_event(5000)];
+        let mut log = VecDeque::from(vec![make_event(5000)]);
         let total_bytes = 5000;
         // After trimming the one event, log is empty, 0 bytes remain which is <= 1000
         let (trimmed, bytes_removed) = trim_raw_log(&mut log, total_bytes, 1000, 10000);
@@ -331,7 +333,7 @@ mod tests {
 
     #[test]
     fn test_trim_raw_log_empty() {
-        let mut log: Vec<RawEvent> = vec![];
+        let mut log: VecDeque<RawEvent> = VecDeque::new();
         let (trimmed, bytes_removed) = trim_raw_log(&mut log, 0, 1000, 10);
         assert_eq!(trimmed, 0);
         assert_eq!(bytes_removed, 0);
@@ -341,13 +343,13 @@ mod tests {
     #[test]
     fn test_trim_raw_log_preserves_newest() {
         // Events with ascending timestamps; oldest should be removed first
-        let mut log = vec![
+        let mut log = VecDeque::from(vec![
             make_event_with_ts(100, 1000),
             make_event_with_ts(100, 2000),
             make_event_with_ts(100, 3000),
             make_event_with_ts(100, 4000),
             make_event_with_ts(100, 5000),
-        ];
+        ]);
         let total_bytes = 500;
         // max_events = 3 means we need to remove 2 oldest
         let (trimmed, bytes_removed) = trim_raw_log(&mut log, total_bytes, 10000, 3);
@@ -364,13 +366,13 @@ mod tests {
     fn test_trim_raw_log_variable_event_sizes() {
         // Events with different sizes: [100, 200, 50, 300, 150] = 800 total
         // max_bytes = 500 => need to remove 300+ bytes from front
-        let mut log = vec![
+        let mut log = VecDeque::from(vec![
             make_event(100),
             make_event(200),
             make_event(50),
             make_event(300),
             make_event(150),
-        ];
+        ]);
         let total_bytes = 800;
         let (trimmed, bytes_removed) = trim_raw_log(&mut log, total_bytes, 500, 10000);
         // Remove event 0 (100): remaining 700 > 500
@@ -386,7 +388,7 @@ mod tests {
 
     #[test]
     fn test_trim_raw_log_returns_correct_counts() {
-        let mut log: Vec<RawEvent> = (0..100).map(|_| make_event(50)).collect();
+        let mut log: VecDeque<RawEvent> = (0..100).map(|_| make_event(50)).collect();
         let total_bytes = 5000;
         let (trimmed, bytes_removed) = trim_raw_log(&mut log, total_bytes, 1000, 10000);
         // Need to go from 5000 to <= 1000, removing 50 bytes per event
@@ -400,15 +402,15 @@ mod tests {
 
     #[test]
     fn test_trim_decoded_under_limit() {
-        let mut events = vec![1, 2, 3];
+        let mut events = VecDeque::from(vec![1, 2, 3]);
         trim_decoded_events(&mut events, 10);
         assert_eq!(events.len(), 3);
-        assert_eq!(events, vec![1, 2, 3]);
+        assert_eq!(events, VecDeque::from(vec![1, 2, 3]));
     }
 
     #[test]
     fn test_trim_decoded_over_limit() {
-        let mut events: Vec<i32> = (0..100).collect();
+        let mut events: VecDeque<i32> = (0..100).collect();
         trim_decoded_events(&mut events, 10);
         assert_eq!(events.len(), 10);
         // Should keep the last 10 (90..100)
@@ -418,42 +420,42 @@ mod tests {
 
     #[test]
     fn test_trim_decoded_exact_limit() {
-        let mut events: Vec<i32> = (0..5).collect();
+        let mut events: VecDeque<i32> = (0..5).collect();
         trim_decoded_events(&mut events, 5);
         assert_eq!(events.len(), 5);
-        assert_eq!(events, vec![0, 1, 2, 3, 4]);
+        assert_eq!(events, VecDeque::from(vec![0, 1, 2, 3, 4]));
     }
 
     #[test]
     fn test_trim_decoded_preserves_newest() {
         // 8 events, keep max 3 => remove first 5, keep last 3
-        let mut events = vec![10, 20, 30, 40, 50, 60, 70, 80];
+        let mut events = VecDeque::from(vec![10, 20, 30, 40, 50, 60, 70, 80]);
         trim_decoded_events(&mut events, 3);
         assert_eq!(events.len(), 3);
-        assert_eq!(events, vec![60, 70, 80]);
+        assert_eq!(events, VecDeque::from(vec![60, 70, 80]));
     }
 
     #[test]
     fn test_trim_decoded_empty() {
-        let mut events: Vec<i32> = vec![];
+        let mut events: VecDeque<i32> = VecDeque::new();
         trim_decoded_events(&mut events, 10);
         assert_eq!(events.len(), 0);
     }
 
     #[test]
     fn test_trim_decoded_one_over() {
-        let mut events = vec![1, 2, 3, 4];
+        let mut events = VecDeque::from(vec![1, 2, 3, 4]);
         trim_decoded_events(&mut events, 3);
         assert_eq!(events.len(), 3);
-        assert_eq!(events, vec![2, 3, 4]);
+        assert_eq!(events, VecDeque::from(vec![2, 3, 4]));
     }
 
     #[test]
     fn test_trim_decoded_max_one() {
-        let mut events = vec![10, 20, 30];
+        let mut events = VecDeque::from(vec![10, 20, 30]);
         trim_decoded_events(&mut events, 1);
         assert_eq!(events.len(), 1);
-        assert_eq!(events, vec![30]);
+        assert_eq!(events, VecDeque::from(vec![30]));
     }
 
     // --- Integration-style tests using production constants ---
@@ -462,7 +464,7 @@ mod tests {
     fn test_trim_raw_log_with_production_constants() {
         // Simulate exceeding MAX_LOG_EVENTS with small events
         let count = MAX_LOG_EVENTS + 100;
-        let mut log: Vec<RawEvent> = (0..count)
+        let mut log: VecDeque<RawEvent> = (0..count)
             .map(|i| make_event_with_ts(10, i as u64))
             .collect();
         let total_bytes = count * 10;
@@ -478,7 +480,7 @@ mod tests {
     #[test]
     fn test_trim_decoded_with_production_constants() {
         let count = MAX_DECODED_EVENTS + 50;
-        let mut events: Vec<u32> = (0..count as u32).collect();
+        let mut events: VecDeque<u32> = (0..count as u32).collect();
         trim_decoded_events(&mut events, MAX_DECODED_EVENTS);
         assert_eq!(events.len(), MAX_DECODED_EVENTS);
         assert_eq!(events[0], 50);

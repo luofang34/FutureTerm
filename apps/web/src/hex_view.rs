@@ -1,5 +1,6 @@
 use core_types::{RawEvent, SelectionRange, SelectionSource};
 use leptos::*;
+use std::collections::VecDeque;
 use wasm_bindgen::closure::Closure;
 use wasm_bindgen::JsCast;
 
@@ -59,7 +60,7 @@ impl HexRow {
 
 #[component]
 pub fn HexView(
-    raw_log: ReadSignal<Vec<RawEvent>>,
+    raw_log: ReadSignal<VecDeque<RawEvent>>,
     cursor: ReadSignal<usize>,
     set_cursor: WriteSignal<usize>,
     #[prop(optional)] global_selection: Option<ReadSignal<Option<SelectionRange>>>,

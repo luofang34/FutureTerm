@@ -1,6 +1,6 @@
 use core_types::DecodedEvent;
 use leptos::*;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, VecDeque};
 
 // Note: MavlinkView currently uses events_list (worker-generated DecodedEvents)
 // rather than processing raw_log directly. This is acceptable because:
@@ -10,7 +10,7 @@ use std::collections::BTreeMap;
 // Future: Could migrate to raw_log + embedded decoder for full isolation
 #[component]
 pub fn MavlinkView(
-    events_list: ReadSignal<Vec<DecodedEvent>>,
+    events_list: ReadSignal<VecDeque<DecodedEvent>>,
     connected: Signal<bool>,
 ) -> impl IntoView {
     // Data structures for the view
@@ -86,7 +86,7 @@ pub fn MavlinkView(
             // CRITICAL FIX: Detect timestamp rollover (device reboot/reconnect)
             // If latest event timestamp is significantly less than cursor, device rebooted
             // Example: cursor=138648500, new event=5000 -> rollover detected
-            let latest_event_ts = events.last().map(|e| e.timestamp_us).unwrap_or(0);
+            let latest_event_ts = events.back().map(|e| e.timestamp_us).unwrap_or(0);
             let timestamp_rollover = last_ts > 0 && latest_event_ts < last_ts / 2;
 
             if timestamp_rollover {
