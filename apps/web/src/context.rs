@@ -1,6 +1,6 @@
 use crate::actor_bridge::ActorBridge;
 use crate::terminal_metadata::TerminalMetadata;
-use crate::ui::ViewMode;
+use crate::views::ViewId;
 use crate::xterm::TerminalHandle;
 use actor_protocol::ConnectionState;
 use core_types::{DecodedEvent, RawEvent, SelectionRange};
@@ -56,8 +56,8 @@ pub struct AppContext {
     pub connected: Signal<bool>,
 
     // ── View mode ──
-    pub view_mode: ReadSignal<ViewMode>,
-    pub set_view_mode: WriteSignal<ViewMode>,
+    pub view_mode: ReadSignal<ViewId>,
+    pub set_view_mode: WriteSignal<ViewId>,
 
     // ── Bridge mode shared state (Safari/Firefox WebSocket bridge) ──
     pub bridge_active: Rc<Cell<bool>>,
@@ -104,7 +104,7 @@ pub fn create_app_context(
 ) -> AppContext {
     let (_terminal_ready, set_terminal_ready) = create_signal(false);
     let (show_bridge_install, set_show_bridge_install) = create_signal(false);
-    let (view_mode, set_view_mode) = create_signal(ViewMode::Terminal);
+    let (view_mode, set_view_mode) = create_signal(ViewId::Terminal);
 
     // Derive connected signal from state machine
     let state_signal = manager.state;

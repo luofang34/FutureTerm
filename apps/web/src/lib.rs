@@ -1,6 +1,5 @@
 use core_types::Transport;
 use leptos::*;
-use wasm_bindgen::prelude::*;
 use wasm_bindgen::JsCast;
 use wasm_bindgen_futures::spawn_local;
 use web_sys::Worker;
@@ -26,7 +25,9 @@ mod xterm;
 
 pub mod mavlink_view;
 mod ui;
-use ui::{Sidebar, ViewMode};
+use ui::Sidebar;
+mod views;
+use views::ViewId;
 
 #[component]
 pub fn App() -> impl IntoView {
@@ -43,7 +44,7 @@ pub fn App() -> impl IntoView {
     // Local aliases for closures that capture individual Copy/Clone fields.
     // Header and dialog signals are now accessed via use_context in their
     // respective component modules (header.rs, dialogs.rs).
-    let set_terminal_ready = ctx.set_terminal_ready;
+    // View-specific signals are accessed via AppContext in view plugins.
     let show_bridge_install = ctx.show_bridge_install;
     let set_show_bridge_install = ctx.set_show_bridge_install;
     let view_mode = ctx.view_mode;
@@ -52,17 +53,8 @@ pub fn App() -> impl IntoView {
     let baud_rate = ctx.baud_rate;
     let framing = ctx.framing;
     let active_framing = ctx.active_framing;
-    let set_term_handle = ctx.set_term_handle;
-    let raw_log = ctx.raw_log;
-    let hex_cursor = ctx.hex_cursor;
-    let set_hex_cursor = ctx.set_hex_cursor;
-    let global_selection = ctx.global_selection;
-    let set_global_selection = ctx.set_global_selection;
-    let terminal_metadata = ctx.terminal_metadata;
-    let events_list = ctx.events_list;
-    let bridge_active = ctx.bridge_active.clone();
-    let bridge_pending_baud = ctx.bridge_pending_baud.clone();
-    let bridge_tx_queue = ctx.bridge_tx_queue.clone();
+    let bridge_active_reconf = ctx.bridge_active.clone();
+    let bridge_pending_baud_reconf = ctx.bridge_pending_baud.clone();
 
     // ── Startup pre-checks ──
     // Detect transport availability at page load so the Connect button can
@@ -147,12 +139,6 @@ pub fn App() -> impl IntoView {
     // Worker Logic (extracted to data_dispatch module)
     data_dispatch::setup_worker_dispatch(&ctx);
 
-    // Bridge mode clones for closures that still live in lib.rs
-    let bridge_active_reconf = bridge_active.clone();
-    let bridge_pending_baud_reconf = bridge_pending_baud.clone();
-    let bridge_active_term = bridge_active.clone();
-    let bridge_tx_queue_term = bridge_tx_queue.clone();
-
     // Connect logic (extracted to connect module)
     let on_connect = {
         let ctx = ctx.clone();
@@ -189,49 +175,10 @@ pub fn App() -> impl IntoView {
     // Auto-Switch View to MAVLink Dashboard
     create_effect(move |_| {
         let dec = manager.decoder_id.get();
-        if dec == "mavlink" && view_mode.get_untracked() != ViewMode::Mavlink {
-            set_view_mode.set(ViewMode::Mavlink);
+        if dec == "mavlink" && view_mode.get_untracked() != ViewId::Mavlink {
+            set_view_mode.set(ViewId::Mavlink);
             // History now persists across decoder switches
         }
-    });
-
-    let manager_tx_cb = manager.clone();
-
-    // -- Extract Callbacks for TerminalView --
-    let on_terminal_mount = Callback::new(move |_| set_terminal_ready.set(true));
-
-    let on_term_ready = Callback::from(move |t: xterm::TerminalHandle| {
-        set_term_handle.set(Some(t.clone()));
-
-        // Bind TX
-        let manager_tx = manager_tx_cb.clone();
-        let bridge_active_tx = bridge_active_term.clone();
-        let bridge_tx_queue_tx = bridge_tx_queue_term.clone();
-        let on_data_cb = Closure::wrap(Box::new(move |data: JsValue| {
-            if let Some(text) = data.as_string() {
-                let bytes = text.into_bytes();
-
-                if bridge_active_tx.get() {
-                    // Bridge mode - queue for WS send
-                    #[cfg(debug_assertions)]
-                    web_sys::console::log_1(
-                        &format!("Bridge TX: queuing {} bytes", bytes.len()).into(),
-                    );
-                    bridge_tx_queue_tx.borrow_mut().push(bytes);
-                } else {
-                    // WebSerial mode
-                    let active_manager = manager_tx.clone();
-                    spawn_local(async move {
-                        if let Err(e) = active_manager.write(&bytes).await {
-                            #[cfg(debug_assertions)]
-                            web_sys::console::log_1(&format!("TX Error: {:?}", e).into());
-                        }
-                    });
-                }
-            }
-        }) as Box<dyn FnMut(JsValue)>);
-
-        t.on_data(on_data_cb.into_js_value().unchecked_into());
     });
 
     view! {
@@ -243,38 +190,12 @@ pub fn App() -> impl IntoView {
 
             <header::Header on_connect=on_connect.clone() />
             <div style="flex: 1; display: flex; overflow: hidden; height: 100%; flex-direction: row;">
-                 // Sidebar
                 <div style="flex: 1; position: relative; overflow: hidden; display: flex;">
-                    // Terminal Container
-                    <div style=move || format!("flex: 1; height: 100%; display: {};", if view_mode.get() == ViewMode::Terminal { "block" } else { "none" })>
-                         <xterm::TerminalView
-                             on_mount=on_terminal_mount
-                             on_terminal_ready=on_term_ready
-                             terminal_metadata=terminal_metadata
-                             global_selection=global_selection
-                             set_global_selection=set_global_selection
-                         />
-                    </div>
-
-                    // Hex View Container
-                    <Show when=move || view_mode.get() == ViewMode::Hex fallback=|| ()>
-                        <hex_view::HexView
-                            raw_log=raw_log
-                            cursor=hex_cursor
-                            set_cursor=set_hex_cursor
-                            global_selection=global_selection
-                            set_global_selection=set_global_selection
-                        />
-                    </Show>
-
-                    // MAVLink View Container
-                    <Show when=move || view_mode.get() == ViewMode::Mavlink fallback=|| ()>
-                        <mavlink_view::MavlinkView events_list=events_list connected=connected />
-                    </Show>
+                    <views::ViewRouter />
                 </div>
 
                  // Sidebar (Moved to Right)
-                 <Sidebar view_mode=view_mode.into() set_view_mode=set_view_mode manager=manager.clone() />
+                 <Sidebar />
             </div>
         </div>
     }
