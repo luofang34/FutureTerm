@@ -959,6 +959,44 @@ mod tests {
     }
 
     #[test]
+    fn test_build_char_map_utf8_3byte() {
+        // CJK character '中' (U+4E2D) is 3 bytes in UTF-8: 0xE4 0xB8 0xAD
+        let raw = "A中B".as_bytes();
+        let map = TerminalMetadata::build_char_map(raw, "A中B", 0);
+        assert_eq!(map.len(), 3);
+        // A: 1 byte ASCII
+        assert_eq!(map[0].terminal_column, 0);
+        assert_eq!(map[0].byte_offset_in_span, 0);
+        assert_eq!(map[0].byte_length, 1);
+        // 中: 3 bytes
+        assert_eq!(map[1].terminal_column, 1);
+        assert_eq!(map[1].byte_offset_in_span, 1);
+        assert_eq!(map[1].byte_length, 3);
+        // B: 1 byte ASCII (at byte offset 4)
+        assert_eq!(map[2].terminal_column, 2);
+        assert_eq!(map[2].byte_offset_in_span, 4);
+        assert_eq!(map[2].byte_length, 1);
+    }
+
+    #[test]
+    fn test_build_char_map_utf8_4byte() {
+        // Emoji '😀' (U+1F600) is 4 bytes in UTF-8: 0xF0 0x9F 0x98 0x80
+        let raw = "A😀B".as_bytes();
+        let map = TerminalMetadata::build_char_map(raw, "A😀B", 0);
+        assert_eq!(map.len(), 3);
+        // A: 1 byte
+        assert_eq!(map[0].byte_length, 1);
+        // 😀: 4 bytes
+        assert_eq!(map[1].terminal_column, 1);
+        assert_eq!(map[1].byte_offset_in_span, 1);
+        assert_eq!(map[1].byte_length, 4);
+        // B: 1 byte (at byte offset 5)
+        assert_eq!(map[2].terminal_column, 2);
+        assert_eq!(map[2].byte_offset_in_span, 5);
+        assert_eq!(map[2].byte_length, 1);
+    }
+
+    #[test]
     fn test_build_char_map_empty() {
         // "" -> empty mapping
         let raw = b"";
@@ -1111,7 +1149,6 @@ mod tests {
         // First span: col_offset=0, text="Hello" (5 visible chars)
         // Second span: col_offset=5, text=" World" (6 visible chars)
         // Current column should be 11 after both writes
-        assert!(!meta.has_content() || meta.has_content()); // trivially true, real check:
 
         // Select " World" portion (cols 5-11, end exclusive)
         let result = meta.terminal_position_to_bytes(0, 5, 0, 11);
@@ -1120,6 +1157,47 @@ mod tests {
         // " World" starts at global byte 5, ends at 11
         assert_eq!(start, 5);
         assert_eq!(end, 11);
+    }
+
+    #[test]
+    fn test_char_map_valid_after_partial_trim() {
+        let mut meta = TerminalMetadata::new();
+        meta.record_write(b"AAAA", "AAAA", 1000); // bytes 0-4
+        meta.record_write(b"BBBB", "BBBB", 2000); // bytes 4-8
+
+        // Trim 2 bytes — first span shrinks from (0,4) to (0,2) but survives
+        meta.adjust_for_log_trim(2);
+
+        // The second span should still produce valid position mappings
+        // Span 2 was at (4,8), now at (2,6)
+        // Selecting "BBBB" should work via position mapping
+        let result = meta.terminal_position_to_bytes(0, 4, 0, 8);
+        assert!(result.is_some());
+        let (start, end) = result.unwrap();
+        // Second span's raw_log_byte_start shifted from 4 to 2
+        assert_eq!(start, 2);
+        assert_eq!(end, 6);
+    }
+
+    #[test]
+    fn test_position_mapping_after_trim() {
+        let mut meta = TerminalMetadata::new();
+        // Write "Hello\nWorld" (11 bytes)
+        meta.record_write(b"Hello\nWorld", "Hello\nWorld", 1000);
+        // Write "Test" (4 bytes, continues on line 1 at col 5)
+        meta.record_write(b"Test", "Test", 2000);
+
+        // Before trim: span1 bytes 0-11, span2 bytes 11-15
+        // Trim 5 bytes
+        meta.adjust_for_log_trim(5);
+        // After trim: span1 bytes 0-6, span2 bytes 6-10
+
+        // Verify we can still map positions in the second span
+        let result = meta.terminal_position_to_bytes(1, 5, 1, 9);
+        assert!(result.is_some());
+        let (start, end) = result.unwrap();
+        assert_eq!(start, 6); // span2 shifted from 11 to 6
+        assert_eq!(end, 10); // span2 shifted from 15 to 10
     }
 
     #[test]
