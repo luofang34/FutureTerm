@@ -12,6 +12,11 @@ use wasm_bindgen_futures::spawn_local;
 /// Expected daemon version must match the daemon built with this release.
 const EXPECTED_DAEMON_VERSION: &str = "0.3.2";
 
+/// Maximum number of chunks allowed in the bridge TX queue.
+/// Prevents unbounded growth if the WebSocket stalls or the daemon is slow.
+/// 1024 chunks × ~6 bytes each ≈ 6 KB — well within reason.
+const MAX_TX_QUEUE: usize = 1024;
+
 /// Run startup pre-checks for bridge transport availability.
 ///
 /// Detects whether the browser has WebSerial support.  If NOT (Safari/Firefox),
@@ -118,6 +123,10 @@ pub async fn connect(
     set_bridge_port_pick: WriteSignal<Option<String>>,
     bridge_port_pick: ReadSignal<Option<String>>,
 ) {
+    // Clear stale TX data from any previous session.
+    // Without this, leftover queue items would be sent to the new connection.
+    bridge_tx_queue.borrow_mut().clear();
+
     // Wait for any in-progress bridge cleanup to finish.
     // This prevents the race where Disconnect->Connect fires
     // before the old session's close_port() completes on the daemon,
@@ -396,9 +405,26 @@ async fn read_loop(
                 }
             }
 
-            // Drain TX queue and send to daemon
+            // Drain TX queue and send to daemon.
+            // Cap enforcement: if the queue grew beyond MAX_TX_QUEUE (e.g.
+            // during auto-reconnect when the drain loop was paused), drop
+            // the oldest entries to bound memory usage.
             {
-                let tx_data: Vec<Vec<u8>> = bridge_tx_queue.borrow_mut().drain(..).collect();
+                let tx_data: Vec<Vec<u8>> = {
+                    let mut queue = bridge_tx_queue.borrow_mut();
+                    let overflow = queue.len().saturating_sub(MAX_TX_QUEUE);
+                    if overflow > 0 {
+                        queue.drain(..overflow);
+                        web_sys::console::warn_1(
+                            &format!(
+                                "Bridge TX: queue overflow, dropped {} oldest chunks",
+                                overflow
+                            )
+                            .into(),
+                        );
+                    }
+                    queue.drain(..).collect()
+                }; // borrow_mut dropped here, before any await
                 if !tx_data.is_empty() {
                     #[cfg(debug_assertions)]
                     web_sys::console::log_1(
@@ -407,8 +433,7 @@ async fn read_loop(
                     let mut sent_any = false;
                     for data in tx_data {
                         if ws_transport.write(&data).await.is_err() {
-                            #[cfg(debug_assertions)]
-                            web_sys::console::error_1(&"Bridge TX: write to daemon failed".into());
+                            web_sys::console::error_1(&"Bridge TX: write failed".into());
                             break;
                         }
                         sent_any = true;
