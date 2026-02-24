@@ -299,8 +299,10 @@ impl TerminalMetadata {
         let newline_count = text.matches('\n').count();
         let has_trailing_text = !text.ends_with('\n');
 
-        // Build character-to-byte mapping for column-level precision
-        // Pass the current column offset so this span knows where it starts on the line
+        // Build character-to-byte mapping eagerly (not lazily).
+        // Leptos signal.get_untracked() returns a CLONE — lazy Option<Vec> maps
+        // would always be None on the clone, rebuilt every query, then discarded.
+        // Eager building here means the built Vec survives cloning.
         let char_map = Self::build_char_map(raw_bytes, text, self.current_terminal_column);
 
         let span = TerminalSpan {

@@ -6,6 +6,7 @@ use actor_protocol::ConnectionState;
 use core_types::{DecodedEvent, RawEvent, SelectionRange};
 use leptos::*;
 use std::cell::{Cell, RefCell};
+use std::collections::VecDeque;
 use std::rc::Rc;
 use web_sys::Worker;
 
@@ -21,12 +22,12 @@ pub struct AppContext {
     pub manager: ActorBridge,
 
     // ── Decoded events (MAVLink view) ──
-    pub events_list: ReadSignal<Vec<DecodedEvent>>,
-    pub set_events_list: WriteSignal<Vec<DecodedEvent>>,
+    pub events_list: ReadSignal<VecDeque<DecodedEvent>>,
+    pub set_events_list: WriteSignal<VecDeque<DecodedEvent>>,
 
     // ── Unified raw log (Hex view, Terminal metadata) ──
-    pub raw_log: ReadSignal<Vec<RawEvent>>,
-    pub set_raw_log: WriteSignal<Vec<RawEvent>>,
+    pub raw_log: ReadSignal<VecDeque<RawEvent>>,
+    pub set_raw_log: WriteSignal<VecDeque<RawEvent>>,
     pub raw_log_bytes: ReadSignal<usize>,
     pub set_raw_log_bytes: WriteSignal<usize>,
     pub hex_cursor: ReadSignal<usize>,
@@ -126,8 +127,8 @@ pub fn create_app_context(
     let (term_handle, set_term_handle) = create_signal::<Option<TerminalHandle>>(None);
 
     // Data architecture signals
-    let (events_list, set_events_list) = create_signal::<Vec<DecodedEvent>>(Vec::new());
-    let (raw_log, set_raw_log) = create_signal::<Vec<RawEvent>>(Vec::new());
+    let (events_list, set_events_list) = create_signal::<VecDeque<DecodedEvent>>(VecDeque::new());
+    let (raw_log, set_raw_log) = create_signal::<VecDeque<RawEvent>>(VecDeque::new());
     let (raw_log_bytes, set_raw_log_bytes) = create_signal(0usize);
     let (hex_cursor, set_hex_cursor) = create_signal(0usize);
     let (global_selection, set_global_selection) = create_signal::<Option<SelectionRange>>(None);
