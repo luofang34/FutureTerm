@@ -100,17 +100,7 @@ pub fn on_connect(ctx: &AppContext, bctx: &BridgeContext, force_picker: bool) {
 
     let manager = manager.clone();
 
-    // Bridge mode clones for the async block
-    let bridge_active_connect = bctx.active.clone();
-    let bridge_closing_connect = bctx.closing.clone();
-    let bridge_tx_queue_connect = bctx.tx_queue.clone();
-    let bridge_pending_baud_connect = bctx.pending_baud.clone();
-    let bridge_ready = bctx.ready;
-    let set_bridge_ready = bctx.set_ready;
-    let set_show_bridge_install = bctx.set_show_install;
-    let set_bridge_ports = bctx.set_ports;
-    let set_bridge_port_pick = bctx.set_port_pick;
-    let bridge_port_pick = bctx.port_pick;
+    let bctx = bctx.clone();
     let framing = ctx.framing;
 
     spawn_local(async move {
@@ -125,23 +115,7 @@ pub fn on_connect(ctx: &AppContext, bctx: &BridgeContext, force_picker: bool) {
 
         // Phase 3: WebSocket fallback for Safari/Firefox
         if serial.is_undefined() {
-            bridge::connect(
-                &manager,
-                &window,
-                shift_held,
-                current_baud,
-                &bridge_active_connect,
-                &bridge_closing_connect,
-                &bridge_tx_queue_connect,
-                &bridge_pending_baud_connect,
-                bridge_ready,
-                set_bridge_ready,
-                set_show_bridge_install,
-                set_bridge_ports,
-                set_bridge_port_pick,
-                bridge_port_pick,
-            )
-            .await;
+            bridge::connect(&manager, &window, shift_held, current_baud, &bctx).await;
             return;
         }
 
