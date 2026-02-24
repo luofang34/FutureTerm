@@ -12,15 +12,29 @@ BLUE='\033[0;34m'
 CYAN='\033[0;36m'
 NC='\033[0m'
 
+# Project root (absolute) — anchors all paths regardless of cd
+PROJECT_ROOT="$(cd "$(dirname "$0")" && pwd)"
+
+# Path to debug bridge-daemon binary (built by `serve` command)
+BRIDGE_DEBUG_BIN="${PROJECT_ROOT}/target/debug/bridge-daemon"
+
+# Track whether serve mode built the debug bridge binary
+BUILT_BRIDGE_DEBUG=false
+
 # Cleanup function
 cleanup() {
     echo ""
     echo "Stopping background processes..."
     kill $(jobs -p) 2>/dev/null
+    # Remove debug bridge-daemon artifact only if we built it
+    if [ "${BUILT_BRIDGE_DEBUG}" = true ] && [ -f "${BRIDGE_DEBUG_BIN}" ]; then
+        echo "Cleaning debug bridge-daemon artifact..."
+        rm -f "${BRIDGE_DEBUG_BIN}"
+    fi
     exit 0
 }
 
-trap cleanup SIGINT
+trap cleanup SIGINT SIGTERM EXIT
 
 # ============================================================
 # QUALITY CHECKS (GATE)
@@ -343,16 +357,45 @@ run_dev_server() {
     echo -e "${BLUE}================================================${NC}"
     echo ""
 
-    # Kill any process occupying port 8080
-    echo -e "${YELLOW}Checking port 8080...${NC}"
+    # Kill any process occupying port 8080 or 9876
+    echo -e "${YELLOW}Checking ports 8080 and 9876...${NC}"
     if lsof -ti :8080 >/dev/null 2>&1; then
         echo -e "${YELLOW}Killing process on port 8080...${NC}"
         lsof -ti :8080 | xargs kill -9 2>/dev/null
         sleep 1
     fi
+    if lsof -ti :9876 >/dev/null 2>&1; then
+        echo -e "${YELLOW}Killing process on port 9876...${NC}"
+        lsof -ti :9876 | xargs kill -9 2>/dev/null
+        sleep 1
+    fi
+
+    # Build bridge daemon in debug mode (enables localhost Origin)
+    echo -e "${YELLOW}Building bridge-daemon (debug)...${NC}"
+    if cargo build -p bridge-daemon; then
+        BUILT_BRIDGE_DEBUG=true
+        echo -e "${GREEN}✓ Bridge daemon built${NC}"
+        echo ""
+
+        # Start bridge daemon in background
+        echo -e "${GREEN}Starting bridge daemon on port 9876...${NC}"
+        "${BRIDGE_DEBUG_BIN}" &
+        BRIDGE_PID=$!
+        sleep 1
+
+        if kill -0 "$BRIDGE_PID" 2>/dev/null; then
+            echo -e "${GREEN}✓ Bridge daemon running (PID ${BRIDGE_PID})${NC}"
+        else
+            echo -e "${YELLOW}⚠ Bridge daemon exited early — Safari/Firefox bridge unavailable${NC}"
+        fi
+    else
+        echo -e "${YELLOW}⚠ Bridge daemon build failed — Safari/Firefox bridge unavailable${NC}"
+    fi
+    echo ""
 
     echo -e "${GREEN}Starting Trunk dev server on port 8080...${NC}"
     echo -e "${CYAN}App will be available at http://127.0.0.1:8080${NC}"
+    echo -e "${CYAN}Bridge daemon (debug) at wss://local.futureterm.app:9876${NC}"
     echo ""
     echo -e "${YELLOW}Connect to a real serial device through the browser.${NC}"
     echo -e "${YELLOW}Or use socat to create virtual ports for testing.${NC}"
@@ -372,7 +415,7 @@ show_usage() {
     echo ""
     echo "Commands:"
     echo "  test       Full test suite (check + unit tests + WASM tests) - RECOMMENDED"
-    echo "  serve      Run checks + start dev server (default)"
+    echo "  serve      Run checks + build/start bridge daemon (debug) + start dev server (default)"
     echo "  build      Full test suite + release build"
     echo "  bridge     Build macOS bridge daemon + app bundle + DMG (macOS only)"
     echo ""
