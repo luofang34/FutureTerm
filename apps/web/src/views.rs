@@ -125,8 +125,7 @@ mod tests {
 /// Other views mount/unmount on demand via `<Show>`.
 #[component]
 pub fn ViewRouter() -> impl IntoView {
-    #[allow(clippy::expect_used)]
-    let ctx = use_context::<AppContext>().expect("AppContext");
+    let ctx = expect_context::<AppContext>();
     let view_mode = ctx.view_mode;
 
     view! {

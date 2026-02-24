@@ -7,8 +7,7 @@ use leptos::*;
 /// Pulls all required signals from `AppContext` instead of receiving props.
 #[component]
 pub fn MavlinkPlugin() -> impl IntoView {
-    #[allow(clippy::expect_used)]
-    let ctx = use_context::<AppContext>().expect("AppContext");
+    let ctx = expect_context::<AppContext>();
 
     view! {
         <mavlink_view::MavlinkView events_list=ctx.events_list connected=ctx.connected />

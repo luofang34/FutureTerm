@@ -63,6 +63,10 @@ pub struct ActorBridge {
     // Store last connected port for reconfigure
     #[cfg(target_arch = "wasm32")]
     last_port: std::rc::Rc<std::cell::RefCell<Option<web_sys::SerialPort>>>,
+
+    // TX routing: bridge vs WebSerial (set after construction via set_bridge_tx)
+    bridge_active: std::rc::Rc<std::cell::Cell<bool>>,
+    bridge_tx_queue: std::rc::Rc<std::cell::RefCell<Vec<Vec<u8>>>>,
 }
 
 /// Helper function to send messages to worker with error handling
@@ -188,6 +192,8 @@ impl ActorBridge {
             worker_signal,
             #[cfg(target_arch = "wasm32")]
             last_port: std::rc::Rc::new(std::cell::RefCell::new(None)),
+            bridge_active: std::rc::Rc::new(std::cell::Cell::new(false)),
+            bridge_tx_queue: std::rc::Rc::new(std::cell::RefCell::new(Vec::new())),
         }
     }
 
@@ -473,6 +479,40 @@ impl ActorBridge {
     }
 
     // === Bridge Mode Helpers ===
+
+    /// Inject bridge TX routing state.
+    ///
+    /// Called once during app init, after the bridge Rc's are created in
+    /// `create_app_context`.  This gives `send_tx()` access to the same
+    /// `bridge_active` / `bridge_tx_queue` that the bridge read loop uses.
+    pub fn set_bridge_tx(
+        &mut self,
+        active: std::rc::Rc<std::cell::Cell<bool>>,
+        queue: std::rc::Rc<std::cell::RefCell<Vec<Vec<u8>>>>,
+    ) {
+        self.bridge_active = active;
+        self.bridge_tx_queue = queue;
+    }
+
+    /// Unified TX: routes data through the appropriate transport.
+    ///
+    /// Bridge mode (Safari/Firefox): synchronous push into bridge_tx_queue,
+    /// drained every ~5ms by the read loop in connect/bridge.rs.
+    ///
+    /// WebSerial mode (Chrome): async actor command via spawn_local
+    /// (fire-and-forget from the caller's perspective).
+    ///
+    /// This is the ONLY TX entry point views should use.
+    pub fn send_tx(&self, data: Vec<u8>) {
+        if self.bridge_active.get() {
+            self.bridge_tx_queue.borrow_mut().push(data);
+        } else {
+            let mgr = self.clone();
+            spawn_local(async move {
+                let _ = mgr.write(&data).await;
+            });
+        }
+    }
 
     /// Set connection state directly (for bridge mode which bypasses actor system)
     pub fn set_connection_state(&self, state: ConnectionState) {

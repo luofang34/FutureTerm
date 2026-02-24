@@ -1,19 +1,17 @@
-use crate::context::AppContext;
+use crate::bridge_context::BridgeContext;
 use leptos::*;
 
 /// Modal dialog prompting the user to install the FutureTerm bridge helper
 /// app for Safari/Firefox (browsers without WebSerial support).
 #[component]
 pub fn BridgeInstallDialog() -> impl IntoView {
-    // AppContext is always provided by App() before this component renders.
-    #[allow(clippy::expect_used)]
-    let ctx = use_context::<AppContext>().expect("AppContext must be provided");
+    let bctx = expect_context::<BridgeContext>();
 
-    let show_bridge_install = ctx.show_bridge_install;
-    let set_show_bridge_install = ctx.set_show_bridge_install;
+    let show_install = bctx.show_install;
+    let set_show_install = bctx.set_show_install;
 
     view! {
-        <Show when=move || show_bridge_install.get() fallback=|| ()>
+        <Show when=move || show_install.get() fallback=|| ()>
             <div style="position: fixed; top: 0; left: 0; width: 100vw; height: 100vh; background: rgba(0,0,0,0.7); z-index: 10000; display: flex; align-items: center; justify-content: center;">
                 <div style="background: #2a2a2a; border: 1px solid #555; border-radius: 8px; padding: 24px 32px; max-width: 480px; color: #eee; font-family: sans-serif;">
                     <h2 style="margin: 0 0 12px; font-size: 1.2rem; color: #ff9800;">"Serial Port Helper Required"</h2>
@@ -26,7 +24,7 @@ pub fn BridgeInstallDialog() -> impl IntoView {
                     <div style="display: flex; gap: 12px; justify-content: flex-end; align-items: center;">
                         <button
                             style="padding: 8px 16px; background: #444; color: #ccc; border: 1px solid #666; border-radius: 4px; cursor: pointer; font-size: 0.9rem; line-height: 1.4;"
-                            on:click=move |_| set_show_bridge_install.set(false)>
+                            on:click=move |_| set_show_install.set(false)>
                             "Cancel"
                         </button>
                         <a
@@ -50,25 +48,23 @@ pub fn BridgePortPicker(on_connect: impl Fn(bool) + 'static + Clone) -> impl Int
     // use when the port-picker may trigger a connect after selection.
     let _ = &on_connect;
 
-    // AppContext is always provided by App() before this component renders.
-    #[allow(clippy::expect_used)]
-    let ctx = use_context::<AppContext>().expect("AppContext must be provided");
+    let bctx = expect_context::<BridgeContext>();
 
-    let bridge_ports = ctx.bridge_ports;
-    let set_bridge_port_pick = ctx.set_bridge_port_pick;
+    let ports = bctx.ports;
+    let set_port_pick = bctx.set_port_pick;
 
     view! {
-        <Show when=move || !bridge_ports.get().is_empty() fallback=|| ()>
+        <Show when=move || !ports.get().is_empty() fallback=|| ()>
             <div style="position: fixed; top: 0; left: 0; width: 100vw; height: 100vh; background: rgba(0,0,0,0.7); z-index: 10000; display: flex; align-items: center; justify-content: center;">
                 <div style="background: #2a2a2a; border: 1px solid #555; border-radius: 8px; padding: 24px 32px; max-width: 480px; min-width: 320px; color: #eee; font-family: sans-serif;">
                     <h2 style="margin: 0 0 16px; font-size: 1.2rem;">"Select Serial Port"</h2>
                     {move || {
-                        bridge_ports.get().into_iter().map(|(path, desc)| {
+                        ports.get().into_iter().map(|(path, desc)| {
                             let path_click = path.clone();
                             view! {
                                 <button
                                     style="display: block; width: 100%; padding: 10px 16px; margin: 4px 0; background: #333; color: #eee; border: 1px solid #555; border-radius: 4px; cursor: pointer; text-align: left; font-size: 0.9rem;"
-                                    on:click=move |_| set_bridge_port_pick.set(Some(path_click.clone()))>
+                                    on:click=move |_| set_port_pick.set(Some(path_click.clone()))>
                                     {desc}
                                 </button>
                             }
@@ -76,7 +72,7 @@ pub fn BridgePortPicker(on_connect: impl Fn(bool) + 'static + Clone) -> impl Int
                     }}
                     <button
                         style="display: block; width: 100%; padding: 8px 16px; margin-top: 12px; background: #444; color: #ccc; border: 1px solid #666; border-radius: 4px; cursor: pointer; font-size: 0.9rem;"
-                        on:click=move |_| set_bridge_port_pick.set(Some(String::new()))>
+                        on:click=move |_| set_port_pick.set(Some(String::new()))>
                         "Cancel"
                     </button>
                 </div>

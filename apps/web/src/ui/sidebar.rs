@@ -7,8 +7,7 @@ use leptos::*;
 /// Uses `AppContext` via Leptos context instead of receiving props.
 #[component]
 pub fn Sidebar() -> impl IntoView {
-    #[allow(clippy::expect_used)]
-    let ctx = use_context::<AppContext>().expect("AppContext");
+    let ctx = expect_context::<AppContext>();
     let view_mode = ctx.view_mode;
     let set_view_mode = ctx.set_view_mode;
     let manager = ctx.manager.clone();

@@ -1,3 +1,4 @@
+use crate::bridge_context::BridgeContext;
 use crate::context::AppContext;
 use crate::protocol::WorkerToUi;
 use core_types::RawEvent;
@@ -5,7 +6,7 @@ use leptos::*;
 use std::collections::VecDeque;
 use wasm_bindgen::prelude::*;
 use wasm_bindgen::JsCast;
-use wasm_bindgen_futures::spawn_local;
+
 use web_sys::{MessageEvent, Worker};
 
 // Data retention limits for the unified raw log
@@ -59,8 +60,8 @@ fn trim_decoded_events<T>(events: &mut VecDeque<T>, max_events: usize) {
 /// This creates the worker, wires up the message handler that routes
 /// `WorkerToUi` messages to the appropriate signals (raw log, terminal,
 /// decoded events, TX forwarding), and stores the worker in the context.
-pub fn setup_worker_dispatch(ctx: &AppContext) {
-    // Clone all fields we need from AppContext before moving into closures.
+pub fn setup_worker_dispatch(ctx: &AppContext, bctx: &BridgeContext) {
+    // Clone all fields we need from AppContext/BridgeContext before moving into closures.
     let manager = ctx.manager.clone();
     let set_worker = ctx.set_worker;
     let set_raw_log = ctx.set_raw_log;
@@ -69,14 +70,10 @@ pub fn setup_worker_dispatch(ctx: &AppContext) {
     let set_terminal_metadata = ctx.set_terminal_metadata;
     let term_handle = ctx.term_handle;
     let set_events_list = ctx.set_events_list;
-    let bridge_active = ctx.bridge_active.clone();
-    let bridge_tx_queue = ctx.bridge_tx_queue.clone();
-    let needs_session_newline = ctx.needs_session_newline.clone();
+    let needs_session_newline = bctx.needs_session_newline.clone();
 
     create_effect(move |_| {
         let manager = manager.clone();
-        let bridge_active_tx = bridge_active.clone();
-        let bridge_tx_queue_tx = bridge_tx_queue.clone();
         let needs_newline = needs_session_newline.clone();
         if let Ok(w) = Worker::new("worker_bootstrap.js") {
             let Ok(decoder) = web_sys::TextDecoder::new() else {
@@ -193,16 +190,7 @@ pub fn setup_worker_dispatch(ctx: &AppContext) {
                             );
                         }
                         WorkerToUi::TxData { data } => {
-                            if bridge_active_tx.get() {
-                                // Bridge mode - queue for WS send
-                                bridge_tx_queue_tx.borrow_mut().push(data);
-                            } else {
-                                // WebSerial mode
-                                let m = manager.clone();
-                                spawn_local(async move {
-                                    let _ = m.write(&data).await;
-                                });
-                            }
+                            manager.send_tx(data);
                         }
                     }
                 }

@@ -1,11 +1,9 @@
 use crate::actor_bridge::ActorBridge;
-use crate::context::AppContext;
+use crate::bridge_context::BridgeContext;
 use crate::protocol::UiToWorker;
 use actor_protocol::ConnectionState;
 use core_types::Transport;
 use leptos::*;
-use std::cell::Cell;
-use std::rc::Rc;
 use wasm_bindgen::JsCast;
 use wasm_bindgen_futures::spawn_local;
 
@@ -24,15 +22,15 @@ const MAX_TX_QUEUE: usize = 1024;
 /// if the daemon is not running, and retries with increasing delays.  If the
 /// daemon is found, sets `bridge_ready = Some(true)`.  If not found after
 /// retries, shows the bridge install dialog and starts 5-minute polling.
-pub fn run_startup_precheck(ctx: &AppContext) {
+pub fn run_startup_precheck(bctx: &BridgeContext) {
     let has_webserial = web_sys::window()
         .map(|w| !w.navigator().serial().is_undefined())
         .unwrap_or(false);
 
     if !has_webserial {
-        let set_install = ctx.set_show_bridge_install;
-        let set_bridge_ready = ctx.set_bridge_ready;
-        let show_bridge_install = ctx.show_bridge_install;
+        let set_install = bctx.set_show_install;
+        let set_bridge_ready = bctx.set_ready;
+        let show_bridge_install = bctx.show_install;
 
         spawn_local(async move {
             let ws_url = "wss://local.futureterm.app:9876";
@@ -106,47 +104,37 @@ pub fn run_startup_precheck(ctx: &AppContext) {
 /// Handles daemon version checking, port listing/selection, serial port
 /// opening, auto-baud probing, the main read/write loop, and device-lost
 /// auto-reconnect.
-#[allow(clippy::too_many_arguments)]
 pub async fn connect(
     manager: &ActorBridge,
     window: &web_sys::Window,
     shift_held: bool,
     current_baud: u32,
-    bridge_active: &Rc<Cell<bool>>,
-    bridge_closing: &Rc<Cell<bool>>,
-    bridge_tx_queue: &Rc<std::cell::RefCell<Vec<Vec<u8>>>>,
-    bridge_pending_baud: &Rc<Cell<u32>>,
-    bridge_ready: ReadSignal<Option<bool>>,
-    set_bridge_ready: WriteSignal<Option<bool>>,
-    set_show_bridge_install: WriteSignal<bool>,
-    set_bridge_ports: WriteSignal<Vec<(String, String)>>,
-    set_bridge_port_pick: WriteSignal<Option<String>>,
-    bridge_port_pick: ReadSignal<Option<String>>,
+    bctx: &BridgeContext,
 ) {
     // Clear stale TX data from any previous session.
     // Without this, leftover queue items would be sent to the new connection.
-    bridge_tx_queue.borrow_mut().clear();
+    bctx.tx_queue.borrow_mut().clear();
 
     // Wait for any in-progress bridge cleanup to finish.
     // This prevents the race where Disconnect->Connect fires
     // before the old session's close_port() completes on the daemon,
     // causing "Device or resource busy" errors.
-    if bridge_closing.get() {
+    if bctx.closing.get() {
         manager.set_status.set("Waiting for disconnect...".into());
         let mut waited = 0u32;
-        while bridge_closing.get() && waited < 3000 {
+        while bctx.closing.get() && waited < 3000 {
             gloo_timers::future::TimeoutFuture::new(10).await;
             waited += 10;
         }
     }
 
     // If already in bridge mode, disconnect first (hot-swap / manual select)
-    if bridge_active.get() {
-        bridge_closing.set(true);
-        bridge_active.set(false);
+    if bctx.active.get() {
+        bctx.closing.set(true);
+        bctx.active.set(false);
         // Wait for old read loop to exit and cleanup
         let mut waited = 0u32;
-        while bridge_closing.get() && waited < 3000 {
+        while bctx.closing.get() && waited < 3000 {
             gloo_timers::future::TimeoutFuture::new(10).await;
             waited += 10;
         }
@@ -165,13 +153,13 @@ pub async fn connect(
     // Wait until the startup pre-check resolves (usually
     // instant -- it runs at page load and finishes in <4 s).
     loop {
-        match bridge_ready.get() {
+        match bctx.ready.get() {
             Some(_) => break,
             None => gloo_timers::future::TimeoutFuture::new(100).await,
         }
     }
 
-    if bridge_ready.get() != Some(true) {
+    if bctx.ready.get() != Some(true) {
         // Pre-check polling is already showing the install
         // dialog and retrying.  Nothing more to do here.
         return;
@@ -200,21 +188,13 @@ pub async fn connect(
             manager
                 .set_status
                 .set("Helper not available. Try again.".into());
-            set_bridge_ready.set(Some(false));
+            bctx.set_ready.set(Some(false));
             return;
         }
     }
 
     // Check daemon version -- restart if outdated.
-    if !check_daemon_version(
-        manager,
-        window,
-        &mut ws_transport,
-        ws_url,
-        set_show_bridge_install,
-    )
-    .await
-    {
+    if !check_daemon_version(manager, window, &mut ws_transport, ws_url, bctx).await {
         return;
     }
 
@@ -248,28 +228,12 @@ pub async fn connect(
 
     // -- Port Selection --
     let port_path = if shift_held {
-        match select_port_manual(
-            manager,
-            &deduped_ports,
-            set_bridge_ports,
-            set_bridge_port_pick,
-            bridge_port_pick,
-        )
-        .await
-        {
+        match select_port_manual(manager, &deduped_ports, bctx).await {
             Some(path) => path,
             None => return,
         }
     } else {
-        match select_port_auto(
-            manager,
-            &deduped_ports,
-            set_bridge_ports,
-            set_bridge_port_pick,
-            bridge_port_pick,
-        )
-        .await
-        {
+        match select_port_auto(manager, &deduped_ports, bctx).await {
             Some(path) => path,
             None => return,
         }
@@ -296,19 +260,19 @@ pub async fn connect(
     // Set bridge_active + Probing state so the Disconnect button
     // works during probe (same UX as WebSerial probing).
     let mut final_baud = if current_baud == 0 {
-        bridge_active.set(true);
+        bctx.active.set(true);
         manager.set_connection_state(ConnectionState::Probing);
 
-        match auto_probe(&ws_transport, manager, bridge_closing).await {
+        match auto_probe(&ws_transport, manager, bctx).await {
             Ok(baud) => baud,
             Err(e) => {
                 // User cancelled or real failure
-                if bridge_closing.get() {
+                if bctx.closing.get() {
                     // Clean up: close port, reset state
                     let _ = ws_transport.close_port().await;
                     let _ = ws_transport.close().await;
-                    bridge_active.set(false);
-                    bridge_closing.set(false);
+                    bctx.active.set(false);
+                    bctx.closing.set(false);
                     manager.set_connection_state(ConnectionState::Disconnected);
                     manager.set_status.set("Disconnected".into());
                     return;
@@ -335,7 +299,7 @@ pub async fn connect(
         baud_rate: final_baud,
     });
     manager.set_detected_baud.set(final_baud);
-    bridge_active.set(true);
+    bctx.active.set(true);
 
     #[cfg(debug_assertions)]
     web_sys::console::log_1(
@@ -347,26 +311,17 @@ pub async fn connect(
     );
 
     // Bridge read/write loop with auto-reconnect
-    read_loop(
-        manager,
-        &ws_transport,
-        &port_path,
-        &mut final_baud,
-        bridge_active,
-        bridge_tx_queue,
-        bridge_pending_baud,
-    )
-    .await;
+    read_loop(manager, &ws_transport, &port_path, &mut final_baud, bctx).await;
 
     // Cleanup - close_port on daemon first, then WebSocket connection
-    bridge_closing.set(true);
+    bctx.closing.set(true);
     let _ = ws_transport.close_port().await;
     let _ = ws_transport.close().await;
-    bridge_active.set(false);
+    bctx.active.set(false);
     manager.set_connection_state(ConnectionState::Disconnected);
     manager.set_status.set("Disconnected".into());
     // Signal that cleanup is complete - connect flow can proceed
-    bridge_closing.set(false);
+    bctx.closing.set(false);
 }
 
 /// Main read/write loop with device-lost auto-reconnect.
@@ -375,23 +330,21 @@ async fn read_loop(
     ws_transport: &transport_websocket::WebSocketTransport,
     port_path: &str,
     final_baud: &mut u32,
-    bridge_active: &Rc<Cell<bool>>,
-    bridge_tx_queue: &Rc<std::cell::RefCell<Vec<Vec<u8>>>>,
-    bridge_pending_baud: &Rc<Cell<u32>>,
+    bctx: &BridgeContext,
 ) {
     'bridge: loop {
         // Inner read/write loop
         loop {
             // Check if bridge was deactivated (user disconnect)
-            if !bridge_active.get() {
+            if !bctx.active.get() {
                 break 'bridge;
             }
 
             // Apply pending baud rate change (set by reconfigure effect)
             {
-                let pending = bridge_pending_baud.get();
+                let pending = bctx.pending_baud.get();
                 if pending > 0 {
-                    bridge_pending_baud.set(0);
+                    bctx.pending_baud.set(0);
                     if ws_transport.set_baud_rate(pending).await.is_ok() {
                         *final_baud = pending;
                         manager.set_detected_baud.set(*final_baud);
@@ -411,7 +364,7 @@ async fn read_loop(
             // the oldest entries to bound memory usage.
             {
                 let tx_data: Vec<Vec<u8>> = {
-                    let mut queue = bridge_tx_queue.borrow_mut();
+                    let mut queue = bctx.tx_queue.borrow_mut();
                     let overflow = queue.len().saturating_sub(MAX_TX_QUEUE);
                     if overflow > 0 {
                         queue.drain(..overflow);
@@ -466,7 +419,7 @@ async fn read_loop(
         }
 
         // Device lost - try to reconnect (same as WebSerial behavior)
-        if !bridge_active.get() {
+        if !bctx.active.get() {
             break 'bridge;
         }
 
@@ -482,7 +435,7 @@ async fn read_loop(
         let retry_delays_ms: &[u32] = &[500, 1000, 1500, 2000, 2000, 2000];
         let mut reconnected = false;
         for (i, &delay) in retry_delays_ms.iter().enumerate() {
-            if !bridge_active.get() {
+            if !bctx.active.get() {
                 break; // User clicked disconnect
             }
             gloo_timers::future::TimeoutFuture::new(delay).await;
@@ -522,7 +475,7 @@ async fn read_loop(
 async fn auto_probe(
     ws_transport: &transport_websocket::WebSocketTransport,
     manager: &ActorBridge,
-    cancel: &Rc<Cell<bool>>,
+    bctx: &BridgeContext,
 ) -> Result<u32, String> {
     // Same candidates as Chrome prober (connection-actors/src/constants.rs)
     const BAUD_CANDIDATES: &[u32] = &[
@@ -538,7 +491,7 @@ async fn auto_probe(
 
     for &baud in BAUD_CANDIDATES {
         // Check cancellation at the top of each iteration
-        if cancel.get() {
+        if bctx.closing.get() {
             return Err("Probe cancelled by user".into());
         }
         manager
@@ -731,7 +684,7 @@ async fn check_daemon_version(
     window: &web_sys::Window,
     ws_transport: &mut transport_websocket::WebSocketTransport,
     ws_url: &str,
-    set_show_bridge_install: WriteSignal<bool>,
+    bctx: &BridgeContext,
 ) -> bool {
     let daemon_ver = ws_transport.daemon_version();
     match daemon_ver.as_deref() {
@@ -740,7 +693,7 @@ async fn check_daemon_version(
             manager
                 .set_status
                 .set("Helper app outdated \u{2014} please download the latest version".into());
-            set_show_bridge_install.set(true);
+            bctx.set_show_install.set(true);
             false
         }
         Some(v) if v == EXPECTED_DAEMON_VERSION => {
@@ -784,7 +737,7 @@ async fn check_daemon_version(
                 manager
                     .set_status
                     .set("Helper app outdated \u{2014} please download the latest version".into());
-                set_show_bridge_install.set(true);
+                bctx.set_show_install.set(true);
                 return false;
             }
             true
@@ -798,9 +751,7 @@ async fn check_daemon_version(
 async fn select_port_manual(
     manager: &ActorBridge,
     deduped_ports: &[&transport_websocket::BridgePortInfo],
-    set_bridge_ports: WriteSignal<Vec<(String, String)>>,
-    set_bridge_port_pick: WriteSignal<Option<String>>,
-    bridge_port_pick: ReadSignal<Option<String>>,
+    bctx: &BridgeContext,
 ) -> Option<String> {
     let display: Vec<(String, String)> = deduped_ports
         .iter()
@@ -821,13 +772,13 @@ async fn select_port_manual(
         return None;
     }
 
-    set_bridge_ports.set(display);
-    set_bridge_port_pick.set(None);
+    bctx.set_ports.set(display);
+    bctx.set_port_pick.set(None);
     manager.set_status.set("Select a serial port...".into());
 
     loop {
-        if let Some(path) = bridge_port_pick.get_untracked() {
-            set_bridge_ports.set(Vec::new());
+        if let Some(path) = bctx.port_pick.get_untracked() {
+            bctx.set_ports.set(Vec::new());
             if path.is_empty() {
                 manager
                     .set_status
@@ -848,9 +799,7 @@ async fn select_port_manual(
 async fn select_port_auto(
     manager: &ActorBridge,
     deduped_ports: &[&transport_websocket::BridgePortInfo],
-    set_bridge_ports: WriteSignal<Vec<(String, String)>>,
-    set_bridge_port_pick: WriteSignal<Option<String>>,
-    bridge_port_pick: ReadSignal<Option<String>>,
+    bctx: &BridgeContext,
 ) -> Option<String> {
     let usb_ports: Vec<_> = deduped_ports
         .iter()
@@ -876,13 +825,13 @@ async fn select_port_auto(
             })
             .collect();
 
-        set_bridge_ports.set(display);
-        set_bridge_port_pick.set(None);
+        bctx.set_ports.set(display);
+        bctx.set_port_pick.set(None);
         manager.set_status.set("Select a serial port...".into());
 
         loop {
-            if let Some(path) = bridge_port_pick.get_untracked() {
-                set_bridge_ports.set(Vec::new());
+            if let Some(path) = bctx.port_pick.get_untracked() {
+                bctx.set_ports.set(Vec::new());
                 if path.is_empty() {
                     manager
                         .set_status

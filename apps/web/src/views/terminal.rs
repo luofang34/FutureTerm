@@ -3,7 +3,6 @@ use crate::xterm;
 use leptos::*;
 use wasm_bindgen::prelude::*;
 use wasm_bindgen::JsCast;
-use wasm_bindgen_futures::spawn_local;
 
 /// Thin view-plugin wrapper around `xterm::TerminalView`.
 ///
@@ -12,8 +11,7 @@ use wasm_bindgen_futures::spawn_local;
 /// inlined in `App()`.
 #[component]
 pub fn TerminalPlugin() -> impl IntoView {
-    #[allow(clippy::expect_used)]
-    let ctx = use_context::<AppContext>().expect("AppContext");
+    let ctx = expect_context::<AppContext>();
 
     let set_terminal_ready = ctx.set_terminal_ready;
     let set_term_handle = ctx.set_term_handle;
@@ -21,51 +19,17 @@ pub fn TerminalPlugin() -> impl IntoView {
     let global_selection = ctx.global_selection;
     let set_global_selection = ctx.set_global_selection;
 
-    let manager_tx_cb = ctx.manager.clone();
-    let bridge_active_term = ctx.bridge_active.clone();
-    let bridge_tx_queue_term = ctx.bridge_tx_queue.clone();
+    let manager_tx = ctx.manager.clone();
 
     let on_terminal_mount = Callback::new(move |_| set_terminal_ready.set(true));
 
     let on_term_ready = Callback::from(move |t: xterm::TerminalHandle| {
         set_term_handle.set(Some(t.clone()));
 
-        // Bind TX
-        let manager_tx = manager_tx_cb.clone();
-        let bridge_active_tx = bridge_active_term.clone();
-        let bridge_tx_queue_tx = bridge_tx_queue_term.clone();
-        // TX path: intentionally split into two branches.
-        //
-        // WebSerial (Chrome): async actor command → ChannelManager → port.write() Promise.
-        // The actor system owns the port and handles errors internally.
-        //
-        // Bridge (Safari/Firefox): sync push into bridge_tx_queue, drained every ~5ms
-        // by the read loop in connect/bridge.rs. The bridge bypasses the actor system
-        // entirely — it manages the WebSocket transport directly. Unifying these paths
-        // would require either routing bridge TX through the actor system (which doesn't
-        // know about bridge connections) or adding an async abstraction that papers over
-        // fundamentally different write semantics (Promise vs polled queue).
+        let mgr = manager_tx.clone();
         let on_data_cb = Closure::wrap(Box::new(move |data: JsValue| {
             if let Some(text) = data.as_string() {
-                let bytes = text.into_bytes();
-
-                if bridge_active_tx.get() {
-                    // Bridge mode - queue for WS send
-                    #[cfg(debug_assertions)]
-                    web_sys::console::log_1(
-                        &format!("Bridge TX: queuing {} bytes", bytes.len()).into(),
-                    );
-                    bridge_tx_queue_tx.borrow_mut().push(bytes);
-                } else {
-                    // WebSerial mode
-                    let active_manager = manager_tx.clone();
-                    spawn_local(async move {
-                        if let Err(e) = active_manager.write(&bytes).await {
-                            #[cfg(debug_assertions)]
-                            web_sys::console::log_1(&format!("TX Error: {:?}", e).into());
-                        }
-                    });
-                }
+                mgr.send_tx(text.into_bytes());
             }
         }) as Box<dyn FnMut(JsValue)>);
 
