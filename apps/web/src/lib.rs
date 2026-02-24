@@ -1,7 +1,7 @@
 use crate::protocol::{UiToWorker, WorkerToUi};
-use core_types::{DecodedEvent, RawEvent, SelectionRange, Transport};
+use core_types::{RawEvent, Transport};
 use leptos::*;
-use std::cell::{Cell, RefCell};
+use std::cell::Cell;
 use std::rc::Rc;
 use wasm_bindgen::prelude::*;
 use wasm_bindgen::JsCast;
@@ -13,6 +13,9 @@ mod actor_bridge;
 mod actor_system;
 use actor_bridge::ActorBridge;
 use actor_protocol::ConnectionState;
+
+mod context;
+use context::create_app_context;
 
 mod hex_view;
 // mod mavlink_view; // Removed duplicate
@@ -37,121 +40,58 @@ const MAX_DECODED_EVENTS: usize = 2500;
 
 #[component]
 pub fn App() -> impl IntoView {
-    let (_terminal_ready, set_terminal_ready) = create_signal(false);
-    let (show_bridge_install, set_show_bridge_install) = create_signal(false);
-
-    // Worker Signal (Used by ActorBridge)
-    let (worker, set_worker) = create_signal::<Option<Worker>>(None);
-    let (view_mode, set_view_mode) = create_signal(ViewMode::Terminal);
-
     // Actor System (replaces ConnectionManager)
     let manager_internal = actor_system::create_actor_system();
+    // Worker signal must be created before ActorBridge (which reads it)
+    let (worker, set_worker) = create_signal::<Option<Worker>>(None);
     let manager = ActorBridge::new(manager_internal, worker.into());
+
+    // Create centralised application context (all shared signals)
+    let ctx = create_app_context(manager.clone(), worker, set_worker);
+    provide_context(ctx.clone());
+
     let status = manager.get_status();
-
-    // Derive connected signal from state machine
-    let state_signal = manager.state;
-    let connected = Signal::derive(move || state_signal.get() == ConnectionState::Connected);
-
     let detected_baud = manager.detected_baud;
     let detected_framing = manager.detected_framing;
 
-    let (baud_rate, set_baud_rate) = create_signal(0);
-
-    // Framing Signal (String "8N1", "8E1", etc.)
-    let (framing, set_framing) = create_signal("Auto".to_string());
-
-    // Active framing (actually detected value when framing="Auto")
-    // Preserved across baud rate changes to maintain detected framing
-    let (active_framing, set_active_framing) = create_signal("8N1".to_string());
-
-    // Sync active_framing when detection completes
-    create_effect(move |_| {
-        let detected = detected_framing.get();
-        if !detected.is_empty() {
-            set_active_framing.set(detected);
-        }
-    });
-
-    // Direct Terminal Handle
-    let (term_handle, set_term_handle) = create_signal::<Option<xterm::TerminalHandle>>(None);
-
-    // ========== Data Architecture: Unified Raw Log + Per-Decoder Views ==========
-    //
-    // Architecture:
-    // 1. raw_log: Unified append-only log of all RawEvents (bytes + timestamp + channel)
-    //    - Populated from worker DataBatch frames
-    //    - Byte-based capping (10MB / 10k events)
-    //    - Survives decoder view switches
-    //    - Source of truth for Hex view
-    //
-    // 2. events_list: Worker-generated DecodedEvents (protocol-specific parsing)
-    //    - Populated from worker DataBatch events
-    //    - Used by MAVLink view (filters by protocol)
-    //    - No longer cleared on view switch (history persists)
-    //    - Future: Could be replaced by per-view decoding of raw_log
-    //
-    // 3. Per-decoder cursors: Track processing position for each view
-    //    - hex_cursor: HexView scroll/processing position
-    //    - MAVLink uses timestamp-based cursor internally
-    //
-    // Benefits:
-    // ✅ History persists when switching between decoder views
-    // ✅ Each view maintains independent state (scroll, processed events)
-    // ✅ Foundation for future features (replay, bookmarks, multi-view)
-
-    let (events_list, set_events_list) = create_signal::<Vec<DecodedEvent>>(Vec::new());
-    let (raw_log, set_raw_log) = create_signal::<Vec<RawEvent>>(Vec::new());
-    // Cumulative byte counter for raw_log to avoid O(N) iteration
-    let (raw_log_bytes, set_raw_log_bytes) = create_signal(0usize);
-    let (hex_cursor, set_hex_cursor) = create_signal(0usize);
-
-    // ========== Cross-View Selection Sync ==========
-    // Global selection state for synchronizing selections across Terminal, Hex, and future views
-    let (global_selection, set_global_selection) = create_signal::<Option<SelectionRange>>(None);
-
-    // Terminal metadata for mapping between Terminal text and raw_log byte positions
-    let (terminal_metadata, set_terminal_metadata) =
-        create_signal(terminal_metadata::TerminalMetadata::new());
-
-    // Legacy signals removed/replaced by manager:
-    // status, connected, transport, active_port, is_reconfiguring
-
-    // Session separator: prepend \r\n on first write after reconnect so the
-    // new prompt doesn't concatenate on the previous session's last line.
-    // NOT set on the very first connection (terminal at origin → no separator needed).
-    let needs_session_newline: Rc<Cell<bool>> = Rc::new(Cell::new(false));
-
-    // Set the session-newline flag when transitioning to Connected and the
-    // terminal already has content from a previous session.
-    {
-        let flag = needs_session_newline.clone();
-        create_effect(move |prev: Option<ConnectionState>| {
-            let current = state_signal.get();
-            if current == ConnectionState::Connected {
-                if let Some(prev_state) = prev {
-                    if prev_state != ConnectionState::Connected {
-                        let meta = terminal_metadata.get_untracked();
-                        if meta.has_content() {
-                            flag.set(true);
-                        }
-                    }
-                }
-            }
-            current
-        });
-    }
-
-    // Bridge mode shared state (for Safari/Firefox WebSocket bridge)
-    let bridge_active: Rc<Cell<bool>> = Rc::new(Cell::new(false));
-    let bridge_closing: Rc<Cell<bool>> = Rc::new(Cell::new(false));
-    let bridge_tx_queue: Rc<RefCell<Vec<Vec<u8>>>> = Rc::new(RefCell::new(Vec::new()));
-    // Pending baud rate change for bridge mode (0 = no pending change).
-    // Written by the reconfigure effect, read+cleared by the bridge loop.
-    let bridge_pending_baud: Rc<Cell<u32>> = Rc::new(Cell::new(0));
-    // Bridge port picker signals (Copy signals, no clone needed)
-    let (bridge_ports, set_bridge_ports) = create_signal::<Vec<(String, String)>>(Vec::new());
-    let (bridge_port_pick, set_bridge_port_pick) = create_signal::<Option<String>>(None);
+    // Local aliases for closures that capture individual fields
+    let set_terminal_ready = ctx.set_terminal_ready;
+    let show_bridge_install = ctx.show_bridge_install;
+    let set_show_bridge_install = ctx.set_show_bridge_install;
+    let set_worker = ctx.set_worker;
+    let view_mode = ctx.view_mode;
+    let set_view_mode = ctx.set_view_mode;
+    let connected = ctx.connected;
+    let baud_rate = ctx.baud_rate;
+    let set_baud_rate = ctx.set_baud_rate;
+    let framing = ctx.framing;
+    let set_framing = ctx.set_framing;
+    let active_framing = ctx.active_framing;
+    let term_handle = ctx.term_handle;
+    let set_term_handle = ctx.set_term_handle;
+    let set_events_list = ctx.set_events_list;
+    let raw_log = ctx.raw_log;
+    let set_raw_log = ctx.set_raw_log;
+    let raw_log_bytes = ctx.raw_log_bytes;
+    let set_raw_log_bytes = ctx.set_raw_log_bytes;
+    let hex_cursor = ctx.hex_cursor;
+    let set_hex_cursor = ctx.set_hex_cursor;
+    let global_selection = ctx.global_selection;
+    let set_global_selection = ctx.set_global_selection;
+    let terminal_metadata = ctx.terminal_metadata;
+    let set_terminal_metadata = ctx.set_terminal_metadata;
+    let events_list = ctx.events_list;
+    let needs_session_newline = ctx.needs_session_newline.clone();
+    let bridge_active = ctx.bridge_active.clone();
+    let bridge_closing = ctx.bridge_closing.clone();
+    let bridge_tx_queue = ctx.bridge_tx_queue.clone();
+    let bridge_pending_baud = ctx.bridge_pending_baud.clone();
+    let bridge_ports = ctx.bridge_ports;
+    let set_bridge_ports = ctx.set_bridge_ports;
+    let bridge_port_pick = ctx.bridge_port_pick;
+    let set_bridge_port_pick = ctx.set_bridge_port_pick;
+    let bridge_ready = ctx.bridge_ready;
+    let set_bridge_ready = ctx.set_bridge_ready;
 
     // ── Startup pre-checks ──
     // Detect transport availability at page load so the Connect button can
@@ -163,9 +103,6 @@ pub fn App() -> impl IntoView {
     let has_webserial = web_sys::window()
         .map(|w| !w.navigator().serial().is_undefined())
         .unwrap_or(false);
-
-    // bridge_ready: None = still checking, Some(true) = daemon reachable
-    let (bridge_ready, set_bridge_ready) = create_signal::<Option<bool>>(None);
 
     if !has_webserial {
         let set_install = set_show_bridge_install;
