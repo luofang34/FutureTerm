@@ -9,7 +9,7 @@ use actor_bridge::ActorBridge;
 
 mod connect;
 mod context;
-use context::create_app_context;
+use context::{create_app_context, AppContext};
 
 mod data_dispatch;
 mod dialogs;
@@ -33,10 +33,19 @@ pub fn App() -> impl IntoView {
     let manager_internal = actor_system::create_actor_system();
     // Worker signal must be created before ActorBridge (which reads it)
     let (worker, set_worker) = create_signal::<Option<Worker>>(None);
-    let manager = ActorBridge::new(manager_internal, worker.into());
+    let mut manager = ActorBridge::new(manager_internal, worker.into());
 
     // Create centralised application context (all shared signals)
     let ctx = create_app_context(manager.clone(), worker, set_worker);
+
+    // Inject bridge TX routing into ActorBridge so send_tx() works.
+    // Must happen after create_app_context (which creates the Rc's).
+    manager.set_bridge_tx(ctx.bridge_active.clone(), ctx.bridge_tx_queue.clone());
+    // Update the manager inside ctx with the bridge-aware version
+    let ctx = AppContext {
+        manager: manager.clone(),
+        ..ctx
+    };
     provide_context(ctx.clone());
 
     // Local aliases for closures that capture individual Copy/Clone fields.

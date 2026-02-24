@@ -5,7 +5,7 @@ use leptos::*;
 use std::collections::VecDeque;
 use wasm_bindgen::prelude::*;
 use wasm_bindgen::JsCast;
-use wasm_bindgen_futures::spawn_local;
+
 use web_sys::{MessageEvent, Worker};
 
 // Data retention limits for the unified raw log
@@ -69,14 +69,10 @@ pub fn setup_worker_dispatch(ctx: &AppContext) {
     let set_terminal_metadata = ctx.set_terminal_metadata;
     let term_handle = ctx.term_handle;
     let set_events_list = ctx.set_events_list;
-    let bridge_active = ctx.bridge_active.clone();
-    let bridge_tx_queue = ctx.bridge_tx_queue.clone();
     let needs_session_newline = ctx.needs_session_newline.clone();
 
     create_effect(move |_| {
         let manager = manager.clone();
-        let bridge_active_tx = bridge_active.clone();
-        let bridge_tx_queue_tx = bridge_tx_queue.clone();
         let needs_newline = needs_session_newline.clone();
         if let Ok(w) = Worker::new("worker_bootstrap.js") {
             let Ok(decoder) = web_sys::TextDecoder::new() else {
@@ -193,16 +189,7 @@ pub fn setup_worker_dispatch(ctx: &AppContext) {
                             );
                         }
                         WorkerToUi::TxData { data } => {
-                            if bridge_active_tx.get() {
-                                // Bridge mode - queue for WS send
-                                bridge_tx_queue_tx.borrow_mut().push(data);
-                            } else {
-                                // WebSerial mode
-                                let m = manager.clone();
-                                spawn_local(async move {
-                                    let _ = m.write(&data).await;
-                                });
-                            }
+                            manager.send_tx(data);
                         }
                     }
                 }
