@@ -1,3 +1,3 @@
 pub mod sidebar;
 
-pub use sidebar::{Sidebar, ViewMode};
+pub use sidebar::Sidebar;
