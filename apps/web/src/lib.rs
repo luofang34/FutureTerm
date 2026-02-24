@@ -170,17 +170,67 @@ pub fn App() -> impl IntoView {
     if !has_webserial {
         let set_install = set_show_bridge_install;
         spawn_local(async move {
-            let mut ws = transport_websocket::WebSocketTransport::new();
-            let ok = ws.connect("wss://local.futureterm.app:9876").await.is_ok();
-            if ok {
-                let _ = ws.close().await;
-            }
-            set_bridge_ready.set(Some(ok));
+            let ws_url = "wss://local.futureterm.app:9876";
 
-            // No WebSerial AND no daemon → show install dialog immediately.
-            // User sees it while the page finishes loading — no wasted clicks.
-            if !ok {
-                set_install.set(true);
+            // 1. Quick probe — daemon may already be running.
+            let mut ws = transport_websocket::WebSocketTransport::new();
+            if ws.connect(ws_url).await.is_ok() {
+                let _ = ws.close().await;
+                set_bridge_ready.set(Some(true));
+                return;
+            }
+
+            // 2. Daemon not running — try URL scheme launch.
+            if let Some(window) = web_sys::window() {
+                if let Some(doc) = window.document() {
+                    if let Ok(iframe) = doc.create_element("iframe") {
+                        let _ = iframe.set_attribute("style", "display:none");
+                        let _ = iframe.set_attribute("src", "futureterm://launch?port=9876");
+                        if let Some(body) = doc.body() {
+                            let _ = body.append_child(&iframe);
+                            let body_clone = body.clone();
+                            let iframe_clone = iframe.clone();
+                            let cleanup = wasm_bindgen::closure::Closure::once(move || {
+                                let _ = body_clone.remove_child(&iframe_clone);
+                            });
+                            let _ = window.set_timeout_with_callback_and_timeout_and_arguments_0(
+                                cleanup.as_ref().unchecked_ref(),
+                                1000,
+                            );
+                            cleanup.forget();
+                        }
+                    }
+                }
+            }
+
+            // 3. Fast retries while daemon starts up.
+            //    Cumulative: 500 / 1000 / 2000 / 3500ms.
+            for &delay in &[500u32, 500, 1000, 1500] {
+                gloo_timers::future::TimeoutFuture::new(delay).await;
+                let mut probe = transport_websocket::WebSocketTransport::new();
+                if probe.connect(ws_url).await.is_ok() {
+                    let _ = probe.close().await;
+                    set_bridge_ready.set(Some(true));
+                    return;
+                }
+            }
+
+            // 4. Helper not installed — show dialog and keep polling.
+            set_bridge_ready.set(Some(false));
+            set_install.set(true);
+
+            for _ in 0..300 {
+                gloo_timers::future::TimeoutFuture::new(1000).await;
+                if !show_bridge_install.get() {
+                    return; // User clicked Cancel
+                }
+                let mut probe = transport_websocket::WebSocketTransport::new();
+                if probe.connect(ws_url).await.is_ok() {
+                    let _ = probe.close().await;
+                    set_bridge_ready.set(Some(true));
+                    set_install.set(false);
+                    return;
+                }
             }
         });
     }
@@ -507,53 +557,41 @@ pub fn App() -> impl IntoView {
 
                 // WebSerial not available — use WebSocket bridge.
                 //
-                // Connect to bridge daemon via wss://local.futureterm.app:9876.
-                // Uses a Let's Encrypt cert fetched by the daemon from GitHub
-                // Releases. The domain resolves to 127.0.0.1 — traffic stays local.
-                // LE certs are trusted by ALL browsers natively (no Keychain or
-                // NSS store interaction needed).
+                // The startup pre-check already tried to launch the helper
+                // via URL scheme and is polling in the background.  If the
+                // daemon is reachable (bridge_ready == Some(true)), connect
+                // directly.  Otherwise wait for the pre-check to finish.
                 let ws_url = "wss://local.futureterm.app:9876";
 
                 let mut ws_transport = transport_websocket::WebSocketTransport::new();
 
-                // Use the startup pre-check result to skip the 3s connect
-                // timeout when we already know whether the daemon is up.
-                let precheck = bridge_ready.get_untracked();
-
-                let connected = match precheck {
-                    // Daemon was reachable at page load — connect directly.
-                    Some(true) => {
-                        manager
-                            .set_status
-                            .set("Connecting to bridge\u{2026}".into());
-                        ws_transport.connect(ws_url).await.is_ok()
+                // Wait until the startup pre-check resolves (usually
+                // instant — it runs at page load and finishes in <4 s).
+                loop {
+                    match bridge_ready.get() {
+                        Some(_) => break,
+                        None => gloo_timers::future::TimeoutFuture::new(100).await,
                     }
-                    // Daemon was unreachable at page load — skip the 3s
-                    // timeout and go straight to URL scheme launch.
-                    Some(false) => false,
-                    // Pre-check still in flight (rare) — probe now.
-                    None => {
-                        manager
-                            .set_status
-                            .set("Connecting to bridge\u{2026}".into());
-                        ws_transport.connect(ws_url).await.is_ok()
-                    }
-                };
+                }
 
-                let connected = if connected {
-                    // Dismiss the install dialog if it was shown at startup.
-                    set_show_bridge_install.set(false);
-                    true
-                } else {
-                    // Daemon not running — try URL scheme launch.
-                    manager.set_status.set("Launching helper\u{2026}".into());
+                if bridge_ready.get() != Some(true) {
+                    // Pre-check polling is already showing the install
+                    // dialog and retrying.  Nothing more to do here.
+                    return;
+                }
 
-                    // Launch via hidden iframe (avoids navigating away)
-                    let launch_url = "futureterm://launch?port=9876";
+                // Daemon is reachable — connect.
+                manager
+                    .set_status
+                    .set("Connecting to bridge\u{2026}".into());
+                if ws_transport.connect(ws_url).await.is_err() {
+                    // Daemon went away between pre-check and now — retry
+                    // via URL scheme + fast retries.
+                    manager.set_status.set("Reconnecting\u{2026}".into());
                     if let Some(doc) = window.document() {
                         if let Ok(iframe) = doc.create_element("iframe") {
                             let _ = iframe.set_attribute("style", "display:none");
-                            let _ = iframe.set_attribute("src", launch_url);
+                            let _ = iframe.set_attribute("src", "futureterm://launch?port=9876");
                             if let Some(body) = doc.body() {
                                 let _ = body.append_child(&iframe);
                                 let body_clone = body.clone();
@@ -570,69 +608,27 @@ pub fn App() -> impl IntoView {
                             }
                         }
                     }
-
-                    // Aggressive retry schedule (no install dialog yet).
-                    // Cumulative: 500 / 1000 / 2000 / 3500ms.
-                    let retry_delays_ms: &[u32] = &[500, 500, 1000, 1500];
-                    let mut success = false;
-                    for &delay in retry_delays_ms.iter() {
+                    let mut ok = false;
+                    for &delay in &[500u32, 500, 1000, 1500] {
                         gloo_timers::future::TimeoutFuture::new(delay).await;
                         ws_transport = transport_websocket::WebSocketTransport::new();
                         if ws_transport.connect(ws_url).await.is_ok() {
-                            success = true;
+                            ok = true;
                             break;
                         }
                     }
-
-                    // Only show install dialog after all fast retries failed —
-                    // returning users with the helper installed never see it.
-                    if !success {
-                        set_show_bridge_install.set(true);
-                    }
-                    success
-                };
-
-                if !connected {
-                    // Install dialog is already visible. Keep polling in the
-                    // background so the page auto-detects when the user finishes
-                    // installing the helper — no manual "Connect again" needed.
-                    manager
-                        .set_status
-                        .set("Waiting for helper app\u{2026}".into());
-
-                    let mut detected = false;
-                    // Poll every 1 s for up to ~2 minutes (120 attempts).
-                    // Fast polling gives snappy UX — the dialog disappears
-                    // within a second of the helper becoming reachable.
-                    for _ in 0..120 {
-                        gloo_timers::future::TimeoutFuture::new(1000).await;
-                        // User clicked Cancel — stop polling
-                        if !show_bridge_install.get() {
-                            return;
-                        }
-                        ws_transport = transport_websocket::WebSocketTransport::new();
-                        if ws_transport.connect(ws_url).await.is_ok() {
-                            detected = true;
-                            break;
-                        }
-                    }
-
-                    if !detected {
+                    if !ok {
                         manager
                             .set_status
-                            .set("Could not connect. Click Connect to try again.".into());
+                            .set("Helper not available. Try again.".into());
+                        set_bridge_ready.set(Some(false));
                         return;
                     }
-
-                    // Helper detected — dismiss dialog, update pre-check cache,
-                    // and continue to version check.
-                    set_show_bridge_install.set(false);
-                    set_bridge_ready.set(Some(true));
                 }
 
                 // Check daemon version — restart if outdated.
                 // Expected version must match the daemon built with this release.
-                const EXPECTED_DAEMON_VERSION: &str = "0.3.0";
+                const EXPECTED_DAEMON_VERSION: &str = "0.3.1";
 
                 let daemon_ver = ws_transport.daemon_version();
                 match daemon_ver.as_deref() {
@@ -1218,16 +1214,16 @@ pub fn App() -> impl IntoView {
                         <p style="margin: 0 0 16px; font-size: 0.9rem; line-height: 1.5; color: #ccc;">
                             "The helper is lightweight (~1 MB), runs only when needed, and shuts down automatically after 2 minutes of inactivity."
                         </p>
-                        <div style="display: flex; gap: 12px; justify-content: flex-end;">
+                        <div style="display: flex; gap: 12px; justify-content: flex-end; align-items: center;">
                             <button
-                                style="padding: 8px 16px; background: #444; color: #ccc; border: 1px solid #666; border-radius: 4px; cursor: pointer; font-size: 0.9rem;"
+                                style="padding: 8px 16px; background: #444; color: #ccc; border: 1px solid #666; border-radius: 4px; cursor: pointer; font-size: 0.9rem; line-height: 1.4;"
                                 on:click=move |_| set_show_bridge_install.set(false)>
                                 "Cancel"
                             </button>
                             <a
                                 href="/bridge-helper"
                                 target="_blank"
-                                style="padding: 8px 16px; background: #007acc; color: white; border: none; border-radius: 4px; cursor: pointer; font-size: 0.9rem; text-decoration: none; display: inline-block;">
+                                style="padding: 8px 16px; background: #007acc; color: white; border: 1px solid #007acc; border-radius: 4px; cursor: pointer; font-size: 0.9rem; line-height: 1.4; text-decoration: none; display: inline-block;">
                                 "Download Helper"
                             </a>
                         </div>
