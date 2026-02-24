@@ -34,6 +34,17 @@ pub fn TerminalPlugin() -> impl IntoView {
         let manager_tx = manager_tx_cb.clone();
         let bridge_active_tx = bridge_active_term.clone();
         let bridge_tx_queue_tx = bridge_tx_queue_term.clone();
+        // TX path: intentionally split into two branches.
+        //
+        // WebSerial (Chrome): async actor command → ChannelManager → port.write() Promise.
+        // The actor system owns the port and handles errors internally.
+        //
+        // Bridge (Safari/Firefox): sync push into bridge_tx_queue, drained every ~5ms
+        // by the read loop in connect/bridge.rs. The bridge bypasses the actor system
+        // entirely — it manages the WebSocket transport directly. Unifying these paths
+        // would require either routing bridge TX through the actor system (which doesn't
+        // know about bridge connections) or adding an async abstraction that papers over
+        // fundamentally different write semantics (Promise vs polled queue).
         let on_data_cb = Closure::wrap(Box::new(move |data: JsValue| {
             if let Some(text) = data.as_string() {
                 let bytes = text.into_bytes();
