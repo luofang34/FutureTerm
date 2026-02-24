@@ -1,4 +1,5 @@
 use crate::actor_bridge::ActorBridge;
+use crate::context::AppContext;
 use crate::protocol::UiToWorker;
 use actor_protocol::ConnectionState;
 use core_types::Transport;
@@ -6,9 +7,94 @@ use leptos::*;
 use std::cell::Cell;
 use std::rc::Rc;
 use wasm_bindgen::JsCast;
+use wasm_bindgen_futures::spawn_local;
 
 /// Expected daemon version must match the daemon built with this release.
 const EXPECTED_DAEMON_VERSION: &str = "0.3.2";
+
+/// Run startup pre-checks for bridge transport availability.
+///
+/// Detects whether the browser has WebSerial support.  If NOT (Safari/Firefox),
+/// quick-probes the bridge daemon via WebSocket, attempts a URL-scheme launch
+/// if the daemon is not running, and retries with increasing delays.  If the
+/// daemon is found, sets `bridge_ready = Some(true)`.  If not found after
+/// retries, shows the bridge install dialog and starts 5-minute polling.
+pub fn run_startup_precheck(ctx: &AppContext) {
+    let has_webserial = web_sys::window()
+        .map(|w| !w.navigator().serial().is_undefined())
+        .unwrap_or(false);
+
+    if !has_webserial {
+        let set_install = ctx.set_show_bridge_install;
+        let set_bridge_ready = ctx.set_bridge_ready;
+        let show_bridge_install = ctx.show_bridge_install;
+
+        spawn_local(async move {
+            let ws_url = "wss://local.futureterm.app:9876";
+
+            // 1. Quick probe -- daemon may already be running.
+            let mut ws = transport_websocket::WebSocketTransport::new();
+            if ws.connect(ws_url).await.is_ok() {
+                let _ = ws.close().await;
+                set_bridge_ready.set(Some(true));
+                return;
+            }
+
+            // 2. Daemon not running -- try URL scheme launch.
+            if let Some(window) = web_sys::window() {
+                if let Some(doc) = window.document() {
+                    if let Ok(iframe) = doc.create_element("iframe") {
+                        let _ = iframe.set_attribute("style", "display:none");
+                        let _ = iframe.set_attribute("src", "futureterm://launch?port=9876");
+                        if let Some(body) = doc.body() {
+                            let _ = body.append_child(&iframe);
+                            let body_clone = body.clone();
+                            let iframe_clone = iframe.clone();
+                            let cleanup = wasm_bindgen::closure::Closure::once(move || {
+                                let _ = body_clone.remove_child(&iframe_clone);
+                            });
+                            let _ = window.set_timeout_with_callback_and_timeout_and_arguments_0(
+                                cleanup.as_ref().unchecked_ref(),
+                                1000,
+                            );
+                            cleanup.forget();
+                        }
+                    }
+                }
+            }
+
+            // 3. Fast retries while daemon starts up.
+            //    Cumulative: 500 / 1000 / 2000 / 3500ms.
+            for &delay in &[500u32, 500, 1000, 1500] {
+                gloo_timers::future::TimeoutFuture::new(delay).await;
+                let mut probe = transport_websocket::WebSocketTransport::new();
+                if probe.connect(ws_url).await.is_ok() {
+                    let _ = probe.close().await;
+                    set_bridge_ready.set(Some(true));
+                    return;
+                }
+            }
+
+            // 4. Helper not installed -- show dialog and keep polling.
+            set_bridge_ready.set(Some(false));
+            set_install.set(true);
+
+            for _ in 0..300 {
+                gloo_timers::future::TimeoutFuture::new(1000).await;
+                if !show_bridge_install.get() {
+                    return; // User clicked Cancel
+                }
+                let mut probe = transport_websocket::WebSocketTransport::new();
+                if probe.connect(ws_url).await.is_ok() {
+                    let _ = probe.close().await;
+                    set_bridge_ready.set(Some(true));
+                    set_install.set(false);
+                    return;
+                }
+            }
+        });
+    }
+}
 
 /// Bridge connection flow (Safari/Firefox via WebSocket daemon).
 ///

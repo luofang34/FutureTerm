@@ -1,6 +1,8 @@
 mod bridge;
 mod webserial;
 
+pub use bridge::run_startup_precheck;
+
 use crate::context::AppContext;
 use leptos::*;
 use wasm_bindgen_futures::spawn_local;
