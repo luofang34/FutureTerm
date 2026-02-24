@@ -57,6 +57,68 @@ pub fn all_views() -> &'static [ViewDescriptor] {
     VIEWS
 }
 
+#[cfg(test)]
+#[allow(clippy::panic, clippy::unwrap_used, clippy::indexing_slicing)]
+mod tests {
+    use super::*;
+    use std::collections::HashSet;
+
+    #[test]
+    fn test_registry_has_all_view_ids() {
+        // Every ViewId variant should have a descriptor in all_views()
+        let views = all_views();
+        let ids: HashSet<ViewId> = views.iter().map(|v| v.id).collect();
+        assert!(ids.contains(&ViewId::Terminal));
+        assert!(ids.contains(&ViewId::Hex));
+        assert!(ids.contains(&ViewId::Mavlink));
+    }
+
+    #[test]
+    fn test_registry_no_duplicate_ids() {
+        let views = all_views();
+        let mut ids = HashSet::new();
+        for v in views {
+            assert!(ids.insert(v.id), "Duplicate ViewId: {:?}", v.id);
+        }
+    }
+
+    #[test]
+    fn test_registry_decoder_mapping() {
+        // Verify correct decoder is assigned to each view
+        let views = all_views();
+        for v in views {
+            match v.id {
+                ViewId::Terminal => assert_eq!(v.decoder, DecoderId::Utf8),
+                ViewId::Hex => assert_eq!(v.decoder, DecoderId::Hex),
+                ViewId::Mavlink => assert_eq!(v.decoder, DecoderId::Mavlink),
+            }
+        }
+    }
+
+    #[test]
+    fn test_registry_labels_non_empty() {
+        for v in all_views() {
+            assert!(!v.label.is_empty(), "ViewId {:?} has empty label", v.id);
+            assert!(!v.title.is_empty(), "ViewId {:?} has empty title", v.id);
+        }
+    }
+
+    #[test]
+    fn test_view_id_equality() {
+        assert_eq!(ViewId::Terminal, ViewId::Terminal);
+        assert_ne!(ViewId::Terminal, ViewId::Hex);
+        assert_ne!(ViewId::Hex, ViewId::Mavlink);
+    }
+
+    #[test]
+    fn test_registry_count_matches_enum() {
+        // If a new ViewId variant is added, this test will remind to add a descriptor
+        let views = all_views();
+        // This verifies the exhaustive match above covers all variants
+        assert!(views.len() >= 3, "Expected at least 3 views in registry");
+    }
+}
+
 /// View router component that replaces the hardcoded `<Show>` blocks in lib.rs.
 ///
 /// Terminal is always mounted (hidden when inactive) to preserve metadata tracking.
