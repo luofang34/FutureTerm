@@ -4,59 +4,16 @@ use std::collections::VecDeque;
 use wasm_bindgen::closure::Closure;
 use wasm_bindgen::JsCast;
 
-// Display constants
-/// Height of each hex row in pixels
-const ROW_HEIGHT: f64 = 28.0;
+mod highlight;
+mod layout;
+mod selection;
 
-/// Auto-scroll threshold distance from bottom in pixels
-const AUTO_SCROLL_THRESHOLD: f64 = 100.0;
-
-/// Number of buffer rows to prevent white flashes during scroll
-const SCROLL_BUFFER_ROWS: usize = 5;
-
-// Responsive layout breakpoints (with 30px hysteresis dead zones)
-/// Minimum width in pixels for 32-byte row layout
-const WIDE_LAYOUT_MIN_WIDTH: f64 = 1150.0;
-/// Width below which we switch from 32 to 16 bytes/row
-const WIDE_LAYOUT_HYSTERESIS: f64 = 1120.0;
-
-/// Minimum width in pixels for 16-byte row layout
-const MEDIUM_LAYOUT_MIN_WIDTH: f64 = 650.0;
-/// Width below which we switch from 16 to 8 bytes/row
-const MEDIUM_LAYOUT_HYSTERESIS: f64 = 620.0;
-
-/// Minimum width in pixels for 8-byte row layout
-const NARROW_LAYOUT_MIN_WIDTH: f64 = 400.0;
-/// Width below which we switch from 8 to 4 bytes/row
-const NARROW_LAYOUT_HYSTERESIS: f64 = 370.0;
-
-/// Represents a single hex dump row (4, 8, 16, or 32 bytes)
-#[derive(Clone, Debug, PartialEq)]
-struct HexRow {
-    offset: usize,
-    bytes: Vec<u8>,
-}
-
-impl HexRow {
-    #[allow(dead_code)]
-    fn ascii(&self) -> String {
-        self.bytes
-            .iter()
-            .map(|&b| {
-                if (32..=126).contains(&b) {
-                    b as char
-                } else {
-                    '.'
-                }
-            })
-            .collect()
-    }
-
-    /// Returns groups of up to 4 bytes each
-    fn byte_groups(&self) -> Vec<Vec<u8>> {
-        self.bytes.chunks(4).map(|chunk| chunk.to_vec()).collect()
-    }
-}
+pub use layout::icon;
+use layout::{
+    HexRow, SelectionOrigin, AUTO_SCROLL_THRESHOLD, HEX_STYLES, MEDIUM_LAYOUT_HYSTERESIS,
+    MEDIUM_LAYOUT_MIN_WIDTH, NARROW_LAYOUT_HYSTERESIS, NARROW_LAYOUT_MIN_WIDTH, ROW_HEIGHT,
+    SCROLL_BUFFER_ROWS, WIDE_LAYOUT_HYSTERESIS, WIDE_LAYOUT_MIN_WIDTH,
+};
 
 #[component]
 pub fn HexView(
@@ -73,16 +30,7 @@ pub fn HexView(
     let (container_height, set_container_height) = create_signal(600.0); // Default height
     let (scroll_top, set_scroll_top) = create_signal(0.0);
 
-    #[derive(Clone, Copy, PartialEq, Debug)]
-    enum SelectionOrigin {
-        Hex,
-        Ascii,
-    }
     let (active_origin, set_active_origin) = create_signal::<Option<SelectionOrigin>>(None);
-
-    // Track previous selection range to optimize DOM updates
-    let (prev_selection, set_prev_selection) =
-        create_signal::<Option<(usize, usize, SelectionSource)>>(None);
 
     // Row height is defined as a module-level constant
 
@@ -282,308 +230,11 @@ pub fn HexView(
         }
     });
 
-    // Handle Native Selection Changes (Throttled for performance)
-    let (last_selection_time, set_last_selection_time) = create_signal(0.0);
+    // Native selection listener (extracted to keep this file reviewable).
+    selection::setup_selection_change_listener(set_active_origin, set_global_selection);
 
-    create_effect(move |_| {
-        let set_global = set_global_selection;
-        let last_time = last_selection_time;
-        let set_last = set_last_selection_time;
-
-        let callback = Closure::wrap(Box::new(move || {
-            // Throttle to 60fps (16.67ms) for performance
-            let now = js_sys::Date::now();
-            let last = last_time.get_untracked();
-            if now - last < 16.67 {
-                return;
-            }
-            set_last.set(now);
-
-            if let Some(window) = web_sys::window() {
-                if let Some(selection) = window.get_selection().ok().flatten() {
-                    // If no valid selection, clear global selection
-                    if selection.is_collapsed() {
-                        set_active_origin.set(None);
-                        if let Some(set_g) = set_global {
-                            set_g.set(None);
-                        }
-                        return;
-                    }
-
-                    let anchor_node = selection.anchor_node();
-                    let focus_node = selection.focus_node();
-
-                    if let (Some(anchor), Some(focus)) = (anchor_node, focus_node) {
-                        let get_info = |node: web_sys::Node| -> Option<(usize, bool)> {
-                            let mut curr = Some(node);
-                            let mut offset_found = None;
-                            let mut is_ascii = None;
-
-                            while let Some(n) = curr {
-                                if let Some(el) = n.dyn_ref::<web_sys::HtmlElement>() {
-                                    if offset_found.is_none() {
-                                        if let Some(off) = el.dataset().get("offset") {
-                                            if let Ok(val) = off.parse::<usize>() {
-                                                offset_found = Some(val);
-                                            }
-                                        }
-                                    }
-                                    // Check container class for reliable column detection
-                                    if is_ascii.is_none() {
-                                        if el.class_list().contains("ascii-container") {
-                                            is_ascii = Some(true);
-                                        } else if el.class_list().contains("hex-data-container") {
-                                            is_ascii = Some(false);
-                                        }
-                                    }
-                                    if offset_found.is_some() && is_ascii.is_some() {
-                                        break;
-                                    }
-                                }
-                                curr = n.parent_element().map(|e| e.into());
-                            }
-
-                            // Require precise byte offset — no fallback to row offset
-                            // to prevent full-row expansion when anchor/focus lands on
-                            // a container element
-                            match (is_ascii, offset_found) {
-                                (Some(ascii), Some(off)) => Some((off, ascii)),
-                                _ => None,
-                            }
-                        };
-
-                        let start_info = get_info(anchor.clone());
-                        let end_info = get_info(focus);
-
-                        if let (Some((start_off, start_is_ascii)), Some((end_off, end_is_ascii))) =
-                            (start_info, end_info)
-                        {
-                            // Cross-column detected. Clamp focus to the anchor's column.
-                            if start_is_ascii != end_is_ascii {
-                                let container_class = if start_is_ascii {
-                                    "ascii-container"
-                                } else {
-                                    "hex-data-container"
-                                };
-                                let selector = format!(
-                                    ".{} .hex-byte[data-offset=\"{}\"]",
-                                    container_class, end_off
-                                );
-                                if let Some(document) = window.document() {
-                                    if let Ok(Some(target_el)) = document.query_selector(&selector)
-                                    {
-                                        if let Some(text_node) = target_el.first_child() {
-                                            let focus_offset = if start_off <= end_off {
-                                                target_el
-                                                    .text_content()
-                                                    .map(|t| t.len() as u32)
-                                                    .unwrap_or(1)
-                                            } else {
-                                                0
-                                            };
-                                            let _ = selection.set_base_and_extent(
-                                                &anchor,
-                                                selection.anchor_offset(),
-                                                &text_node,
-                                                focus_offset,
-                                            );
-                                        }
-                                    }
-                                }
-
-                                // Process the clamped range inline to avoid throttle swallowing re-fired event
-                                let (min, max) = if start_off < end_off {
-                                    (start_off, end_off)
-                                } else {
-                                    (end_off, start_off)
-                                };
-                                let max_exclusive = max + 1;
-
-                                if min < max_exclusive {
-                                    set_active_origin.set(Some(if start_is_ascii {
-                                        SelectionOrigin::Ascii
-                                    } else {
-                                        SelectionOrigin::Hex
-                                    }));
-
-                                    if let Some(set_g) = set_global {
-                                        set_g.set(Some(SelectionRange::new(
-                                            min,
-                                            max_exclusive,
-                                            0,
-                                            0,
-                                            SelectionSource::HexView,
-                                        )));
-                                    }
-                                }
-                                return;
-                            }
-
-                            let (min, max) = if start_off < end_off {
-                                (start_off, end_off)
-                            } else {
-                                (end_off, start_off)
-                            };
-
-                            // Use Range API for precise end boundary:
-                            // When endOffset == 0, the browser selection ends just before
-                            // the focus node's text content (byte not visually selected).
-                            let range_end_offset = selection
-                                .get_range_at(0)
-                                .ok()
-                                .and_then(|r| r.end_offset().ok())
-                                .unwrap_or(1);
-
-                            let max_exclusive = if range_end_offset == 0 && min < max {
-                                max
-                            } else {
-                                max + 1
-                            };
-
-                            if min >= max_exclusive {
-                                return;
-                            }
-
-                            // Valid HexView selection found
-                            set_active_origin.set(Some(if start_is_ascii {
-                                SelectionOrigin::Ascii
-                            } else {
-                                SelectionOrigin::Hex
-                            }));
-
-                            if let Some(set_g) = set_global {
-                                set_g.set(Some(SelectionRange::new(
-                                    min,
-                                    max_exclusive,
-                                    0,
-                                    0,
-                                    SelectionSource::HexView,
-                                )));
-                            }
-                        }
-                    }
-                }
-            }
-        }) as Box<dyn FnMut()>);
-
-        let Some(window) = web_sys::window() else {
-            return;
-        };
-        let Some(document) = window.document() else {
-            return;
-        };
-        let _ = document
-            .add_event_listener_with_callback("selectionchange", callback.as_ref().unchecked_ref());
-
-        on_cleanup(move || {
-            let _ = document.remove_event_listener_with_callback(
-                "selectionchange",
-                callback.as_ref().unchecked_ref(),
-            );
-            // Note: Callback remains in memory after removal.
-            // wasm-bindgen Closure::forget() prevents the destructor from
-            // invalidating the JS function wrapper, which is required for
-            // correct cleanup in WASM event handler lifecycle.
-            callback.forget();
-        });
-    });
-
-    // Optimized DOM manipulation for highlighting
-    // Uses incremental updates instead of full DOM traversal
-    create_effect(move |_| {
-        let range_opt = global_selection.and_then(|g| g.get());
-        let origin = active_origin.get();
-        let prev = prev_selection.get();
-
-        // Use requestAnimationFrame to batch DOM updates
-        let set_prev = set_prev_selection;
-        let callback = Closure::once(Box::new(move || {
-            if let Some(window) = web_sys::window() {
-                if let Some(document) = window.document() {
-                    // Convert current selection to comparable tuple
-                    let current = range_opt
-                        .as_ref()
-                        .map(|r| (r.start_byte_offset, r.end_byte_offset, r.source_view));
-
-                    // Only update if selection actually changed
-                    if prev == current {
-                        return;
-                    }
-
-                    // Clear all highlight classes unconditionally before reapplying.
-                    // This ensures stale classes from previous origin changes are removed
-                    // (e.g., switching from Hex→Ascii selection would leave bg-sync on
-                    // hex-column elements that overlap the new range).
-                    if let Ok(elements) =
-                        document.query_selector_all(".hex-byte.bg-sync, .hex-byte.bg-term")
-                    {
-                        for i in 0..elements.length() {
-                            if let Some(el) = elements.get(i) {
-                                if let Some(el) = el.dyn_ref::<web_sys::HtmlElement>() {
-                                    let _ = el.class_list().remove_2("bg-sync", "bg-term");
-                                }
-                            }
-                        }
-                    }
-
-                    // Apply new highlights if selection exists
-                    if let Some(range) = range_opt {
-                        let is_terminal = range.source_view == SelectionSource::Terminal;
-                        let is_hex_view = range.source_view == SelectionSource::HexView;
-
-                        // Query only elements in range for better performance
-                        if let Ok(elements) = document.query_selector_all(".hex-byte[data-offset]")
-                        {
-                            for i in 0..elements.length() {
-                                if let Some(el) = elements.get(i) {
-                                    if let Some(el) = el.dyn_ref::<web_sys::HtmlElement>() {
-                                        if let Some(offset_str) = el.dataset().get("offset") {
-                                            if let Ok(offset) = offset_str.parse::<usize>() {
-                                                if range.contains_offset(offset) {
-                                                    // Terminal selection: both hex and ASCII get
-                                                    // bg-term
-                                                    if is_terminal {
-                                                        let _ = el.class_list().add_1("bg-term");
-                                                    }
-                                                    // HexView selection: sync highlighting logic
-                                                    else if is_hex_view {
-                                                        let is_ascii =
-                                                            el.class_list().contains("ascii-char");
-                                                        // If origin is ASCII and this is hex, or
-                                                        // vice versa, apply sync color
-                                                        if (origin == Some(SelectionOrigin::Ascii)
-                                                            && !is_ascii)
-                                                            || (origin
-                                                                == Some(SelectionOrigin::Hex)
-                                                                && is_ascii)
-                                                        {
-                                                            let _ =
-                                                                el.class_list().add_1("bg-sync");
-                                                        }
-                                                    }
-                                                }
-                                            }
-                                        }
-                                    }
-                                }
-                            }
-                        }
-                    }
-
-                    // Update previous selection for next comparison
-                    set_prev.set(current);
-                }
-            }
-        }) as Box<dyn FnOnce()>);
-
-        if let Some(window) = web_sys::window() {
-            let _ = window.request_animation_frame(callback.as_ref().unchecked_ref());
-            // For FnOnce callbacks in requestAnimationFrame, we need to forget
-            // because they execute once and then should be cleaned up by the browser.
-            // This is a known limitation in wasm-bindgen for one-shot callbacks.
-            callback.forget();
-        }
-    });
+    // Highlight-class DOM updates (extracted to keep this file reviewable).
+    highlight::setup_highlight_effect(global_selection, active_origin);
 
     // Grid Template: Offset | Hex Data | Separator | ASCII
     // Calculate fixed width for hex column to prevent ASCII invasion
@@ -605,114 +256,7 @@ pub fn HexView(
                 let div = event_target::<web_sys::HtmlElement>(&ev);
                 set_scroll_top.set(div.scroll_top() as f64);
             }
-            on:copy=move |ev: web_sys::Event| {
-                let Some(ev) = ev.dyn_into::<web_sys::ClipboardEvent>().ok() else { return; };
-                if let Some(window) = web_sys::window() {
-                    if let Some(selection) = window.get_selection().ok().flatten() {
-                        if selection.is_collapsed() { return; }
-
-                        let anchor_node = selection.anchor_node();
-                        let focus_node = selection.focus_node();
-
-                        if let (Some(anchor), Some(focus)) = (anchor_node, focus_node) {
-                            // Helper to determine component type and offset
-                            // Returns: (offset, is_ascii)
-                            let get_info = |node: web_sys::Node| -> Option<(usize, bool)> {
-                                let mut curr = Some(node);
-                                let mut is_ascii = None;
-                                let mut precise_offset = None;
-                                let mut row_offset = None;
-
-                                while let Some(n) = curr {
-                                    if let Some(el) = n.dyn_ref::<web_sys::HtmlElement>() {
-                                        // Check for specific byte offset
-                                        if precise_offset.is_none() {
-                                            if let Some(off) = el.dataset().get("offset") {
-                                                if let Ok(val) = off.parse::<usize>() {
-                                                    precise_offset = Some(val);
-                                                }
-                                            }
-                                        }
-
-                                        // Check for row offset
-                                        if row_offset.is_none() {
-                                            if let Some(off) = el.dataset().get("row-offset") {
-                                                if let Ok(val) = off.parse::<usize>() {
-                                                    row_offset = Some(val);
-                                                }
-                                            }
-                                        }
-
-                                        // Check container type
-                                        if el.class_list().contains("ascii-container") {
-                                            is_ascii = Some(true);
-                                        } else if el.class_list().contains("hex-data-container") {
-                                            is_ascii = Some(false);
-                                        }
-                                    }
-                                    curr = n.parent_element().map(|e| e.into());
-                                }
-
-                                match (is_ascii, precise_offset, row_offset) {
-                                    (Some(ascii), Some(p_off), _) => Some((p_off, ascii)),
-                                    (Some(ascii), None, Some(r_off)) => Some((r_off, ascii)), // Fallback to row start
-                                    _ => None
-                                }
-                            };
-
-                            let start_info = get_info(anchor);
-                            let end_info = get_info(focus);
-
-                            if let (Some((start_off, start_ascii)), Some((end_off, _))) = (start_info, end_info) {
-                                let (min, max) = if start_off < end_off { (start_off, end_off) } else { (end_off, start_off) };
-
-                                let mut content = String::new();
-                                let rows = all_hex_rows.get();
-
-                                for row in rows {
-                                    if row.offset + row.bytes.len() <= min { continue; }
-                                    if row.offset > max { break; }
-
-                                    for (i, &b) in row.bytes.iter().enumerate() {
-                                        let abs_off = row.offset + i;
-                                        if abs_off >= min && abs_off <= max {
-                                            if start_ascii {
-                                                if (32..=126).contains(&b) {
-                                                    content.push(b as char);
-                                                } else {
-                                                    content.push('.');
-                                                }
-                                            } else {
-                                                if !content.is_empty() && content.len() % 3 == 2 { content.push(' '); }
-                                                else if !content.is_empty() && content.ends_with('\n') { /* Newline, no space needed */ }
-                                                else if !content.is_empty() { content.push(' '); }
-
-                                                content.push_str(&format!("{:02X}", b));
-                                            }
-                                        }
-                                    }
-                                    // Add newlines? Browser copy usually adds newlines for block elements.
-                                    // But here we are constructing a string.
-                                    // If the selection spans multiple rows, we might want newlines?
-                                    // The user "multi line selection" implies block copy.
-                                    // Logic: If we finished a row and there are more bytes in range, add newline?
-                                    // Simpler: Just space separated hex is usually preferred, but for long dumps, lines are good.
-                                    // Let's stick to space separated for now to be safe, or check existing behavior.
-                                    // Existing behavior: one long string.
-                                }
-
-                                if let Some(clipboard_data) = ev.clipboard_data() {
-                                    let _ = clipboard_data.set_data("text/plain", &content);
-                                    ev.prevent_default();
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-            // Note: Browser's default copy behavior will include both hex and ASCII columns
-            // if user selects across the grid. This is a known limitation of the grid layout.
-            // Users should select within a single column for best results.
+            on:copy=selection::make_copy_handler(all_hex_rows)
             on:mouseup=move |_ev| {
                 // DISABLED: Custom selection causing performance issues and conflicts with browser copy
                 // Users can use browser's native text selection to copy hex bytes or ASCII
@@ -735,36 +279,7 @@ pub fn HexView(
             "
         >
             // Performance Styles
-            <style>
-                ".hex-byte {
-                     cursor: text;
-                     display: inline-block;
-                     padding: 0 1px;
-                     box-sizing: border-box;
-                 }
-                 .ascii-char {
-                     cursor: text;
-                     display: inline-block;
-                     padding: 0;
-                 }
-                 .bg-sync {
-                     background-color: rgba(80, 150, 250, 0.35);
-                 }
-                 .bg-term {
-                     background-color: rgba(86, 156, 214, 0.3);
-                 }
-                 .hex-byte::selection, .ascii-char::selection {
-                     background-color: rgba(80, 150, 250, 0.4);
-                 }
-                 .bg-sync::selection {
-                     background-color: transparent;
-                 }
-                 .hex-data-container::selection,
-                 .hex-data-container > div::selection,
-                 .ascii-container::selection {
-                     background-color: transparent;
-                 }"
-            </style>
+            <style>{HEX_STYLES}</style>
 
             // Sticky Header
             <div
@@ -970,14 +485,5 @@ pub fn HexView(
                 <div style=move || format!("height: {}px;", visible_rows.get().1)></div>
             </div>
         </div>
-    }
-}
-
-pub fn icon() -> impl IntoView {
-    view! {
-        <svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
-            <path d="M12 2l9 5v10l-9 5l-9-5V7z" />
-            <text x="50%" y="54%" text-anchor="middle" dominant-baseline="middle" font-size="9" font-weight="bold" fill="currentColor" stroke="none">"0x"</text>
-        </svg>
     }
 }
