@@ -61,3 +61,6 @@ apps/web/bridge-helper/bridge-daemon-*
 *.md
 !DEVELOPMENT.md
 !CHANGELOG.md
+
+# Local planning / superpowers scratchpads (not version controlled)
+docs/superpowers/
