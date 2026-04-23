@@ -109,6 +109,8 @@ fn make_ws_config() -> WebSocketConfig {
 }
 
 /// Origin validation callback shared by plain and TLS paths.
+// ErrorResponse is dictated by tokio-tungstenite's handshake API; we can't box it.
+#[allow(clippy::result_large_err)]
 fn make_origin_callback() -> impl FnOnce(
     &tokio_tungstenite::tungstenite::handshake::server::Request,
     tokio_tungstenite::tungstenite::handshake::server::Response,
