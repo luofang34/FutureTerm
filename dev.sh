@@ -44,6 +44,17 @@ run_quality_checks() {
         FAILED=1
     fi
 
+    # File size limit (500 lines per .rs file, per CLAUDE.md)
+    echo -e "${YELLOW}▶ File size limit${NC}"
+    if bash scripts/check_file_sizes.sh 2>&1; then
+        echo -e "${GREEN}✓ File size limit passed${NC}"
+        echo ""
+    else
+        echo -e "${RED}✗ File size limit FAILED${NC}"
+        echo ""
+        FAILED=1
+    fi
+
     # Clippy for non-WASM
     echo -e "${YELLOW}▶ Clippy (non-WASM)${NC}"
     if cargo clippy --workspace \
